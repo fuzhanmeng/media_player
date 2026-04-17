@@ -1,0 +1,22 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "CMake Build Release", // 给这个任务起个名字
+            "type": "shell",
+            // 这里就是我们在终端敲的那行魔法命令！
+            "command": "cmake",
+            "args": [
+                "--build",
+                "--preset",
+                "conan-release"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true // 设为默认编译任务 (按 Ctrl+Shift+B 直接触发)
+            },
+            "problemMatcher": "$gcc",
+            "detail": "使用 CMake 和 Conan 预设编译整个项目"
+        }
+    ]
+}

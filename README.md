@@ -149,25 +149,29 @@ make -j8
 ## 项目目录结构
 ```
 ai-media-player/
-├── src/                # 核心源代码
-│   ├── demux/          # 文件解封装模块
-│   ├── audio_decode/   # 音频解码模块
-│   ├── video_decode/   # 视频解码模块
-│   ├── av_sync/        # 音画同步模块
-│   ├── audio_process/  # 音频处理链模块
-│   ├── video_process/  # 视频处理链模块
-│   ├── audio_play/     # 音频播放模块
-│   ├── video_render/   # 视频渲染模块
-│   ├── audio_encode/   # 音频编码模块（预留接口）
-│   ├── video_encode/   # 视频编码模块（预留接口）
-│   ├── mux/            # 文件封装模块（预留接口）
-│   └── main/           # 主程序入口、界面逻辑
-├── include/            # 公共头文件、模块接口定义
-├── third_party/        # 第三方依赖库
-├── assets/             # 资源文件（图标、滤镜配置、样式表）
-├── docs/               # 设计文档、开发手册
-├── CMakeLists.txt      # 项目顶层构建配置
-└── README.md           # 项目说明文档
+├── 3rdparty/                # 第三方依赖库目录
+│   └── inspire_face/        # AI 人脸识别第三方库，用于智能特效扩展
+├── cache/                   # 程序运行缓存目录，临时文件、日志、解码缓存
+├── learn_av/                # 音视频核心业务层（纯逻辑，与Qt界面解耦）
+│   ├── include/             # 全局公共头文件、模块对外接口
+│   ├── qt/                  # Qt 适配层，桥接核心引擎与UI组件
+│   └── src/                 # 音视频全链路核心源码
+├── qt/                      # 界面交互层，仅负责窗口、控件、用户操作
+│   ├── main.cpp             # 程序全局入口
+│   ├── main_window.cpp      # 主窗口逻辑实现
+│   ├── main_window.h        # 主窗口类定义
+│   └── ui/                  # 细分UI控件
+│       ├── controller_widget.cpp  # 播放控制：暂停/进度/音量
+│       ├── controller_widget.h
+│       ├── player_widget.cpp      # OpenGL 视频渲染画布
+│       └── player_widget.h
+├── resource/                # 静态资源目录
+│   ├── pack/                # AI 模型权重文件
+│   ├── sticker/             # 人脸贴纸、特效素材
+│   └── video/               # 测试视频资源
+├── CMakeLists.txt           # 项目全局构建配置
+├── conanfile.txt            # Conan2 第三方依赖管理配置
+└── README.md                # 项目说明文档
 ```
 
 ---

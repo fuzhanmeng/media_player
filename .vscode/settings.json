@@ -1,0 +1,108 @@
+{
+    // ==== 🎨 编辑器基础视觉与排版 ====
+    "editor.fontFamily": "Fira Code, JetBrains Mono, Consolas, 'Courier New', monospace", // 优先使用护眼的编程字体
+    "editor.fontLigatures": true, // 开启连字 (例如将 -> 显示为连体箭头，非常优雅)
+    "editor.fontSize": 18, // 字体大小，适合长时间写代码
+    "editor.tabSize": 4, // 按一下 Tab 等效为 4 个空格
+    "editor.insertSpaces": true, // 严格使用空格代替 Tab 字符（避免在不同编辑器里排版错乱）
+    "editor.wordWrap": "on", // 代码过长时自动换行，不用左右拖动滚动条
+    "editor.minimap.enabled": false, // 关闭右侧的迷你代码缩略图，把屏幕空间全留给代码
+    "editor.formatOnSave": true, // 【极度推荐】按 Ctrl+S 自动整理代码格式
+
+    // ==== 💡 智能提示行为 ====
+    "editor.quickSuggestions": {
+        "other": true, // 在正常代码中开启弹窗提示
+        "comments": false, // 写注释时不弹提示，让你安心打字
+        "strings": true // 在字符串内部允许提示
+    },
+    "editor.inlineSuggest.enabled": true, // 开启类似 GitHub Copilot 的灰色内联预测文本
+
+    // ==== 💾 自动保存 (再也不怕断电/崩溃) ==== 
+    "files.autoSave": "afterDelay", // 停止打字后自动保存
+    "files.autoSaveDelay": 500, // 停手 0.5 秒就保存，配合 formatOnSave 食用极佳
+
+    // ==== 💻 终端面板设置 ====
+    "workbench.panel.opensMaximized": "never", // 启动时终端面板不要占满全屏
+    "terminal.integrated.defaultProfile.linux": "bash", // 默认终端设为 bash
+    "terminal.integrated.fontSize": 15, // 终端字号稍微小一点点
+    "terminal.integrated.scrollback": 5000, // 终端输出历史保留 5000 行，方便看 CMake 长篇大论的报错
+
+    // =========================================================
+    // ==== 🚀 C++ / Clangd 核心护航设置 (解决红线问题的关键) ====
+    // =========================================================
+    "C_Cpp.intelliSenseEngine": "disabled", // 【核心】必须禁用微软自带的 C++ 补全，全权交给 clangd，一山不容二虎
+    "clangd.path": "/usr/bin/clangd", // clangd 的绝对路径
+    "clangd.arguments": [
+        // --- 性能与后台行为 ---
+        "--background-index", // 后台自动分析整个项目的代码并建立索引
+        "--pch-storage=memory", // 把预编译信息放在内存里，吃点内存但提示速度快如闪电
+        "--background-index-priority=normal", 
+        
+        // --- 补全与提示体验 ---
+        "--completion-style=detailed", // 自动补全时，显示完整的函数参数和返回值类型
+        "--all-scopes-completion", // 全局搜索补全建议
+        "--limit-results=100", // 最多显示 100 条匹配结果
+        
+        // --- 诊断与美化 ---
+        "--clang-tidy", // 开启极其严格的代码规范检查（会教你写出更高质量的现代 C++）
+        "--pretty", // 让终端里的报错信息排版更好看
+        
+        // --- 头文件管理 ---
+        "--header-insertion=never", // 【重要修正】禁止 clangd 自作聪明帮你插头文件，防止它瞎引入不需要的库
+        "--header-insertion-decorators=true", // 在补全列表里用小图标暗示这个函数需要引入哪个头文件
+        
+        // --- 编写协助 ---
+        "--function-arg-placeholders=true", // 回车补全函数时，自动填入参数占位符，你可以按 Tab 键逐个填写参数！
+        
+        // --- 编译环境绑定 ---
+        "--query-driver=/usr/bin/clang++", // 告诉 clangd 你的编译器在哪，用来找基础库
+        "-std=c++20", // 强制按 C++20 标准解析代码（兼容你的 C++17，让你能用最新的语法特性）
+        
+        // ✅ ====== 你的救星：告诉 clangd 你的 Qt 和 FFmpeg 到底在哪 ======
+        "--compile-commands-dir=${workspaceFolder}/build/Release" 
+    ],
+
+    // ==== ⌨️ 代码片段与补全策略 ====
+    "editor.snippetSuggestions": "inline", 
+    "editor.tabCompletion": "on", 
+    "editor.wordBasedSuggestions": "allDocuments", // 开启基于单词的模糊记忆补全（clangd 偶尔反应慢时的兜底护城河）
+
+    // ==== 🔗 C++ 标准库文件后缀关联 ====
+    // 强制把这些无后缀的文件当做 C++ 代码解析，防止它们打开时变成纯文本没有高亮
+    "files.associations": {
+        "*.h": "cpp",
+        "*.hpp": "cpp",
+        "iostream": "cpp",
+        "vector": "cpp",
+        "string": "cpp",
+        "map": "cpp",
+        "set": "cpp",
+        "unordered_map": "cpp",
+        "unordered_set": "cpp",
+        "memory": "cpp",
+        "thread": "cpp",
+        "mutex": "cpp",
+        "future": "cpp",
+        "chrono": "cpp",
+        "filesystem": "cpp",
+        "algorithm": "cpp",
+        "tuple": "cpp",
+        "optional": "cpp",
+        "variant": "cpp",
+        "any": "cpp"
+    },
+
+    // ==== 🐍 Python 设置 (备用) ====
+    "python.defaultInterpreterPath": "/usr/bin/python3", 
+    "python.analysis.autoImportCompletions": true, 
+    "python.analysis.typeCheckingMode": "basic", 
+    "python.formatting.provider": "black", 
+
+    // ==== ⚙️ 其它杂项 ====
+    "git.autofetch": true, // 自动拉取 Git 远端变更
+    "git.confirmSync": false, // 点同步时不再烦人地问你确不确认
+    "testing.automaticallyOpenPeekViewDuringAutoRun": true, 
+    "terminal.integrated.stickyScroll.enabled": false, // 关闭终端滚动时的置顶吸附效果
+    "explorer.confirmDelete": false, // 删除文件时不再弹窗确认（配合版本控制使用很爽）
+    "cmake.sourceDirectory": "${workspaceFolder}" // 明确告诉 CMake 插件你的根目录在哪
+}

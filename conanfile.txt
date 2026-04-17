@@ -1,0 +1,23 @@
+[requires]
+# 1. 基础音视频与图形库
+ffmpeg/4.4.4
+stb/cci.20240531
+glm/cci.20230113
+
+# 2. qt
+qt/6.5.3
+
+[options]
+# 裁剪 Qt，避免长达几小时的源码编译
+qt/*:qtwebengine=False
+qt/*:qtwebchannel=False
+qt/*:qtwebsockets=False
+
+qt/*:qtmultimedia=True
+
+[generators]
+CMakeDeps
+CMakeToolchain
+
+[layout]
+cmake_layout
