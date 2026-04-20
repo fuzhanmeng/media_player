@@ -1,0 +1,11 @@
+# 继承父目录（根目录）的所有 Checks 配置
+# 这里我们只覆盖 CheckOptions 中关于成员变量的部分
+
+CheckOptions:
+  # ---------- 覆盖：成员变量使用 Qt 风格 (m_xxx) ----------
+  - key: readability-identifier-naming.MemberCase
+    value: lowerCamelCase
+  - key: readability-identifier-naming.MemberPrefix
+    value: 'm_'
+  - key: readability-identifier-naming.MemberSuffix
+    value: ''     # 清空父目录的 '_' 后缀要求

@@ -8,11 +8,13 @@ glm/cci.20230113
 qt/6.5.3
 
 [options]
-# 裁剪 Qt，避免长达几小时的源码编译
+# 强制 Qt 编译为动态链接库，解决 Linux 下 xcb 插件无法加载的问题
+qt/*:shared=True
+
+# 裁剪 Qt，避免长达几小时的无用源码编译
 qt/*:qtwebengine=False
 qt/*:qtwebchannel=False
 qt/*:qtwebsockets=False
-
 qt/*:qtmultimedia=True
 
 [generators]
