@@ -1,0 +1,27 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "运行/调试 ai-media-player",
+            "type": "cppdbg",
+            "request": "launch",
+            // 明确指向我们 CMake 编译出来的那个真实的可执行文件路径
+            "program": "${workspaceFolder}/build/Release/ai_media_player",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}", // 运行目录设为项目根目录，方便读取 resource/
+            "environment": [],
+            "externalConsole": false, // 在 VSCode 内部的终端输出，不要额外弹黑框
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+            // 【核心关联】：在启动调试前，先执行 tasks.json 里的编译任务！
+            "preLaunchTask": "CMake Build Release" 
+        }
+    ]
+}

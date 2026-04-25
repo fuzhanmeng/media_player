@@ -1,0 +1,17 @@
+# 1. 编译输出与构建目录
+build/
+
+# 2. Conan 生成的本地预设文件
+CMakeUserPresets.json
+
+# 3. 运行时的缓存文件
+cache/*
+!cache/.gitkeep
+
+# 4. 操作系统垃圾文件
+.DS_Store
+Thumbs.db
+
+# 5. VSCode 缓存与历史记录 (忽略这些，但不要忽略 json 文件)
+.vscode/ipch/
+.vscode/.root/

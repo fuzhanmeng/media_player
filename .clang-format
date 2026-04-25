@@ -1,0 +1,91 @@
+# ==============================
+# Clang-Format Configuration
+# Derived from Provided Code
+# ==============================
+
+BasedOnStyle: Google
+
+# ------------------------------
+# 缩进（与你的代码一致）
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ContinuationIndentWidth: 4
+
+# ------------------------------
+# 花括号（K&R / Attach）
+BreakBeforeBraces: Attach
+BraceWrapping:
+  AfterClass: false
+  AfterControlStatement: false
+  AfterEnum: false
+  AfterFunction: false
+  AfterNamespace: false
+  AfterStruct: false
+  AfterUnion: false
+  BeforeElse: false
+  BeforeCatch: false
+  IndentBraces: false
+
+# ------------------------------
+# 指针 & 引用（贴变量名）
+PointerAlignment: Left
+ReferenceAlignment: Left
+
+# ------------------------------
+# 访问修饰符
+AccessModifierOffset: -4
+
+# ------------------------------
+# switch / case
+IndentCaseLabels: true
+
+# ------------------------------
+# 行宽
+ColumnLimit: 120
+
+# ------------------------------
+# 控制语句
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: All
+
+# ------------------------------
+# 对齐策略（与你代码一致：不强行对齐）
+AlignAfterOpenBracket: Align
+AlignOperands: false
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+
+# ------------------------------
+# 参数与调用
+BinPackParameters: true
+BinPackArguments: true
+
+# ------------------------------
+# 构造函数初始化列表
+BreakConstructorInitializersBeforeComma: false
+ConstructorInitializerAllOnOneLineOrOnePerLine: true
+
+# ------------------------------
+# 空格规则
+SpaceBeforeAssignmentOperators: true
+SpaceAfterCStyleCast: false
+SpacesInSquareBrackets: false
+SpacesInContainerLiterals: false
+SpacesBeforeTrailingComments: 1
+
+# ------------------------------
+# 空行
+MaxEmptyLinesToKeep: 1
+
+# ------------------------------
+# 注释
+AlignTrailingComments: false
+
+# ==============================
+# Naming (clang-format 无法控制)
+# - 函数：lowerCamelCase
+# - 变量：lowerCamelCase
+# - 类型：CamelCase
+# ==============================

@@ -1,0 +1,54 @@
+Checks: >
+  -*,
+  readability-identifier-naming,
+  modernize-use-constexpr,
+  modernize-use-nullptr,
+  modernize-use-override,
+  modernize-avoid-c-arrays,
+  bugprone-*,
+  performance-*,
+
+WarningsAsErrors: ''
+
+CheckOptions:
+  # ---------- 常量 ----------
+  - key: readability-identifier-naming.ConstantPrefix
+    value: 'k'
+  - key: readability-identifier-naming.ConstantCase
+    value: CamelCase
+
+  # ---------- 变量 ----------
+  - key: readability-identifier-naming.VariableCase
+    value: lowerCamelCase
+
+  # ---------- 成员变量 ----------
+  - key: readability-identifier-naming.MemberCase
+    value: lowerCamelCase
+  - key: readability-identifier-naming.MemberSuffix
+    value: '_'
+
+  # ---------- 函数 ----------
+  - key: readability-identifier-naming.FunctionCase
+    value: lowerCamelCase
+
+  # ---------- 类 / 结构体 ----------
+  - key: readability-identifier-naming.ClassCase
+    value: CamelCase
+  - key: readability-identifier-naming.StructCase
+    value: CamelCase
+
+  # ---------- 命名空间 ----------
+  - key: readability-identifier-naming.NamespaceCase
+    value: lower_case
+
+  # ---------- 枚举 ----------
+  - key: readability-identifier-naming.EnumCase
+    value: CamelCase
+  - key: readability-identifier-naming.EnumConstantPrefix
+    value: 'k'
+  - key: readability-identifier-naming.EnumConstantCase
+    value: CamelCase
+
+  # ---------- 宏 ----------
+  - key: readability-identifier-naming.MacroDefinitionCase
+    value: UPPER_CASE
