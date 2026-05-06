@@ -17,6 +17,7 @@
 
 #include "data/av_packet.h"
 #include "interface/idemuxer_listener.h"
+#include "logger.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -46,6 +47,7 @@ bool Demuxer::Open(const std::string& url) {
     // 2. 打开文件
     if (avformat_ctx_) {
         avformat_close_input(&avformat_ctx_);
+
     }
 
     if (avformat_open_input(&avformat_ctx_, url.c_str(), nullptr, nullptr) < 0) {
@@ -92,12 +94,12 @@ void Demuxer::Start() {
     is_paused_ = false;
 
     cv_.notify_all();
-    std::cout << "[Demuxer] Engine started." << std::endl;
+    LOG_INFO("Engine Start");
 }
 
 void Demuxer::Pause() {
     is_paused_ = true;
-    std::cout << "[Demuxer] Engine paused." << std::endl;
+    LOG_INFO("Engine Paused.");
 }
 
 void Demuxer::Stop() {
@@ -114,7 +116,7 @@ void Demuxer::Stop() {
         thread_.join();
     }
 
-    std::cout << "[Demuxer] Engine stopping..." << std::endl;
+    LOG_INFO("the engine is stopping");
 }
 
 void Demuxer::SeekTo(float progress) {
@@ -185,7 +187,7 @@ void Demuxer::ThreadLoop() {
 void Demuxer::ProcessSeek() {
     // 在这里要操作 FFmpeg，必须加锁
 
-    // 1. add mutex
+    // 1. Lock avformat_mutex_
     std::unique_lock<std::mutex> lock(avformat_mutex_);
     if (!avformat_ctx_) {
         return;
@@ -194,15 +196,17 @@ void Demuxer::ProcessSeek() {
     // 1. 换算目标时间戳
     int64_t target_timestamp = static_cast<int64_t>(seek_progress_ * static_cast<float>(avformat_ctx_->duration));
 
-    // 2. 调用 FFmpeg 底层 API 进行物理寻址 (寻找目标时间点之前的最近一个 I 帧)
+    // 2. 调用 FFmpeg 底层 API 进行物理寻址 AVSEEK_FLAG_BACKWARD(寻找到target_timestamp时刻前的一个I帧)
     if (av_seek_frame(avformat_ctx_, -1, target_timestamp, AVSEEK_FLAG_BACKWARD) >= 0) {
-        std::cout << "[Demuxer] Seek executed successfully." << std::endl;
+        LOG_INFO("Seek executed successfully");
 
         // 3. 构建 Flush 空包，清洗下游的脏数据
         if (listener_) {
             // 给视频管线发送 Flush
+            // 在 FFmpeg 中，如果一个文件没有视频，我们在探测时 stream_index_ 会保持默认初始值（通常设为 -1）
             if (video_stream_.stream_index_ >= 0) {
                 auto flush_video_pkt = std::make_shared<IAVPacket>(nullptr);
+                
                 flush_video_pkt->flags_ |= AVFrameFlag::kFlush;
                 listener_->OnNotifyVideoPacket(flush_video_pkt);
             }
@@ -222,9 +226,13 @@ void Demuxer::ProcessSeek() {
 bool Demuxer::ReadAndSendPacket() {
     // 分配一个干净的空箱子
     AVPacket* packet = av_packet_alloc();
+    if (!packet) {
+        LOG_ERROR("av_packet_alloc failed");
+    }
     int ret = 0;
 
     if (!avformat_ctx_) {
+        LOG_ERROR("avformat_ctx_ is nullptr");
         return false;
     }
     // 锁住文件上下文，防止读取一半时 UI 线程触发了其它对文件的操作

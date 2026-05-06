@@ -12,6 +12,7 @@
 
 #include "igl_context.h"
 #include "iplayer.h"
+#include "logger.h"
 #include "ui/controller_widget.h"
 #include "ui/player_widget.h"
 
@@ -22,25 +23,16 @@ public:
     PlaybackListenerImpl(MainWindow* window) : m_window(window) {}
     ~PlaybackListenerImpl() override = default;
 
-    // 进度更新
     void NotifyPlaybackTimeChanged(float current_pos, float duration) override {
-        // TODO: 以后在这里调 m_window 的进度条更新函数
+        // 进度更新太频繁了，保留 LOG_TRACE，等发布时提高日志级别即可屏蔽
+        LOG_TRACE("Time changed: pos={:.3f}s, duration={:.3f}s", current_pos, duration);
     }
 
-    // 播放开始
-    void NotifyPlaybackStarted() override {
-        // 暂时留空
-    }
+    void NotifyPlaybackStarted() override { LOG_INFO("Playback started."); }
 
-    // 播放暂停
-    void NotifyPlaybackPaused() override {
-        // 暂时留空
-    }
+    void NotifyPlaybackPaused() override { LOG_INFO("Playback paused."); }
 
-    // 播放结束
-    void NotifyPlaybackEOF() override {
-        // 暂时留空
-    }
+    void NotifyPlaybackEOF() override { LOG_INFO("Playback EOF reached."); }
 
 private:
     MainWindow* m_window;
@@ -48,6 +40,7 @@ private:
 namespace av {} // namespace av
 
 MainWindow::MainWindow() : QWidget() {
+    LOG_INFO("Run MainWindow constructor");
     // 1. 创建共享的 OpenGL 上下文 (包装成项目的 av::GLContext)
     auto sharedContext = std::make_shared<av::IGLContext>(QOpenGLContext::globalShareContext());
 
@@ -56,13 +49,14 @@ MainWindow::MainWindow() : QWidget() {
     m_player->SetPlaybackListener(std::make_shared<PlaybackListenerImpl>(this));
 
     if (m_player) {
-        bool ret = m_player->Open("/home/xm/Videos/video0.mp4");
+        std::string test_url = "/home/xm/Videos/video0.mp4";
+        bool ret = m_player->Open(test_url);
         if (!ret) {
-            // 真实项目中这里可以弹个 MessageBox 报错
-            qDebug() << "视频文件打开失败，请检查路径！";
+            LOG_ERROR("Failed to open media, URL: {}", test_url);
+        } else {
+            LOG_INFO("Successfully opened media, URL: {}", test_url);
         }
     }
-
     // 3. 设置布局
     auto* vbox = new QVBoxLayout();
     vbox->setContentsMargins(0, 0, 0, 0);
@@ -92,7 +86,7 @@ MainWindow::~MainWindow() = default;
 
 // 进度条
 void MainWindow::onSliderMoved(int value) {
-    // 调用底层 Seek 接口
+    LOG_INFO("Slider moved by user, target value: {}", value);
     // if (m_player) m_player->Seek(value);
 }
 
@@ -120,10 +114,11 @@ void MainWindow::mouseReleaseEvent(QMouseEvent* event) { QWidget::mouseReleaseEv
 // 简单的双击全屏/还原切换逻辑
 void MainWindow::mouseDoubleClickEvent(QMouseEvent* event) {
     if (isFullScreen()) {
+        LOG_INFO("Double click detected, exiting full screen.");
         showNormal();
     } else {
+        LOG_INFO("Double click detected, entering full screen.");
         showFullScreen();
     }
-
     QWidget::mouseDoubleClickEvent(event);
 }

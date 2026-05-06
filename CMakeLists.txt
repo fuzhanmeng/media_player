@@ -1,77 +1,82 @@
 cmake_minimum_required(VERSION 3.23)
 project(ai_media_player VERSION 1.0.0 LANGUAGES CXX)
 
-# 1. Global Configurations (全局编译与构建策略配置)
 
-# 设置 C++ 标准为 C++17
+# 1. Global Toolchain & Build Strategy Configuration (全局工具链与构建策略配置)
+# Enforce C++17 Standard Compilation
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 启用 Qt 的元对象编译 (MOC)、资源编译 (RCC) 和 UI 文件编译 (UIC) 自动化
+# Enable Qt Code Generation Pipelines
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
-# 生成 compile_commands.json，供 clangd 等 LSP (语言服务器) 进行代码补全与静态分析
+# Generate Compilation Database for LSP static analysis
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-
-# 2. Dependency Resolution (外部依赖项寻址)
-# 查找通过包管理器 (如 Conan/vcpkg) 或系统环境变量安装的第三方依赖
+# 2. External Dependency Resolution (外部依赖项寻址与链接)
+# Locate third-party libraries via CMake config modules or pkg-config (定位第三方库配置模块)
 find_package(ffmpeg REQUIRED CONFIG)
 find_package(stb REQUIRED CONFIG)
 find_package(glm REQUIRED CONFIG)
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets OpenGL OpenGLWidgets Multimedia)
-find_package(Threads REQUIRED) # POSIX 线程库支持
+find_package(Threads REQUIRED)       # POSIX Threads API 支持
+find_package(spdlog REQUIRED CONFIG) # 高性能日志中间件
 
 
-# 3. Target Definition: Static Library静态库构建
+
+# 3. Target Definition: Core Static Library (核心逻辑层静态库构建)
+# Recursively collect translation units; CONFIGURE_DEPENDS triggers re-configuration on filesystem mutation.
+# (递归收集编译单元；通过监视文件系统变动触发自动重配置)
 file(GLOB_RECURSE LEARN_AV_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/learn_av/*.cpp")
 
+# Define a Static Library Target (定义静态库目标实体)
 add_library(learn_av_lib STATIC ${LEARN_AV_SOURCES})
 
-# 配置 Target 的头文件搜索路径 (Include Directories)
-target_include_directories(learn_av_lib 
-    PUBLIC 
-        # PUBLIC：qt 模块也会继承这里的路径，所以放对外暴露的接口
-        ${CMAKE_CURRENT_SOURCE_DIR}/learn_av/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/inspire_face 
-    PRIVATE
-        # PRIVATE：仅 learn_av_lib 内部编译时可见
-        ${CMAKE_CURRENT_SOURCE_DIR}/learn_av/src
+# Set PUBLIC Include Directories: Propagated to both internal compilation and external dependent targets.
+# (配置公有头文件搜索路径：提供给内部编译使用，并传递给所有链接此库的外部模块)
+target_include_directories(learn_av_lib PUBLIC 
+    ${CMAKE_CURRENT_SOURCE_DIR}/learn_av/include
 )
 
-# 配置 Target 的链接依赖 (Link Libraries)
+# Set PRIVATE Include Directories: Restricted to internal translation unit compilation only.
+# (配置私有头文件搜索路径：作用域严格限制于内部源码编译，禁止向外传递)
+target_include_directories(learn_av_lib PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}/learn_av/src     
+    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/inspire_face 
+)
+
+# Configure Target Link Libraries (配置目标实体的动态/静态链接依赖)
 target_link_libraries(learn_av_lib PUBLIC 
     ffmpeg::ffmpeg 
     stb::stb 
     glm::glm
     Threads::Threads
+    spdlog::spdlog
 )
 
-
-# 4. Target Definition: Application Executable 应用层：可执行程序构建
-# 收集表现层 (Qt GUI) 源代码
+# 4. Target Definition: Application Executable
+# Collect presentation layer translation units (收集表现层编译单元)
 file(GLOB_RECURSE QT_DEMO_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/qt/*.cpp")
 
-# 定义可执行文件 Target
+# Define Executable Target (定义最终可执行文件实体)
 add_executable(${PROJECT_NAME} ${QT_DEMO_SOURCES})
 
-# 应用层仅供内部编译使用，不向外暴露，因此声明为 PRIVATE
+# Restrict presentation layer includes to internal scope (将表现层头文件作用域限制为私有)
 target_include_directories(${PROJECT_NAME} PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}/qt
 )
 
-# 链接业务逻辑层 (learn_av_lib) 及应用层框架 (Qt6)
+# Link core business logic target and UI framework (执行链接过程：整合核心逻辑模块与 Qt 框架)
 target_link_libraries(${PROJECT_NAME} PRIVATE 
     learn_av_lib  
     Qt6::Core Qt6::Gui Qt6::Widgets Qt6::OpenGL Qt6::OpenGLWidgets Qt6::Multimedia
 )
 
-
-# 5. 预处理宏注入
-
-# 将资源目录的绝对路径作为宏定义注入到 C++ 源码中，方便运行时寻址
+# 5. Preprocessor Macro Injection (预处理器宏定义注入)
+# Inject absolute filesystem paths as compilation definitions for runtime I/O 
+# (将文件系统绝对路径注入为预处理宏，供运行时 I/O 操作寻址使用)
 target_compile_definitions(${PROJECT_NAME} PRIVATE 
     RESOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/resource"
     CACHE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/cache"
