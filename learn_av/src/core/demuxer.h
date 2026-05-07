@@ -12,7 +12,7 @@
 #include <string>
 #include <thread>
 
-#include "../interface/idemuxer.h"
+#include "interface/idemuxer.h"
 
 struct AVFormatContext;
 

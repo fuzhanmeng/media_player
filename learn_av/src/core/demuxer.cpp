@@ -1,9 +1,9 @@
 /**
- * @file demuxer
- * @brief 解封装模块的实现,负责将MP4拆解为音视频Packet
+ * @file demuxer.cpp
+ * @brief Demuxer module responsible for demuxing mp4.
  */
 
-#include "../core/demuxer.h"
+#include "demuxer.h"
 
 #include <chrono>
 #include <condition_variable>
@@ -15,8 +15,8 @@
 #include <string>
 #include <thread>
 
-#include "../data/av_packet.h"
-#include "../interface/idemuxer_listener.h"
+#include "data/av_packet.h"
+#include "interface/idemuxer_listener.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -33,6 +33,8 @@ Demuxer::~Demuxer() {
     if (avformat_ctx_) {
         avformat_close_input(&avformat_ctx_);
     }
+
+    std::cout << "[Demuxer] Destroyed." << std::endl;
 }
 
 void Demuxer::SetListener(IDemuxerListener* listener) { listener_ = listener; }
@@ -47,13 +49,13 @@ bool Demuxer::Open(const std::string& url) {
     }
 
     if (avformat_open_input(&avformat_ctx_, url.c_str(), nullptr, nullptr) < 0) {
-        std::cerr << "open mp4 file fail" << std::endl;
+        std::cerr << "[Demuxer] Error: Failed to open input file, url: " << url << std::endl;
         return false;
     }
 
     // 3. 探测流信息
     if (avformat_find_stream_info(avformat_ctx_, nullptr) < 0) {
-        std::cerr << "find mp4 avformat_ctx info fail" << std::endl;
+        std::cerr << "[Demuxer] Error: Failed to find stream information." << std::endl;
         return false;
     }
 
@@ -90,12 +92,12 @@ void Demuxer::Start() {
     is_paused_ = false;
 
     cv_.notify_all();
-    std::cout << "Engine Start" << std::endl;
+    std::cout << "[Demuxer] Engine started." << std::endl;
 }
 
 void Demuxer::Pause() {
     is_paused_ = true;
-    std::cout << "Engine Paused." << std::endl;
+    std::cout << "[Demuxer] Engine paused." << std::endl;
 }
 
 void Demuxer::Stop() {
@@ -112,7 +114,7 @@ void Demuxer::Stop() {
         thread_.join();
     }
 
-    std::cout << "the engine is stopping" << std::endl;
+    std::cout << "[Demuxer] Engine stopping..." << std::endl;
 }
 
 void Demuxer::SeekTo(float progress) {
@@ -194,7 +196,7 @@ void Demuxer::ProcessSeek() {
 
     // 2. 调用 FFmpeg 底层 API 进行物理寻址 (寻找目标时间点之前的最近一个 I 帧)
     if (av_seek_frame(avformat_ctx_, -1, target_timestamp, AVSEEK_FLAG_BACKWARD) >= 0) {
-        std::cout << "Seek executed successfully" << std::endl;
+        std::cout << "[Demuxer] Seek executed successfully." << std::endl;
 
         // 3. 构建 Flush 空包，清洗下游的脏数据
         if (listener_) {
@@ -239,8 +241,7 @@ bool Demuxer::ReadAndSendPacket() {
             // 视频流包+1
             video_stream_.pipeline_resource_count_++;
 
-            // 创建一个智能指针指向回调函数？safe_packet是不是指向了一个结构体？？IAVPacket
-            // IAVPacket里面
+            // 创建一个智能指针指向回调函数
             safe_packet->release_callback_ = std::make_shared<std::function<void()>>([this]() {
                 video_stream_.pipeline_resource_count_--;
                 cv_.notify_all(); // 通知被堵住的 Demuxer 可以继续发货了
@@ -269,7 +270,7 @@ bool Demuxer::ReadAndSendPacket() {
     // 发生严重读取错误else
     else {
         av_packet_free(&packet);
-        std::cerr << "read error" << std::endl;
+        std::cerr << "[Demuxer] Error: Failed to read frame." << std::endl;
         return false;
     }
     return true;

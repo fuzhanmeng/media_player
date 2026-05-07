@@ -10,7 +10,7 @@
 #include <QSlider>
 #include <QVBoxLayout>
 
-#include "../include/igl_context.h"
+#include "igl_context.h"
 #include "iplayer.h"
 #include "ui/controller_widget.h"
 #include "ui/player_widget.h"

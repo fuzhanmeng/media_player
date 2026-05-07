@@ -26,17 +26,19 @@ find_package(Threads REQUIRED) # POSIX 线程库支持
 
 
 # 3. Target Definition: Static Library静态库构建
-# 使用 CONFIGURE_DEPENDS 追踪文件系统变更，收集底层核心源代码
 file(GLOB_RECURSE LEARN_AV_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/learn_av/*.cpp")
 
-# 定义静态库 Target
 add_library(learn_av_lib STATIC ${LEARN_AV_SOURCES})
 
 # 配置 Target 的头文件搜索路径 (Include Directories)
-# 声明为 PUBLIC：该库自身编译需要这些路径，且链接此库的上层模块也继承这些路径
-target_include_directories(learn_av_lib PUBLIC 
-    ${CMAKE_CURRENT_SOURCE_DIR}/learn_av/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/inspire_face 
+target_include_directories(learn_av_lib 
+    PUBLIC 
+        # PUBLIC：qt 模块也会继承这里的路径，所以放对外暴露的接口
+        ${CMAKE_CURRENT_SOURCE_DIR}/learn_av/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/inspire_face 
+    PRIVATE
+        # PRIVATE：仅 learn_av_lib 内部编译时可见
+        ${CMAKE_CURRENT_SOURCE_DIR}/learn_av/src
 )
 
 # 配置 Target 的链接依赖 (Link Libraries)
