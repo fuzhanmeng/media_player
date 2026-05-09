@@ -10,42 +10,58 @@
 #include <QSlider>
 #include <QVBoxLayout>
 
+#include "igl_context.h"
 #include "iplayer.h"
 #include "ui/controller_widget.h"
 #include "ui/player_widget.h"
 
 // 具体的类来实现监听器接口
-class PlaybackListenerImpl : public av::IPlaybackListener{
+class PlaybackListenerImpl : public av::IPlaybackListener {
 public:
     // 构造函数接收 MainWindow 的指针，方便以后在回调里更新 UI
-    PlaybackListenerImpl(MainWindow* window): m_window(window) {
+    PlaybackListenerImpl(MainWindow* window) : m_window(window) {}
+    ~PlaybackListenerImpl() override = default;
 
+    // 进度更新
+    void NotifyPlaybackTimeChanged(float current_pos, float duration) override {
+        // TODO: 以后在这里调 m_window 的进度条更新函数
     }
-    ~PlaybackListenerImpl() = default;
 
-    void OnProgress(int current_pos, int total_duration) override {
+    // 播放开始
+    void NotifyPlaybackStarted() override {
+        // 暂时留空
+    }
 
+    // 播放暂停
+    void NotifyPlaybackPaused() override {
+        // 暂时留空
+    }
+
+    // 播放结束
+    void NotifyPlaybackEOF() override {
+        // 暂时留空
     }
 
 private:
     MainWindow* m_window;
 };
-
-namespace av {
-struct GLContext {
-    void* handle;
-    explicit GLContext(QOpenGLContext* ctx) : handle(ctx) {}
-};
-} // namespace av
+namespace av {} // namespace av
 
 MainWindow::MainWindow() : QWidget() {
     // 1. 创建共享的 OpenGL 上下文 (包装成项目的 av::GLContext)
-    av::GLContext sharedContext{QOpenGLContext::globalShareContext()};
+    auto sharedContext = std::make_shared<av::IGLContext>(QOpenGLContext::globalShareContext());
 
     // 2. 创建 Player，并设置播放回调
-    m_player = std::shared_ptr<av::IPlayer>(av::IPlayer::Create(&sharedContext));
-
+    m_player = av::IPlayer::Create(sharedContext);
     m_player->SetPlaybackListener(std::make_shared<PlaybackListenerImpl>(this));
+
+    if (m_player) {
+        bool ret = m_player->Open("/home/xm/Videos/video0.mp4");
+        if (!ret) {
+            // 真实项目中这里可以弹个 MessageBox 报错
+            qDebug() << "视频文件打开失败，请检查路径！";
+        }
+    }
 
     // 3. 设置布局
     auto* vbox = new QVBoxLayout();

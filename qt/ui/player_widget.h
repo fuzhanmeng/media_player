@@ -1,3 +1,4 @@
+#pragma once
 /**
  * @brief 视频渲染容器组件
  * 负责管理底层的 OpenGLView，并在自身生命周期内，
@@ -7,7 +8,6 @@
 #include <QWidget> // 所有用户界面对象的基类
 #include <memory>
 
-#pragma once
 
 namespace av {
 class IPlayer;
