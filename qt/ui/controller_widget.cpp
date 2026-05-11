@@ -3,6 +3,7 @@
  * @brief 底部控制面板的实现
  */
 #include "controller_widget.h"
+#include "logger.h"
 
 #include <QDebug>
 #include <QHBoxLayout>
@@ -36,9 +37,10 @@ ControllerWidget::~ControllerWidget() = default;
 void ControllerWidget::onPlayButtonClicked() {
     // 如果没有播放器实例，直接返回
     if (!m_player) {
+        LOG_ERROR("m_player is null");
         return;
     }
-    qDebug() << "[UI 交互] 播放/暂停按钮被点击了！";
+    LOG_INFO("Click Play or Pause");
     if (m_player->IsPlaying()) {
         // 如果底层当前正在播放，说明用户想要暂停
         m_player->Pause(); // 发送暂停指令给底层引擎

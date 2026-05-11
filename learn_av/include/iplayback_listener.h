@@ -10,17 +10,17 @@ class IPlaybackListener {
 public:
     virtual ~IPlaybackListener() = default;
 
-    // 播放开始
+    // Start Play
     virtual void NotifyPlaybackStarted() = 0;
 
-    // 播放进度更新
+    // Playback progress update
     // current_pos: 当前时间，duration: 总时长
     virtual void NotifyPlaybackTimeChanged(float current_pos, float duration) = 0;
 
-    // 播放暂停
+    // Pause
     virtual void NotifyPlaybackPaused() = 0;
 
-    // 播放结束 (End Of File)
+    // End
     virtual void NotifyPlaybackEOF() = 0;
 };
 
