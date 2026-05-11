@@ -1,30 +1,56 @@
 /**
- * @file idemuxer_listener
- * @brief 解复用器数据输出监听接口 (观察者模式)
+ * @file idemuxer_listener.h
+ * @brief 解封装器事件监听器接口
  */
 #pragma once
 
 #include <memory>
 
-struct AVStream;
+extern "C" {
+#include <libavformat/avformat.h>
+}
 
 namespace av {
-struct IAVPacket;
 
+class Packet;
+
+/**
+ * @brief 解封装器事件监听器接口
+ * @details 所有需要接收解封装器事件的类都需要实现这个接口
+ */
 class IDemuxerListener {
 public:
     virtual ~IDemuxerListener() = default;
 
-    // --- 阶段一：流信息初始化通知 ---
-    // 解复用器打开文件后，一旦找到音视频流，立刻通过这两个接口把流信息(包含编解码参数)发给下游
+    /**
+     * @brief 通知发现视频流
+     * @param stream FFmpeg视频流对象
+     */
     virtual void OnNotifyVideoStream(AVStream* stream) = 0;
+
+    /**
+     * @brief 通知发现音频流
+     * @param stream FFmpeg音频流对象
+     */
     virtual void OnNotifyAudioStream(AVStream* stream) = 0;
 
-    // --- 阶段二：实时数据包推送 ---
-    // 解复用器在后台线程读到压缩数据后，封装成 IAVPacket，通过这两个接口源源不断地推给下游
-    virtual void OnNotifyVideoPacket(std::shared_ptr<IAVPacket> packet) = 0;
-    virtual void OnNotifyAudioPacket(std::shared_ptr<IAVPacket> packet) = 0;
+    /**
+     * @brief 通知收到视频数据包
+     * @param packet 视频数据包
+     */
+    virtual void OnNotifyVideoPacket(std::shared_ptr<Packet> packet) = 0;
 
-private:
+    /**
+     * @brief 通知收到音频数据包
+     * @param packet 音频数据包
+     */
+    virtual void OnNotifyAudioPacket(std::shared_ptr<Packet> packet) = 0;
+
+    /**
+     * @brief 通知到达文件末尾
+     * @details 当解封装器读完所有数据包时调用此方法
+     */
+    virtual void OnNotifyEOF() = 0;
 };
+
 } // namespace av

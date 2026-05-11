@@ -17,26 +17,80 @@
 #include "ui/player_widget.h"
 
 // 具体的类来实现监听器接口
+// 具体的类来实现监听器接口
 class PlaybackListenerImpl : public av::IPlaybackListener {
 public:
-    // 构造函数接收 MainWindow 的指针，方便以后在回调里更新 UI
-    PlaybackListenerImpl(MainWindow* window) : m_window(window) {}
+    // 构造函数接收 MainWindow 的指针，用于后续的跨线程 UI 更新
+    explicit PlaybackListenerImpl(MainWindow* window) : m_window(window) {}
     ~PlaybackListenerImpl() override = default;
 
-    void NotifyPlaybackTimeChanged(float current_pos, float duration) override {
-        // 进度更新太频繁了，保留 LOG_TRACE，等发布时提高日志级别即可屏蔽
-        LOG_TRACE("Time changed: pos={:.3f}s, duration={:.3f}s", current_pos, duration);
+    // 1. 播放开始
+    void OnPlaybackStarted() override {
+        LOG_INFO("Playback started.");
+        if (m_window) {
+            QMetaObject::invokeMethod(m_window, [window = m_window]() {
+                // TODO: 在主线程更新 UI (如切换播放按钮状态)
+            });
+        }
     }
 
-    void NotifyPlaybackStarted() override { LOG_INFO("Playback started."); }
+    // 2. 播放暂停
+    void OnPlaybackPaused() override {
+        LOG_INFO("Playback paused.");
+        if (m_window) {
+            QMetaObject::invokeMethod(m_window, [window = m_window]() {
+                // TODO: 在主线程更新 UI
+            });
+        }
+    }
 
-    void NotifyPlaybackPaused() override { LOG_INFO("Playback paused."); }
+    // 3. 播放恢复 (从暂停继续)
+    void OnPlaybackResumed() override {
+        LOG_INFO("Playback resumed.");
+        if (m_window) {
+            QMetaObject::invokeMethod(m_window, [window = m_window]() {
+                // TODO: 在主线程更新 UI
+            });
+        }
+    }
 
-    void NotifyPlaybackEOF() override { LOG_INFO("Playback EOF reached."); }
+    // 4. 播放完成 (EOF)
+    void OnPlaybackCompleted() override {
+        LOG_INFO("Playback completed (EOF reached).");
+        if (m_window) {
+            QMetaObject::invokeMethod(m_window, [window = m_window]() {
+                // TODO: 在主线程重置 UI 状态
+            });
+        }
+    }
+
+    // 5. 播放错误
+    void OnPlaybackError(int error_code, const std::string& error_msg) override {
+        LOG_ERROR("Playback error: {} - {}", error_code, error_msg);
+        if (m_window) {
+            QMetaObject::invokeMethod(m_window, [window = m_window, error_msg]() {
+                // TODO: 在主线程弹出错误提示框
+            });
+        }
+    }
+
+    // 6. 播放进度更新
+    void OnPlaybackProgress(float progress, float current_time, float total_time) override {
+        // 降低日志级别避免刷屏
+        LOG_TRACE("Playback progress: {:.2f}%, time: {:.2f}s / {:.2f}s", progress * 100.0f, current_time, total_time);
+
+        if (m_window) {
+            QMetaObject::invokeMethod(m_window, [window = m_window, current_time, total_time]() {
+                // TODO: 在主线程更新进度条
+                // 注意：如果用户正在拖拽进度条，此时应避免更新导致滑块跳动
+            });
+        }
+    }
 
 private:
-    MainWindow* m_window;
+    MainWindow* m_window{nullptr};
 };
+
 namespace av {} // namespace av
 
 MainWindow::MainWindow() : QWidget() {

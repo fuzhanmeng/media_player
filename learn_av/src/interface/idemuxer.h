@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 
 namespace av {
@@ -55,6 +56,11 @@ public:
      * @return 总时长（单位：秒 或 毫秒，由具体实现决定，建议统一为秒的浮点数）
      */
     virtual float GetDuration() = 0;
+
+    /**
+     * @brief 获取解复用器实例
+     */
+    static std::unique_ptr<IDemuxer> Create();
 };
 
 } // namespace av

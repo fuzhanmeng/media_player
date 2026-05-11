@@ -54,30 +54,40 @@ private:
         int stream_index_{-1};
         std::atomic<int> pipeline_resource_count_{0}; // 当前线程内累积了多少包
         std::shared_ptr<std::function<void()>> pipeline_release_callback_; // 该条流的回调
+
+        /**
+         * @brief 重置流信息到初始状态
+         */
+        void Reset() {
+            stream_index_ = -1;
+            pipeline_resource_count_.store(0, std::memory_order_release);
+            pipeline_release_callback_.reset();
+        }
     };
 
 private:
-    IDemuxerListener* listener_{nullptr};
+    IDemuxerListener* demuxer_listener_{nullptr};
 
-    // ffmpeg
+    // FFmpeg格式上下文
     AVFormatContext* avformat_ctx_{nullptr};
     std::mutex avformat_mutex_;
 
-    // audio and video info struct
-    StreamInfo audio_stream_;
-    StreamInfo video_stream_;
+    // 音视频流信息
+    StreamInfo audio_stream_info_;
+    StreamInfo video_stream_info_;
 
-    // thread info
-    std::thread thread_;
+    // 工作线程
+    std::thread demuxer_thread_;
     std::atomic<bool> is_paused_{true}; // 是否处于暂停读取状态
-    std::atomic<bool> is_abort_{false}; // 是否彻底终止销毁线程
+    std::atomic<bool> is_abort_requested_{false}; // 是否彻底终止销毁线程
 
-    std::mutex cv_mutex_;
-    std::condition_variable cv_;
+    // 条件变量
+    std::mutex condition_mutex_;
+    std::condition_variable demuxer_cv_;
     const int kMaxPipelineCapacity = 100;
 
-    // seek
+    // 跳转相关
     std::atomic<bool> is_seek_requested_{false};
-    std::atomic<float> seek_progress_{-1.0f};
+    std::atomic<float> target_seek_progress_{-1.0f};
 };
 } // namespace av
