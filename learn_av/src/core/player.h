@@ -1,167 +1,179 @@
 /**
  * @file player.h
  * @brief 播放器核心调度中枢实现类
- * @details 整个播放器架构的唯一控制中心，负责协调解封装、解码、渲染等所有底层模块
- *          所有底层模块的事件都汇聚到这里，由Player统一调度并向UI层暴露标准接口
- *          所有公共方法都是线程安全的，可以在任意线程中调用
+ * @details 负责统筹底层数据路由、管线调度，并维护全局有限状态机 (FSM)
  */
 #pragma once
 
 #include <atomic>
-#include <fstream> // 新增头文件
+#include <condition_variable>
+#include <fstream>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
 
-#include "interface/iaudio_decoder.h"
-#include "interface/idemuxer.h"
-#include "interface/idemuxer_listener.h"
+#include "interface/ifile_reader.h"
 #include "iplayer.h"
+#include "playback_state.h"
 
 namespace av {
 
+// 对象前置声明
 class Frame;
-class Packet;
+class VideoFrame;
 
 /**
  * @class Player
  * @brief 播放器核心实现类
- * @inherit IPlayer 面向UI层的播放器标准接口
- * @inherit IDemuxerListener 解封装器事件监听器，接收解封装器的所有事件
- * @inherit IAudioDecoder::Listener 音频解码器事件监听器，接收音频解码器的所有事件
+ * @inherit IPlayer 面向 UI 层的标准播放控制契约
+ * @inherit IFileReader::Listener 底层音视频纯净帧数据的唯一合法接收通道
  */
-class Player : public IPlayer, public IDemuxerListener, public IAudioDecoder::Listener {
+class Player : public IPlayer, public IFileReader::Listener {
 public:
     explicit Player(std::shared_ptr<IGLContext> gl_context);
-
     ~Player() override;
 
-    // UI相关接口
+    // ================= 渲染管道控制 =================
 
     /**
-     * @brief 绑定显示视图
-     * @param view_handle 平台相关的视图句柄
-     * @note 必须在主线程中调用
+     * @brief 绑定视频渲染槽
+     * @param sink 实现了 IVideoSink 接口的视频帧接收器
      */
-    void AttachDisplayView(void* view_handle) override;
+    void AttachDisplayView(IVideoSink* sink) override;
 
     /**
-     * @brief 解绑显示视图
-     * @param view_handle 要解绑的视图句柄
-     * @note 只有传入的句柄与当前绑定的句柄一致时才会执行解绑
+     * @brief 解绑视频渲染槽
+     * @param sink 要解绑的视频帧接收器
      */
-    void DetachDisplayView(void* view_handle) override;
+    void DetachDisplayView(IVideoSink* sink) override;
 
-    // 播放控制接口
+    // ================= 播放状态机控制指令 =================
 
     /**
-     * @brief 打开媒体文件
+     * @brief 打开媒体流并建立底层数据路由
      * @param url 媒体文件路径或网络流地址
-     * @return true 打开成功；false 打开失败
-     * @note 该方法是同步阻塞的，会执行文件IO和流解析操作
+     * @return true 探测成功；false 打开失败
+     * @note 该方法会触发底层 Demuxer 的同步阻塞探测逻辑
      */
     bool Open(const std::string& url) override;
 
     /**
-     * @brief 开始或恢复播放
-     * @note 如果已经在播放状态，调用此方法无效果
+     * @brief 触发播放状态机流转 (kIdle/kPaused -> kPlaying)
      */
     void Play() override;
 
     /**
-     * @brief 暂停播放
-     * @note 如果已经在暂停状态，调用此方法无效果
+     * @brief 触发播放状态机流转 (kPlaying -> kPaused)，挂起全链路线程
      */
     void Pause() override;
 
     /**
-     * @brief 查询当前是否正在播放
-     * @return true 正在播放；false 已暂停或已停止
+     * @brief 终止播放状态机，安全释放底层的解码与解复用引擎
      */
-    bool IsPlaying() const override;
+    void Stop() override;
 
     /**
-     * @brief 设置播放事件监听器
-     * @param listener 监听器指针，接收播放状态变化事件
-     * @note 所有监听器回调都保证在主线程中调用
+     * @brief 触发媒体物理时间轴跳转 (Seek)
+     * @param target_time_sec 目标绝对时间（单位：秒）
+     * @note Pause -> Flush -> Seek -> 状态恢复 的多线程安全时序
      */
-    void SetPlaybackListener(std::shared_ptr<IPlaybackListener> listener) override;
+    void SeekTo(double target_time_sec) override;
 
-    // IDemuxerListener 接口实现, 所有方法都由解复用线程调用
-    /**
-     * @brief 通知发现视频流
-     * @param stream FFmpeg视频流对象
-     * @note 由解复用线程调用
-     */
-    void OnNotifyVideoStream(AVStream* stream) override;
+    // ================= 状态查询与事件订阅 =================
 
     /**
-     * @brief 通知发现音频流
-     * @param stream FFmpeg音频流对象
-     * @note 由解复用线程调用
+     * @brief 获取当前媒体全局总时长
+     * @return 总时长（单位：秒）。若是直播流或未就绪，返回 0.0
      */
-    void OnNotifyAudioStream(AVStream* stream) override;
+    double GetDuration() const override;
 
     /**
-     * @brief 通知收到视频数据包
-     * @param packet 视频数据包
-     * @note 由解复用线程调用
+     * @brief 获取图像物理宽度
+     * @note 仅在 Open 成功解析流信息后有效
      */
-    void OnNotifyVideoPacket(std::shared_ptr<Packet> packet) override;
+    int GetVideoWidth() const override;
 
     /**
-     * @brief 通知收到音频数据包
-     * @param packet 音频数据包
-     * @note 由解复用线程调用
+     * @brief 获取图像物理高度
+     * @note 仅在 Open 成功解析流信息后有效
      */
-    void OnNotifyAudioPacket(std::shared_ptr<Packet> packet) override;
+    int GetVideoHeight() const override;
 
     /**
-     * @brief 通知解封装器到达文件末尾
-     * @details 表示解封装器已经读完了所有数据包
-     * @note 由解复用线程调用
+     * @brief 查询当前播放器状态机的原子状态
+     * @return 当前所处的 PlaybackState 枚举值
      */
-    void OnNotifyEOF() override;
+    PlaybackState GetState() const override;
 
-    // IAudioDecoder::Listener 接口实现,所有方法都由音频解码线程调用
-    /**
-     * @brief 通知收到解码后的音频帧
-     * @param frame 解码后的原始音频帧
-     * @note 由音频解码线程调用
-     */
-    void OnNotifyAudioFrame(std::shared_ptr<Frame> frame) override;
-
-    /**
-     * @brief 通知音频解码器到达末尾
-     * @details 表示音频解码器已经输出了所有剩余帧
-     * @note 由音频解码线程调用
-     */
-    void OnNotifyAudioEOF() override;
-
-    // 调试工具方法
-    /**
-     * @brief 调试专用：打印数据包的详细信息
-     * @param stream_type 标明是 "Video" 还是 "Audio"
-     * @param packet 要打印的数据包
-     */
-    void DumpPacketInfo(const std::string& stream_type, const std::shared_ptr<Packet>& packet);
+    void SetListener(IPlayer::Listener* listener) override;
 
 private:
-    // 渲染相关
-    /// 共享的OpenGL上下文，用于视频渲染
+    // ================= IFileReader::Listener 数据上行接口实现 =================
+
+    /**
+     * @brief 接收底层解码输出的纯净 PCM 音频帧
+     * @param audio_frame 包含采样率、声道数等物理参数的音频数据 DTO
+     */
+    void OnFileReaderNotifyAudioFrame(std::shared_ptr<Frame> audio_frame) override;
+
+    /**
+     * @brief 接收底层解码输出的纯净 YUV/RGB 视频帧
+     * @param video_frame 包含分辨率、色彩空间等物理参数的视频数据 DTO
+     */
+    void OnFileReaderNotifyVideoFrame(std::shared_ptr<VideoFrame> video_frame) override;
+
+    /**
+     * @brief 音频物理管线彻底枯竭 (Audio EOF)
+     * @details 底层音频解码器内部残留帧已全部排空
+     */
+    void OnFileReaderNotifyAudioFinished() override;
+
+    /**
+     * @brief 视频物理管线彻底枯竭 (Video EOF)
+     * @details 底层视频解码器内部残留帧已全部排空
+     */
+    void OnFileReaderNotifyVideoFinished() override;
+
+    // ================= 内部控制逻辑 =================
+
+    /**
+     * @brief 内部状态机跃迁辅助函数
+     * @param new_state 目标原子状态
+     * @details 负责执行 CAS 状态锁更新，并异步派发事件至 UI 层
+     */
+    void ChangeState(PlaybackState new_state);
+
+private:
+    // ================= 核心基础设施 =================
+
+    /// 面向 UI 层的事件监听器 (采用裸指针，严格防止循环依赖)
+    IPlayer::Listener* listener_{nullptr};
+
+    /// 硬件 OpenGL 上下文句柄 (用于后续初始化 VideoPipeline 渲染管线)
     std::shared_ptr<IGLContext> gl_context_{nullptr};
-    /// 平台相关的显示视图句柄
-    void* view_handle_{nullptr};
 
-    // 状态与监听器
-    std::atomic<bool> is_playing_{false};
-    /// 面向UI层的播放事件监听器
-    std::shared_ptr<IPlaybackListener> ui_listener_{nullptr};
+    /// 底层数据源路由总管
+    std::unique_ptr<IFileReader> file_reader_{nullptr};
 
-    // 底层模块
-    /// 解封装器实例，负责读取媒体文件并拆解为音视频数据包
-    std::unique_ptr<IDemuxer> demuxer_{nullptr};
-    /// 音频解码器实例，负责解码音频数据包为原始音频帧
-    std::unique_ptr<IAudioDecoder> audio_decoder_{nullptr};
+    // ================= 视频渲染分发 =================
+    // 保存注册上来的 OpenGLView 等接收端
+    std::vector<IVideoSink*> video_sinks_;
+    // 保护 video_sinks_ 读写的互斥锁，防止 UI 销毁组件时底层还在刷帧
+    std::mutex sinks_mutex_;
 
+    // ================= 多线程状态同步原语 (The Source of Truth) =================
+
+    // 全局同步上下文的持久化句柄
+    std::shared_ptr<SyncContext> sync_ctx_;
+
+    // ================= 调试工具 =================
+
+    /// 调试专用：纯净 PCM 音频裸流文件
     std::ofstream debug_pcm_file_;
+
+    /// 调试专用：纯净 YUV 视频裸流文件
+    std::ofstream debug_yuv_file_;
 };
 
 } // namespace av

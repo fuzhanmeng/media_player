@@ -12,16 +12,13 @@ void Logger::Init() {
     if (s_CoreLogger_ != nullptr) {
         return;
     }
+
     // 1. 控制台 sink
     auto console_sink_ = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
-
-    // 【修改点 1】：加入 [%s:%#] (文件名:行号) 和 [%!] (函数名) 占位符
     console_sink_->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [thread %t] [%s:%#] [%!] [%^%l%$] %v");
 
-    // 2. 文件 sink
+    // 2. 文件 sink 加入 [%s:%#] (文件名:行号) 和 [%!] (函数名) 占位符
     auto file_sink_ = std::make_shared<spdlog::sinks::basic_file_sink_mt>("logs/ai_media_player.log", true);
-
-    // 同步更新文件 sink 的格式化字符串
     file_sink_->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [thread %t] [%s:%#] [%!] [%l] %v");
 
     // 3. sink 集合
@@ -38,6 +35,22 @@ void Logger::Init() {
 
     // 7. 注册 logger
     spdlog::register_logger(s_CoreLogger_);
+
+    // 设置为全局默认logger，方便第三方库使用
+    spdlog::set_default_logger(s_CoreLogger_);
+}
+
+void Logger::Shutdown() {
+    // 先刷新所有未写入的日志
+    if (s_CoreLogger_) {
+        s_CoreLogger_->flush();
+    }
+
+    // 关闭spdlog所有logger
+    spdlog::shutdown();
+
+    // 释放logger资源
+    s_CoreLogger_.reset();
 }
 
 } // namespace av

@@ -1,7 +1,7 @@
 #pragma once
 
-// 【关键】：必须在 #include <spdlog/spdlog.h> 之前定义此宏，
-// 解除预处理器对 TRACE 和 DEBUG 级别的编译期屏蔽。
+// 在 #include <spdlog/spdlog.h> 之前定义此宏，
+// 解除预处理器对 TRACE 和 DEBUG 级别的编译期屏蔽
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LEVEL_TRACE
 
 #include <spdlog/spdlog.h>
@@ -16,6 +16,8 @@ public:
     ~Logger() = delete;
 
     static void Init();
+    static void Shutdown();
+
     inline static std::shared_ptr<spdlog::logger>& GetCoreLogger() { return s_CoreLogger_; }
 
 private:

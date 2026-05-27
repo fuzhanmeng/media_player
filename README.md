@@ -149,28 +149,82 @@ make -j8
 ## 项目目录结构
 ```
 ai-media-player/
-├── 3rdparty/                # 第三方依赖库目录
-│   └── inspire_face/        # AI 人脸识别第三方库，用于智能特效扩展
-├── cache/                   # 程序运行缓存目录，临时文件、日志、解码缓存
-├── learn_av/                # 音视频核心业务层（纯逻辑，与Qt界面解耦）
-│   ├── include/             # 全局公共头文件、模块对外接口
-│   ├── qt/                  # Qt 适配层，桥接核心引擎与UI组件
+├── 3rdparty/                # 第三方依赖库目录（Git忽略，由Conan管理）
+│   └── ffmpeg/              # FFmpeg音视频处理库（唯一必需的第三方依赖）
+├── cache/                   # 程序运行缓存目录（Git完全忽略）
+│   ├── logs/                # 运行日志文件
+│   └── decode_cache/        # 解码临时缓存
+├── learn_av/                # 音视频核心业务层（纯C++，完全独立于Qt）
+│   ├── include/             # 全局公共头文件（对外暴露的唯一接口）
+│   │   ├── igl_context.h    # OpenGL上下文抽象接口
+│   │   ├── iplayback_listener.h # 播放事件监听器接口
+│   │   ├── iplayer.h        # 播放器核心接口
+│   │   └── logger.h         # 日志系统接口
 │   └── src/                 # 音视频全链路核心源码
-├── qt/                      # 界面交互层，仅负责窗口、控件、用户操作
+│       ├── core/            # 核心协调层
+│       │   ├── player.cpp   # 播放器核心实现（状态机管理）
+│       │   ├── player.h
+│       │   ├── av_synchronizer.cpp # 音画同步器（解决音视频不同步问题）
+│       │   ├── av_synchronizer.h
+│       │   ├── audio_pipeline.cpp # 音频处理管线（音量调节、均衡器等）
+│       │   ├── audio_pipeline.h
+│       │   ├── video_pipeline.cpp # 视频处理管线（缩放、格式转换等）
+│       │   └── video_pipeline.h
+│       ├── reader/          # 媒体输入读取模块
+│       │   ├── file_reader.cpp # 文件读取器（解复用+解码器组合封装）
+│       │   ├── file_reader.h
+│       │   ├── demuxer.cpp  # 解复用器（分离音视频数据包）
+│       │   ├── demuxer.h
+│       │   ├── audio_decoder.cpp # 音频解码器
+│       │   ├── audio_decoder.h
+│       │   ├── video_decoder.cpp # 视频解码器
+│       │   └── video_decoder.h
+│       ├── writer/          # 媒体输出写入模块（录制功能，可先空着）
+│       │   ├── file_writer.cpp
+│       │   └── file_writer.h
+│       ├── define/          # 数据结构定义（纯数据，无任何逻辑）
+│       │   ├── av_error.h   # 错误码定义
+│       │   ├── av_packet.h  # 压缩数据包结构（FFmpeg AVPacket封装）
+│       │   ├── av_frame.h   # 原始帧基类
+│       │   ├── audio_samples.h # 音频样本结构（PCM数据）
+│       │   └── video_frame.h # 视频帧结构（YUV/RGB数据）
+│       ├── interface/       # 模块间内部接口（不对外暴露）
+│       │   ├── ifile_reader.h
+│       │   ├── ifile_writer.h
+│       │   ├── idemuxer.h
+│       │   ├── idemuxer_listener.h
+│       │   ├── iaudio_decoder.h
+│       │   ├── ivideo_decoder.h
+│       │   ├── iaudio_pipeline.h
+│       │   ├── ivideo_pipeline.h
+│       │   ├── iaudio_speaker.h
+│       │   └── ivideo_display_view.h
+│       ├── utils/           # 通用工具类（无业务逻辑）
+│       │   ├── logger.cpp
+│       │   ├── thread_safe_queue.h # 线程安全队列（跨线程数据传递核心）
+│       │   ├── sync_notifier.cpp # 跨线程同步通知器
+│       │   ├── sync_notifier.h
+│       │   ├── task_pool.cpp # 通用任务池（GL资源销毁专用）
+│       │   └── task_pool.h
+│       └── output/          # 输出设备抽象层
+│           ├── audio_speaker.cpp # 音频扬声器（SDL/ALSA实现）
+│           └── audio_speaker.h
+├── qt/                      # 界面交互层（仅负责UI，无任何音视频处理逻辑）
 │   ├── main.cpp             # 程序全局入口
-│   ├── main_window.cpp      # 主窗口逻辑实现
-│   ├── main_window.h        # 主窗口类定义
+│   ├── main_window.cpp      # 主窗口协调器
+│   ├── main_window.h
 │   └── ui/                  # 细分UI控件
-│       ├── controller_widget.cpp  # 播放控制：暂停/进度/音量
+│       ├── controller_widget.cpp # 播放控制面板（播放/暂停/进度条）
 │       ├── controller_widget.h
-│       ├── player_widget.cpp      # OpenGL 视频渲染画布
+│       ├── opengl_view.cpp  # OpenGL渲染基础类
+│       ├── opengl_view.h
+│       ├── player_widget.cpp # 视频渲染画布
 │       └── player_widget.h
-├── resource/                # 静态资源目录
-│   ├── pack/                # AI 模型权重文件
-│   ├── sticker/             # 人脸贴纸、特效素材
+├── resource/                # 静态资源目录（Git管理）
+│   ├── icons/               # UI图标资源
 │   └── video/               # 测试视频资源
 ├── CMakeLists.txt           # 项目全局构建配置
-├── conanfile.txt            # Conan2 第三方依赖管理配置
+├── conanfile.txt            # Conan2第三方依赖管理配置
 └── README.md                # 项目说明文档
 ```
 
