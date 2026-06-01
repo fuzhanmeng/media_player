@@ -32,7 +32,7 @@ PlayerWidget::~PlayerWidget() { DetachPlayer(); }
  * @details 自动解绑之前的播放器，绑定新的播放器，并建立双向事件流
  */
 void PlayerWidget::SetPlayer(std::shared_ptr<av::IPlayer> player) {
-    LOG_INFO("Setting new player instance");
+    LOG_INFO("SetPlayer...");
 
     // 先安全解绑之前的播放器，避免资源泄漏和悬空指针
     DetachPlayer();

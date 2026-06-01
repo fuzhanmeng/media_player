@@ -4,6 +4,8 @@
  */
 #pragma once
 
+#include "logger.h"
+
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -63,6 +65,30 @@ public:
         return true;
     }
 
+/**
+     * @brief 尝试弹出一个元素 (非阻塞提取)
+     * @details 专供高优先级硬件回调线程使用。若队列为空，立刻返回 false，绝不挂起线程。
+     */
+    bool TryPop(T& item) {
+        // 此处仅需普通互斥锁即可，不需要 condition_variable 的 wait
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        // 如果队列为空，或者已经被标记终止，立刻放弃提取
+        if (queue_.empty() || is_abort_) {
+            LOG_INFO("the queue is empty");
+            return false;
+        }
+
+        // 执行正常的元素提取
+        item = std::move(queue_.front());
+        queue_.pop();
+
+        // 提取完毕，唤醒可能因队列满而挂起的生产者
+        not_full_cv_.notify_one();
+
+        return true;
+    }
+    
     /**
      * @brief 清空队列
      */

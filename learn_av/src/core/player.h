@@ -5,8 +5,6 @@
  */
 #pragma once
 
-#include <atomic>
-#include <condition_variable>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -16,6 +14,7 @@
 #include "interface/ifile_reader.h"
 #include "iplayer.h"
 #include "playback_state.h"
+#include "output/sdl_audio_speaker.h"
 
 namespace av {
 
@@ -169,11 +168,8 @@ private:
 
     // ================= 调试工具 =================
 
-    /// 调试专用：纯净 PCM 音频裸流文件
-    std::ofstream debug_pcm_file_;
-
-    /// 调试专用：纯净 YUV 视频裸流文件
-    std::ofstream debug_yuv_file_;
+    /// 音频播放实例
+    std::unique_ptr<IAudioSpeaker> audio_speaker_{nullptr};
 };
 
 } // namespace av

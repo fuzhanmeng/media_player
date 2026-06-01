@@ -62,12 +62,22 @@ Player::Player(std::shared_ptr<IGLContext> gl_context)
     if (file_reader_) {
         file_reader_->SetListener(this);
     }
+
+    // 3. 创建并初始化音频硬件输出设备
+    audio_speaker_ = std::unique_ptr<IAudioSpeaker>(IAudioSpeaker::Create());
+    if (audio_speaker_) {
+        audio_speaker_->Open(44100, 2);
+    }
 }
 
 /**
  * @brief 析构函数
  */
-Player::~Player() { Stop(); }
+Player::~Player() { Stop();
+    if (audio_speaker_) {
+        audio_speaker_->Close();
+    }
+}
 
 // ================= 渲染管道控制 =================
 
@@ -111,18 +121,7 @@ bool Player::Open(const std::string& url) {
         return false;
     }
 
-    // 2. 调试代码：以截断模式创建并打开新的文件
-    if (debug_pcm_file_.is_open()) {
-        debug_pcm_file_.close();
-    }
-    if (debug_yuv_file_.is_open()) {
-        debug_yuv_file_.close();
-    }
-
-    debug_pcm_file_.open("debug_out.pcm", std::ios::binary | std::ios::trunc);
-    debug_yuv_file_.open("debug_out.yuv", std::ios::binary | std::ios::trunc);
-
-    // 3. 打开文件
+    // 2. 打开文件
     bool ret = file_reader_->Open(url);
     if (ret) {
         ChangeState(PlaybackState::kOpened);
@@ -142,10 +141,14 @@ void Player::Play() {
     // 情况1：从kOpened状态第一次播放
     PlaybackState expected_opened = PlaybackState::kOpened;
     if (sync_ctx_->state_.compare_exchange_strong(expected_opened, PlaybackState::kPlaying)) {
-        LOG_INFO("State transition: kOpened -> kPlaying. Initializing worker threads.");
+        LOG_INFO("====== State transition: kOpened -> kPlaying. Initializing worker threads ======");
 
         if (file_reader_) {
             file_reader_->Start(sync_ctx_);
+        }
+
+        if (audio_speaker_) {
+            audio_speaker_->Play();
         }
 
         if (listener_) {
@@ -157,7 +160,11 @@ void Player::Play() {
     // 情况2：从kPaused状态恢复播放
     PlaybackState expected_paused = PlaybackState::kPaused;
     if (sync_ctx_->state_.compare_exchange_strong(expected_paused, PlaybackState::kPlaying)) {
-        LOG_INFO("State transition: kPaused -> kPlaying. Waking up suspended threads.");
+        LOG_INFO("====== State transition: kPaused -> kPlaying. Waking up suspended threads ======");
+
+        if (audio_speaker_) {
+            audio_speaker_->Play();
+        }
 
         // 唤醒其他线程
         sync_ctx_->state_cv_.notify_all();
@@ -171,11 +178,15 @@ void Player::Play() {
     // 情况3：从kStopped状态重新播放
     PlaybackState expected_stopped = PlaybackState::kStopped;
     if (sync_ctx_->state_.compare_exchange_strong(expected_stopped, PlaybackState::kPlaying)) {
-        LOG_INFO("State transition: kStopped -> kPlaying. Re-initializing worker threads.");
+        LOG_INFO("====== State transition: kStopped -> kPlaying. Re-initializing worker threads ======");
 
         if (file_reader_) {
             // 线程已在 Stop 时销毁，需重新执行创建序列
             file_reader_->Start(sync_ctx_);
+        }
+
+        if (audio_speaker_) {
+            audio_speaker_->Play();
         }
 
         if (listener_) {
@@ -203,6 +214,12 @@ void Player::Pause() {
         // 业务执行：因为成功抢占了状态机，当前线程可以合法地执行暂停相关的收尾工作
 
         LOG_INFO("State transition: kPlaying -> kPaused. Notifying threads to suspend.");
+
+        // 暂停音频播放
+        if (audio_speaker_) {
+            audio_speaker_->Pause();
+        }
+
         // 广播信令：唤醒所有可能阻塞在 state_cv_ 上的线程，让它们去读取新的 kPaused 状态并休眠
         sync_ctx_->state_cv_.notify_all();
 
@@ -240,15 +257,6 @@ void Player::Stop() {
     if (file_reader_) {
         file_reader_->Stop();
     }
-
-    // 3. 调试代码：安全关闭测试文件流，强制数据刷入磁盘
-    if (debug_pcm_file_.is_open()) {
-        debug_pcm_file_.close();
-    }
-
-    if (debug_yuv_file_.is_open()) {
-        debug_yuv_file_.close();
-    }
 }
 
 /**
@@ -258,14 +266,16 @@ void Player::Stop() {
  */
 void Player::SeekTo(double target_time_sec) {
     if (!sync_ctx_) {
+        LOG_ERROR("sync_ctx_ is nullptr...");
         return;
     }
 
     // 1. 记录跳转前的原状态
     PlaybackState old_state_ = sync_ctx_->state_.load();
 
-    // 2. 触发挂起信令：利用条件变量阻塞底层队列的生产-消费流动
+    // 2. 触发挂起信令：如果当前正在播放，那么先暂停
     if (old_state_ == PlaybackState::kPlaying) {
+        LOG_INFO("when seeking, first pause");
         Pause();
     }
 
@@ -281,12 +291,18 @@ void Player::SeekTo(double target_time_sec) {
         file_reader_->SeekTo(target_time_sec);
     }
 
-    {
-        std::lock_guard<std::mutex> lock(sync_ctx_->state_mutex_);
-        sync_ctx_->is_seeking_.store(true);
+    // 5. 音频播放模块跳转
+    if (audio_speaker_) {
+        audio_speaker_->Flush();
     }
 
-    // 5. 若原状态为播放，则完成跳转后自动恢复播放
+    // 6. 跳转后is_seeking_设置为false
+    {
+        std::lock_guard<std::mutex> lock(sync_ctx_->state_mutex_);
+        sync_ctx_->is_seeking_.store(false);
+    }
+
+    // 7. 若原状态为播放，则完成跳转后自动恢复播放
     if (old_state_ == PlaybackState::kPlaying) {
         Play();
     }
@@ -334,22 +350,17 @@ void Player::SetListener(IPlayer::Listener* listener) { listener_ = listener; }
  */
 void Player::OnFileReaderNotifyAudioFrame(std::shared_ptr<Frame> audio_frame) {
     // 1. 判断audio_frame合法性
-    if (!audio_frame) {
+    if (!audio_frame || audio_frame->IsEmpty()) {
         return;
     }
 
-    AVFrame* raw_frame = audio_frame->GetRawFrame();
-    if (!raw_frame || raw_frame->nb_samples <= 0 || !raw_frame->data[0]) {
-        return;
-    }
+    // 2. 将音频帧直接投递至物理扬声器的线程安全队列中
+    if (audio_speaker_) {
 
-    // 2. 存储PCM
-    if (debug_pcm_file_.is_open()) {
-        // 计算公式：采样数 * 通道数 * 采样位深(16位=2字节)
-        int data_size = raw_frame->nb_samples * raw_frame->channels * 2;
-        debug_pcm_file_.write(reinterpret_cast<const char*>(raw_frame->data[0]), data_size);
+        audio_speaker_->PushAudioData(std::move(audio_frame));
     }
 }
+
 
 /**
  * @brief 接收底层解码输出的纯净 YUV/RGB 视频帧
@@ -364,26 +375,7 @@ void Player::OnFileReaderNotifyVideoFrame(std::shared_ptr<VideoFrame> video_fram
         return;
     }
 
-    // 2. 正确写入YUV420P文件
-    if (debug_yuv_file_.is_open()) {
-        // 计算正确的分量大小（兼容奇数分辨率）
-        const int kYSize = video_frame->width_ * video_frame->height_;
-        const int kUvWidth = (video_frame->width_ + 1) / 2;
-        const int kUvHeight = (video_frame->height_ + 1) / 2;
-        const int kUvSize = kUvWidth * kUvHeight;
-        const int kTotalSize = kYSize + kUvSize * 2;
-
-        // 分别写入三个分量
-        debug_yuv_file_.write(reinterpret_cast<const char*>(video_frame->data_[0]),
-                              static_cast<std::streamsize>(kYSize));
-        debug_yuv_file_.write(reinterpret_cast<const char*>(video_frame->data_[1]),
-                              static_cast<std::streamsize>(kUvSize));
-        debug_yuv_file_.write(reinterpret_cast<const char*>(video_frame->data_[2]),
-                              static_cast<std::streamsize>(kUvSize));
-
-        // 强制刷新缓冲区，避免数据留在内存
-        debug_yuv_file_.flush();
-    }
+    // 2. 将视频帧传递给后续渲染模块
 }
 
 /**

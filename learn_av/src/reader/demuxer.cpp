@@ -157,7 +157,7 @@ void Demuxer::Start(std::shared_ptr<SyncContext> sync_ctx) {
         demuxer_thread_ = std::thread(&Demuxer::ThreadLoop, this);
     }
 
-    LOG_INFO("Demuxer ThreadLoop started.");
+    LOG_INFO("Demuxer OS thread start successfully...");
 }
 
 /**
@@ -165,7 +165,6 @@ void Demuxer::Start(std::shared_ptr<SyncContext> sync_ctx) {
  * @note 主要用于Seek操作后清除旧数据，防止花屏
  */
 void Demuxer::Flush() {
-    LOG_INFO("Flush demuxer internal state");
 
     // 向音频和视频流分别发送Flush包
     auto flush_packet = std::make_shared<Packet>(nullptr);
@@ -176,7 +175,7 @@ void Demuxer::Flush() {
     }
 
     if (video_stream_index_ != -1 && listener_) {
-        listener_->OnNotifyVideoPacket(std::move(flush_packet));
+        listener_->OnNotifyVideoPacket(flush_packet);
     }
 
     LOG_INFO("Demuxer flush completed, Flush packets sent to decoders");
@@ -211,7 +210,7 @@ void Demuxer::Stop() {
 
     // 释放对全局共享状态的引用，防止悬空
     sync_ctx_.reset();
-    LOG_INFO("Demuxer pipeline stopped safely.");
+    LOG_INFO("Demuxer Stoped...");
 }
 
 /**
@@ -220,7 +219,7 @@ void Demuxer::Stop() {
  * @note 异步非阻塞信令投递。摒弃比例跳转，由外部业务态统一维持绝对时间系。
  */
 void Demuxer::SeekTo(double target_time_sec) {
-    // 防抖机制：若上一次跳转请求尚未处理，则丢弃本次冗余请求
+    // 防抖机制：若上一次跳转请求尚未处理，则丢弃本次冗余请求   
     if (is_seek_requested_.load()) {
         LOG_DEBUG("Seek request debounced. A seek is already in progress.");
         return;
@@ -274,7 +273,7 @@ void Demuxer::Close() {
  * @details 维护三级优先级调度：P0(中断/跳转响应) > P1(背压限流阻塞) > P2(物理分包读取)
  */
 void Demuxer::ThreadLoop() {
-    LOG_INFO("Demuxer I/O thread activated.");
+    LOG_INFO("Demuxer I/O thread start.");
 
     while (!is_abort_requested_.load()) {
         // [优先级 P0]: 拦截与处理 Seek 请求
@@ -337,12 +336,12 @@ void Demuxer::ProcessSeek() {
 
     // 调用底层API av_seek_frame, 定位至目标时间戳之前的最近的一个 I帧 AVSEEK_FLAG_BACKWARD
     if (av_seek_frame(avformat_ctx_, -1, target_timestamp, AVSEEK_FLAG_BACKWARD) >= 0) {
-        LOG_INFO("I/O seek execution succeeded. Target: {} sec", target_seek_time_.load());
+        LOG_INFO("Demuxer seek execution succeeded. Target: {} sec", target_seek_time_.load());
         is_eof_.store(false);
 
         Flush();
     } else {
-        LOG_ERROR("I/O seek execution failed for target: {} sec", target_seek_time_.load());
+        LOG_ERROR("Demuxer seek execution failed for target: {} sec", target_seek_time_.load());
     }
 
     is_seek_requested_.store(false);

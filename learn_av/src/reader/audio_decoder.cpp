@@ -30,7 +30,7 @@ extern "C" {
 namespace av {
 
 std::unique_ptr<IAudioDecoder> IAudioDecoder::Create() {
-    LOG_INFO("AudioDecoder instance created.");
+    LOG_INFO("AudioDecoder Create...");
     return std::make_unique<AudioDecoder>();
 }
 
@@ -46,7 +46,7 @@ AudioDecoder::~AudioDecoder() {
  * @brief 注册解码器输出事件监听器
  */
 void AudioDecoder::SetListener(Listener* listener) {
-    LOG_INFO("AudioDecoder Listener registered.");
+    LOG_INFO("AudioDecoder SetListener...");
     listener_ = listener;
 }
 
@@ -185,7 +185,7 @@ void AudioDecoder::Start(std::shared_ptr<SyncContext> sync_ctx) {
 
     // 5. 实例化并启动 OS 级解码线程
     decode_thread_ = std::thread(&AudioDecoder::DecodeLoop, this);
-    LOG_INFO("Audio Decoder OS thread spawned successfully.");
+    LOG_INFO("Audio Decoder OS thread start successfully...");
 }
 
 /**
@@ -218,22 +218,19 @@ void AudioDecoder::Stop() {
     packet_queue_.Clear();
     sync_ctx_.reset();
 
-    LOG_INFO("AudioDecoder OS thread joined safely.");
+    LOG_INFO("AudioDecoder OS thread joined safely...");
 }
 
 /**
  * @brief 冲洗解码器内部参考帧缓存
  */
 void AudioDecoder::Flush() {
-    // 1. 废弃所有尚未送入解码器的压缩包
-    packet_queue_.Clear();
-
-    // 2. 冲洗 FFmpeg 内部缓存，防范时间轴跳转 (Seek) 后的状态污染
     std::lock_guard<std::mutex> lock(codec_mutex_);
     if (av_codec_ctx_) {
+        // 清空 FFmpeg 内部的历史参考帧，防范 Seek 后花屏
         avcodec_flush_buffers(av_codec_ctx_);
     }
-    LOG_INFO("Audio Decoder internal buffers flushed.");
+    LOG_INFO("Audio Decoder internal codec buffers flushed...");
 }
 
 /**
@@ -257,7 +254,7 @@ void AudioDecoder::Close() {
  * @brief 音频解码与重采样核心事件循环 (Event Loop)
  */
 void AudioDecoder::DecodeLoop() {
-    LOG_INFO("AudioDecoder DecodeLoop activated.");
+    LOG_INFO("AudioDecoder DecodeLoop started...");
 
     // 分配解码输出的复用物理内存载体，避免循环内高频内存分配
     AVFrame* av_frame = av_frame_alloc();
@@ -294,9 +291,8 @@ void AudioDecoder::DecodeLoop() {
 
         // [阶段 C]: 带内信令处理 (In-band Control Signaling)
         if (packet->HasFlag(av::AVFrameFlag::kFlush)) {
-            LOG_INFO("Received In-band Flush packet, executing codec synchronization.");
-            std::lock_guard<std::mutex> lock(codec_mutex_);
-            avcodec_flush_buffers(av_codec_ctx_);
+            LOG_INFO("Audio Decoder Received In-band Flush packet, executing codec synchronization.");
+            Flush();
             continue;
         }
 
@@ -315,7 +311,7 @@ void AudioDecoder::DecodeLoop() {
             continue;
         }
 
-        // [阶段 E]: 贪婪模式抽取 (Greedy Extraction)
+        // [阶段 E]: 提取音频帧
         while (true) {
             {
                 std::lock_guard<std::mutex> lock(codec_mutex_);

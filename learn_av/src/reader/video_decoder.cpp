@@ -56,7 +56,7 @@ std::unique_ptr<IVideoDecoder> IVideoDecoder::Create() {
  * @brief 设置下游监听器
  */
 void VideoDecoder::SetListener(Listener* listener) {
-    LOG_INFO("VideoDecoder SetListener.");
+    LOG_INFO("VideoDecoder SetListener...");
     listener_ = listener;
 }
 
@@ -178,7 +178,7 @@ void VideoDecoder::Start(std::shared_ptr<SyncContext> sync_ctx) {
     // 5. 启动真正的解码线程
     decode_thread_ = std::thread(&VideoDecoder::DecodeLoop, this);
 
-    LOG_INFO("Video Decoder thread started successfully.");
+    LOG_INFO("Video Decoder OS thread start successfully...");
 }
 
 /**
@@ -212,25 +212,20 @@ void VideoDecoder::Stop() {
     is_abort_requested_.store(false);
     sync_ctx_.reset();
 
-    LOG_INFO("VideoDecoder stopped safely.");
+    LOG_INFO("VideoDecoder OS thread joined safely.");
 }
 
 /**
- * @brief 跳转刷新包 (Flush)
- * @details 清空队列，并向下游投递冲刷信令，防止 Seek 后花屏
+ * @brief 执行物理层面的解码器内部状态冲刷
+ * @note 仅允许在解码工作线程 (DecodeLoop) 内部捕获到 kFlush 信令包时调用
  */
 void VideoDecoder::Flush() {
-    // 1. 清空队列
-    packet_queue_.Clear();
-
-    // 2. 构建一个 flush 包
-    auto flush_packet = std::make_shared<Packet>();
-    flush_packet->AddFlag(av::AVFrameFlag::kFlush);
-
-    // 3. 入队
-    packet_queue_.Push(std::move(flush_packet));
-
-    LOG_INFO("VideoDecoder pipeline flushed: queue cleared and flush packet injected.");
+    std::lock_guard<std::mutex> lock(codec_mutex_);
+    if (av_codec_ctx_) {
+        // 清空 FFmpeg 内部的历史参考帧，确保新画面不花屏
+        avcodec_flush_buffers(av_codec_ctx_);
+    }
+    LOG_INFO("Video Decoder internal codec buffers flushed...");
 }
 
 /**
@@ -252,7 +247,7 @@ void VideoDecoder::Close() {
  * 并在无锁环境下执行内存剥离对齐与下游路由投递。
  */
 void VideoDecoder::DecodeLoop() {
-    LOG_INFO("VideoDecoder DecodeLoop started.");
+    LOG_INFO("VideoDecoder DecodeLoop started...");
 
     // [阶段 0]: 申请一个 AVFrame 临时变量作为输出容器
     AVFrame* av_frame = av_frame_alloc();
@@ -269,8 +264,8 @@ void VideoDecoder::DecodeLoop() {
 
             // 1. 处于正在播放 2. 发生了跳转 3. 被停止 就醒来
             sync_ctx_->state_cv_.wait(lock, [this]() {
-                // 响应唤醒信令：解除暂停状态，或接收到线程终止 (Abort) 信令
-                return is_abort_requested_.load() || sync_ctx_->state_.load() == PlaybackState::kPlaying;
+                return is_abort_requested_.load() || sync_ctx_->is_seeking_.load() ||
+                    sync_ctx_->state_.load() == PlaybackState::kPlaying;
             });
         }
 
@@ -293,10 +288,8 @@ void VideoDecoder::DecodeLoop() {
 
         // [阶段 C]: 处理带内控制信令
         if (packet->HasFlag(av::AVFrameFlag::kFlush)) {
-            LOG_INFO("Received In-band Flush signal. Flushing internal codec buffers.");
-            std::lock_guard<std::mutex> lock(codec_mutex_);
-            // 冲刷解码器内部的时序参考帧 (Reference Frames) 缓存，防止 Seek 后花屏
-            avcodec_flush_buffers(av_codec_ctx_);
+            LOG_INFO("Video Decoder Received In-band Flush packet, executing codec synchronization.");
+            Flush();
             continue;
         }
 
@@ -413,4 +406,4 @@ void VideoDecoder::ProcessAndPack(AVFrame* frame) {
     }
 }
 
-} // namespace av 
+} // namespace av
