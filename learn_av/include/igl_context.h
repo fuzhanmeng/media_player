@@ -12,4 +12,4 @@ struct IGLContext {
 
     virtual ~IGLContext() = default;
 };
-}
+} // namespace av
