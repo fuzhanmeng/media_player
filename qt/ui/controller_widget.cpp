@@ -132,9 +132,11 @@ void ControllerWidget::onPlayPauseButtonClicked() {
     // 根据当前记录的状态，决定执行哪个操作
     if (m_isPlaying) {
         // 当前在播放，用户点击意味着他想暂停
+        LOG_INFO("=================== Pause ===================");
         emit sigPauseClicked();
     } else {
         // 当前在暂停，用户点击意味着他想播放
+        LOG_INFO("=================== Play ===================");
         emit sigPlayClicked();
     }
 }

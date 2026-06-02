@@ -13,7 +13,7 @@
 namespace av {
 
 std::unique_ptr<IFileReader> IFileReader::Create() {
-    LOG_INFO("FileReader Create");
+    LOG_INFO("FileReader Create...");
     return std::make_unique<FileReader>();
 }
 
@@ -95,18 +95,12 @@ void FileReader::Stop() {
  */
 
 void FileReader::SeekTo(double pts_seconds) {
-    if (video_decoder_) {
-        video_decoder_->Flush(); // 2. 清空视频解码器内部残留数据
-    }
-    if (audio_decoder_) {
-        audio_decoder_->Flush(); // 3. 清空音频解码器内部残留数据
-    }
 
     if (demuxer_) {
-        demuxer_->SeekTo(pts_seconds); // 4. 执行物理偏移操作
+        demuxer_->SeekTo(pts_seconds);
     }
 
-    // 5. 重置 EOF 状态机
+    //  重置 EOF 状态机
     {
         std::lock_guard<std::mutex> lock(eof_mutex_);
         demuxer_eof_received_ = false;
@@ -170,7 +164,7 @@ void FileReader::OnNotifyVideoPacket(std::shared_ptr<Packet> video_packet) {
  */
 void FileReader::OnNotifyAudioPacket(std::shared_ptr<Packet> audio_packet) {
     if (audio_decoder_) {
-        // 【修正】路由至音频解码管线
+        // 路由至音频解码管线
         audio_decoder_->PushPacket(std::move(audio_packet));
     }
 }

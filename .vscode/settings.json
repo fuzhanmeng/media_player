@@ -1,5 +1,5 @@
 {
-    // ==== 🎨 编辑器基础视觉与排版 ====
+    // ==== 编辑器基础视觉与排版 ====
     "editor.fontFamily": "Fira Code, JetBrains Mono, Consolas, 'Courier New', monospace", // 优先使用护眼的编程字体
     "editor.fontLigatures": true, // 开启连字 (例如将 -> 显示为连体箭头，非常优雅)
     "editor.fontSize": 18, // 字体大小，适合长时间写代码
@@ -8,29 +8,29 @@
     "editor.wordWrap": "on", // 代码过长时自动换行，不用左右拖动滚动条
     "editor.minimap.enabled": false, // 关闭右侧的迷你代码缩略图，把屏幕空间全留给代码
     "editor.formatOnSave": true, // 【极度推荐】按 Ctrl+S 自动整理代码格式
-    // ==== 💡 智能提示行为 ====
+    // ==== 智能提示行为 ====
     "editor.quickSuggestions": {
         "other": true, // 在正常代码中开启弹窗提示
         "comments": false, // 写注释时不弹提示，让你安心打字
         "strings": true // 在字符串内部允许提示
     },
     "editor.inlineSuggest.enabled": true, // 开启类似 GitHub Copilot 的灰色内联预测文本
-    // ==== 💾 自动保存 (再也不怕断电/崩溃) ==== 
+    // ==== 自动保存 (再也不怕断电/崩溃) ==== 
     "files.autoSave": "afterDelay", // 停止打字后自动保存
     "files.autoSaveDelay": 500, // 停手 0.5 秒就保存，配合 formatOnSave 食用极佳
-    // ==== 💻 终端面板设置 ====
+    // ==== 终端面板设置 ====
     "workbench.panel.opensMaximized": "never", // 启动时终端面板不要占满全屏
     "terminal.integrated.defaultProfile.linux": "bash", // 默认终端设为 bash
     "terminal.integrated.fontSize": 15, // 终端字号稍微小一点点
     "terminal.integrated.scrollback": 5000, // 终端输出历史保留 5000 行，方便看 CMake 长篇大论的报错
     // =========================================================
-    // ==== 🚀 C++ / Clangd 核心护航设置 (解决红线问题的关键) ====
+    // ==== 🚀 C++ / Clangd 核心护航设置  ====
     // =========================================================
     "C_Cpp.intelliSenseEngine": "disabled", // 【核心】必须禁用微软自带的 C++ 补全，全权交给 clangd，一山不容二虎
     "clangd.path": "/usr/bin/clangd", // clangd 的绝对路径
     "clangd.arguments": [
         // =========================
-        // 🔴 【必须有】核心配置 (少了这些你的项目就没法用)
+        // 核心配置
         // =========================
         // 告诉 clangd 编译数据库在哪，这是能找到 Qt/FFmpeg 头文件的关键
         // 你刚才 find 到了在 ./build/Release，所以必须指过来
@@ -39,14 +39,14 @@
         // 支持 g++ 和 clang++ 双保险
         "--query-driver=/usr/bin/g++,/usr/bin/clang++",
         // =========================
-        // 🟡 【强烈推荐】性能配置 (用了体验更好)
+        // 性能配置
         // =========================
         // 后台自动建立索引。第一次打开项目会卡一会，之后跳转、补全快如闪电
         "--background-index",
         // 把预编译头(PCH)放在内存里。吃一点内存，但极大提升代码解析速度
         "--pch-storage=memory",
         // =========================
-        // 🟢 【可选】体验优化 (根据个人喜好)
+        // 体验优化 
         // =========================
         // 补全时显示详细的函数签名（返回值 + 参数列表），而不是只显示个函数名
         "--completion-style=detailed",
@@ -67,7 +67,7 @@
     "editor.snippetSuggestions": "inline",
     "editor.tabCompletion": "on",
     "editor.wordBasedSuggestions": "allDocuments", // 开启基于单词的模糊记忆补全（clangd 偶尔反应慢时的兜底护城河）
-    // ==== 🔗 C++ 标准库文件后缀关联 ====
+    // ==== C++ 标准库文件后缀关联 ====
     // 强制把这些无后缀的文件当做 C++ 代码解析，防止它们打开时变成纯文本没有高亮
     "files.associations": {
         "*.h": "cpp",
@@ -91,12 +91,12 @@
         "variant": "cpp",
         "any": "cpp"
     },
-    // ==== 🐍 Python 设置 (备用) ====
+    // ==== Python 设置 (备用) ====
     "python.defaultInterpreterPath": "/usr/bin/python3",
     "python.analysis.autoImportCompletions": true,
     "python.analysis.typeCheckingMode": "basic",
     "python.formatting.provider": "black",
-    // ==== ⚙️ 其它杂项 ====
+    // ==== 其它杂项 ====
     "git.autofetch": true, // 自动拉取 Git 远端变更
     "git.confirmSync": false, // 点同步时不再烦人地问你确不确认
     "testing.automaticallyOpenPeekViewDuringAutoRun": true,

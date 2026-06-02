@@ -143,7 +143,6 @@ bool MainWindow::OpenMedia(const QString& url) {
     if (!m_player)
         return false;
 
-    LOG_INFO("run player open");
     std::string stdUrl = url.toStdString();
     bool ret = m_player->Open(stdUrl);
 
@@ -212,6 +211,7 @@ void MainWindow::onUserPauseRequested() {
  */
 void MainWindow::onUserSeekRequested(float target_progress) {
     if (m_player) {
+        LOG_INFO("Seek to: {}", target_progress);
         double target_time_sec = target_progress * m_player->GetDuration();
         m_player->SeekTo(target_time_sec);
     }

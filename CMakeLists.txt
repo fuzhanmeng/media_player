@@ -23,6 +23,7 @@ find_package(glm REQUIRED CONFIG)
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets OpenGL OpenGLWidgets Multimedia)
 find_package(Threads REQUIRED)       # POSIX Threads API 支持
 find_package(spdlog REQUIRED CONFIG) # 高性能日志中间件
+find_package(SDL2 REQUIRED CONFIG)   # SDL2 模块
 
 
 
@@ -54,6 +55,7 @@ target_link_libraries(learn_av_lib PUBLIC
     glm::glm
     Threads::Threads
     spdlog::spdlog
+    SDL2::SDL2
 )
 
 # 4. Target Definition: Application Executable
