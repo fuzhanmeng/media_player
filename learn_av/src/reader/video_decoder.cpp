@@ -354,7 +354,15 @@ void VideoDecoder::DecodeLoop() {
                 // 解码管线彻底排空
                 if (listener_) {
                     LOG_INFO("Video decoding reached physical EOF.");
-                    listener_->OnNotifyVideoEOF();
+
+                    // 创建一个空帧
+                    auto eof_frame = std::make_shared<VideoFrame>(0,0);
+                    eof_frame->AddFlag(AVFrameFlag::kEOF);
+
+                    // 传给音画同步模块
+                    if (listener_) {
+                        listener_->OnNotifyVideoFrame(std::move(eof_frame));
+                    }
                 }
                 break;
             } else if (ret < 0) {

@@ -67,7 +67,7 @@ Player::Player(std::shared_ptr<IGLContext> gl_context)
     // 3. 创建并初始化音频硬件输出设备
     audio_speaker_ = std::unique_ptr<IAudioSpeaker>(IAudioSpeaker::Create());
     if (audio_speaker_) {
-        audio_speaker_->Open(44100, 2);
+        audio_speaker_->SetListener(this);
     }
 
     // 4. 创建音画同步模块
@@ -150,6 +150,12 @@ bool Player::Open(const std::string& url) {
     if (ret) {
         ChangeState(PlaybackState::kOpened);
     }
+
+    audio_finished_.store(false);
+    video_finished_.store(false);
+
+    has_video_.store(file_reader_->HasVideo());
+    has_audio_.store(file_reader_->HasAduio());
     return ret;
 }
 
@@ -405,8 +411,8 @@ void Player::OnFileReaderNotifyAudioFrame(std::shared_ptr<Frame> audio_frame) {
         return;
     }
 
-    // 2. 如果是Flush包
-    if (audio_frame->HasFlag(AVFrameFlag::kFlush)) {
+    // 2. 判断是不是Flush/EOF 包
+    if (audio_frame->HasFlag(AVFrameFlag::kFlush) || audio_frame->HasFlag(AVFrameFlag::kEOF)) {
         if (audio_speaker_) {
             audio_speaker_->PushAudioFrame(std::move(audio_frame));
         }
@@ -434,20 +440,20 @@ void Player::OnFileReaderNotifyVideoFrame(std::shared_ptr<VideoFrame> video_fram
         return;
     }
 
-    // 2. 判断是不是Flush包
-    if (video_frame->HasFlag(AVFrameFlag::kFlush)) {
+    // 2. 判断是不是Flush/EOF 包
+    if (video_frame->HasFlag(AVFrameFlag::kFlush) || video_frame->HasFlag(AVFrameFlag::kEOF)) {
         if (av_sync_) {
             av_sync_->PushVideoFrame(std::move(video_frame));
             return;
         }
     }
 
-    // 3. 常规数据的合法性校验
+    // 4. 常规数据的合法性校验
     if (!video_frame->IsValid()) {
         return;
     }
 
-    // 4. 将视频送入音画同步模块
+    // 5. 将视频送入音画同步模块
     if (av_sync_) {
         av_sync_->PushVideoFrame(std::move(video_frame));
     }
@@ -465,18 +471,30 @@ void Player::OnSyncNotifyVideoFrame(std::shared_ptr<VideoFrame> video_frame) {
 }
 
 /**
- * @brief Audio EOF
- * @details 底层音频解码器内部残留帧已全部排空
+ * @brief 音画同步器宣告彻底渲染完毕 (视频流结束)
  */
-void Player::OnFileReaderNotifyAudioFinished() {
-    // 预留接口，后续可在此处增加 audio_eof_ 标志位的设置与播放完成检查
+void Player::OnSyncCompleted() {
+    LOG_INFO("Player received Video TRULY finished signal.");
+
+    // 1. 标记视频管线已结束
+    video_finished_.store(true);
+
+    // 2. 触发判定
+    CheckAndNotifyPlaybackCompleted();
 }
 
 /**
- * @brief Video EOF
- * @details 底层视频解码器内部残留帧已全部排空
+ * @brief 扬声器宣告彻底播放完毕 (音频流结束)
  */
-void Player::OnFileReaderNotifyVideoFinished() {}
+void Player::OnAudioCompleted() {
+    LOG_INFO("Player received Audio TRULY finished signal.");
+
+    // 1. 标记音频管线已结束
+    audio_finished_.store(true);
+
+    // 2. 触发判定
+    CheckAndNotifyPlaybackCompleted();
+}
 
 /**
  * @brief 实现 IFileReader::Listener 接口
@@ -508,6 +526,22 @@ void Player::OnFileReaderSeekCompleteResumePlay() {
 
     Play();
 }
+
+/**
+ * @brief 接收获取到的采样率和声道数，启动SDL音频播放功能
+ */
+void Player::OnFileReaderAudioInfo(int sample_rate, int channels) {
+    LOG_INFO("Player received audio format from pipeline: {}Hz, {} channels. Opening sound card...", sample_rate,
+             channels);
+
+    if (audio_speaker_) {
+        bool ret = audio_speaker_->Open(sample_rate, channels);
+        if (!ret) {
+            LOG_ERROR("Failed to open audio speaker with negotiated parameters!");
+        }
+    }
+}
+
 // ================= 内部控制逻辑 =================
 
 /**
@@ -567,6 +601,32 @@ void Player::ProgressLoop() {
             }
         }
         std::this_thread::sleep_for(kUpdateInterval);
+    }
+}
+
+/**
+ * @brief 判定所有存在的流是否均已结束
+ */
+void Player::CheckAndNotifyPlaybackCompleted() {
+    // 1. 检查各轨道状态：若该轨道不存在，或该轨道已结束，则视为该部分 Done
+    bool video_done = !has_video_.load() || video_finished_.load();
+    bool audio_done = !has_audio_.load() || audio_finished_.load();
+
+    // 2. 当且仅当所有存在的轨道都结束时，才执行全局状态切换
+    if (video_done && audio_done) {
+        PlaybackState expected_playing = PlaybackState::kPlaying;
+        PlaybackState expected_paused = PlaybackState::kPaused;
+
+        // 3. 使用 CAS 操作修改底层状态机，防范多线程并发执行时导致 UI 被重复通知
+        if (sync_ctx_->state_.compare_exchange_strong(expected_playing, PlaybackState::kStopped) ||
+            sync_ctx_->state_.compare_exchange_strong(expected_paused, PlaybackState::kStopped)) {
+            LOG_INFO("Playback TRULY Completed. Notifying UI...");
+
+            // 4. 唯一合法的 UI 通知触发点
+            if (listener_) {
+                listener_->OnPlaybackCompleted();
+            }
+        }
     }
 }
 }; // namespace av

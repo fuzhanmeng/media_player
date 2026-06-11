@@ -115,6 +115,18 @@ public:
      * @return 总时长（单位：微秒）
      */
     virtual int64_t GetDuration() const = 0;
+
+    /**
+     * @brief 探测当前媒体是否包含视频流
+     * @return 存在视频流返回 true，否则返回 false
+     */
+    virtual bool HasVideo() const = 0;
+
+    /**
+     * @brief 探测当前媒体是否包含音频流
+     * @return 存在音频流返回 true，否则返回 false
+     */
+    virtual bool HasAudio() const = 0;
 };
 
 } // namespace av

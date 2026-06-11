@@ -84,7 +84,7 @@ bool Demuxer::Open(const std::string& url) {
         AVStream* stream = avformat_ctx_->streams[i];
 
         // video
-        if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+        if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && video_stream_index_ == -1) {
             video_stream_index_ = i;
 
             if (listener_) {
@@ -109,7 +109,7 @@ bool Demuxer::Open(const std::string& url) {
                 // 向上层总控投递纯净 流信息 DTO
                 listener_->OnNotifyVideoStream(info);
             }
-        } else if (stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+        } else if (stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && audio_stream_index_ == -1) {
             audio_stream_index_ = i;
 
             if (listener_) {
@@ -248,6 +248,18 @@ int64_t Demuxer::GetDuration() const {
     // 将 FFmpeg 内部时基 (AV_TIME_BASE, 微秒) 换算为标准绝对秒数
     return avformat_ctx_->duration;
 }
+
+/**
+ * @brief 探测当前媒体是否包含视频流
+ * @return 存在视频流返回 true，否则返回 false
+ */
+bool Demuxer::HasVideo() const { return video_stream_index_ != -1; }
+
+/**
+ * @brief 探测当前媒体是否包含音频流
+ * @return 存在音频流返回 true，否则返回 false
+ */
+bool Demuxer::HasAudio() const { return audio_stream_index_ != -1; }
 
 /**
  * @brief 内部方法：彻底关闭媒体并释放所有物理资源

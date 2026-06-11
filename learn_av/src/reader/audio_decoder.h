@@ -30,7 +30,7 @@ namespace av {
 class AudioDecoder : public IAudioDecoder {
 public:
     AudioDecoder();
-    ~AudioDecoder() override;
+    ~AudioDecoder();
 
     /**
      * @brief 注册监听回调，解码后的数据传递
@@ -84,6 +84,17 @@ public:
      * @brief 启动队列
      */
     void StartQueue() override;
+
+    /**
+     * @brief 获取采样率
+     */
+    int GetSample() const override;
+
+    /**
+     * @brief 获取声道数
+     */
+    int GetChannels() const override;
+
 
 private:
     /**

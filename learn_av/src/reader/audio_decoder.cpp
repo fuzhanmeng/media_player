@@ -29,9 +29,7 @@ extern "C" {
 
 namespace av {
 
-std::unique_ptr<IAudioDecoder> IAudioDecoder::Create() {
-    return std::make_unique<AudioDecoder>();
-}
+std::unique_ptr<IAudioDecoder> IAudioDecoder::Create() { return std::make_unique<AudioDecoder>(); }
 
 AudioDecoder::AudioDecoder() {}
 
@@ -161,7 +159,7 @@ void AudioDecoder::PushPacket(std::shared_ptr<Packet> packet) {
  * @brief 通知解码器数据流物理结束 (EOF)
  */
 void AudioDecoder::SendEOF() {
-    LOG_INFO("Audio decoder received EOF signal, enqueuing empty packet.");
+    LOG_INFO("Audio decoder received EOF signal, pushing EOF packet to queue");
     // 构造空数据包 (Empty Packet) 投递至队列尾部
     // 底层 avcodec_send_packet 接收到空包时，将触发解码器的 Drain (排空) 模式
     auto empty_packet = std::make_shared<Packet>();
@@ -256,6 +254,16 @@ void AudioDecoder::AbortAndClearQueue() { packet_queue_.AbortAndClear(); }
  * @brief 启动队列
  */
 void AudioDecoder::StartQueue() { packet_queue_.Start(); }
+
+/**
+ * @brief 获取采样率
+ */
+int AudioDecoder::GetSample() const { return out_sample_rate_; }
+
+/**
+ * @brief 获取声道数
+ */
+int AudioDecoder::GetChannels() const { return out_channels_; }
 
 /**
  * @brief 释放 FFmpeg 解码器与重采样上下文物理内存
@@ -364,10 +372,14 @@ void AudioDecoder::DecodeLoop() {
                 // 内部参考帧不足，要求补充新 AVPacket
                 break;
             } else if (ret == AVERROR_EOF) {
-                // 解码管线彻底排空
+                // 播放结束 EOF
                 if (listener_) {
                     LOG_INFO("Audio decoding reached physical EOF.");
-                    listener_->OnNotifyAudioEOF();
+
+                    auto audio_frame = std::make_shared<Frame>();
+                    // 构造 EOF 包
+                    audio_frame->AddFlag(AVFrameFlag::kEOF);
+                    listener_->OnNotifyAudioFrame(std::move(audio_frame));
                 }
                 break;
             } else if (ret < 0) {

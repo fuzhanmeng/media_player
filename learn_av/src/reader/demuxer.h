@@ -69,6 +69,18 @@ public:
      */
     int64_t GetDuration() const override;
 
+    /**
+     * @brief 探测当前媒体是否包含视频流
+     * @return 存在视频流返回 true，否则返回 false
+     */
+    bool HasVideo() const override;
+
+    /**
+     * @brief 探测当前媒体是否包含音频流
+     * @return 存在音频流返回 true，否则返回 false
+     */
+    bool HasAudio() const override;
+
 private:
     /**
      * @brief 内部方法：彻底关闭媒体并释放所有物理资源

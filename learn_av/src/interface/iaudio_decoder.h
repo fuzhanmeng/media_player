@@ -38,11 +38,6 @@ public:
          */
         virtual void OnNotifyAudioFrame(std::shared_ptr<Frame> frame) = 0;
 
-        /**
-         * @brief 通知音频解码流彻底枯竭 (Audio EOF)
-         * @details 表示解码器已接收到 EOF 信令，且内部缓存队列中的所有残留帧已全部排空并输出完毕
-         */
-        virtual void OnNotifyAudioEOF() = 0;
     };
 
     // ================= 静态工厂方法 =================
@@ -82,7 +77,6 @@ public:
     /**
      * @brief 发送流结束信令 (EOF 信令)
      * @details 向解码队列尾部投递 EOF 标记，触发解码器进入排空 (Drain) 模式
-     * 当所有帧排空后，触发 Listener::OnNotifyAudioEOF()
      */
     virtual void SendEOF() = 0;
 
@@ -121,6 +115,16 @@ public:
      * @brief 启动队列
      */
     virtual void StartQueue() = 0;
+
+    /**
+     * @brief 获取采样率
+     */
+    virtual int GetSample() const = 0;
+
+    /**
+     * @brief 获取声道数
+     */
+    virtual int GetChannels() const = 0;
 };
 
 } // namespace av

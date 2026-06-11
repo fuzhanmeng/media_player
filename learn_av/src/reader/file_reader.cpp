@@ -12,9 +12,7 @@
 
 namespace av {
 
-std::unique_ptr<IFileReader> IFileReader::Create() {
-    return std::make_unique<FileReader>();
-}
+std::unique_ptr<IFileReader> IFileReader::Create() { return std::make_unique<FileReader>(); }
 
 /**
  * @brief 构造函数
@@ -114,17 +112,8 @@ void FileReader::WaitForStop() {
  * @brief  触发绝对时间轴跳转，保证多线程状态同步
  */
 void FileReader::SeekTo(int64_t target_time_us) {
-
     if (demuxer_) {
         demuxer_->SeekTo(target_time_us);
-    }
-
-    //  重置 EOF 状态机
-    {
-        std::lock_guard<std::mutex> lock(eof_mutex_);
-        demuxer_eof_received_ = false;
-        audio_eof_received_ = false;
-        video_eof_received_ = false;
     }
 }
 
@@ -169,6 +158,16 @@ int FileReader::GetVideoWidth() const { return video_width_; }
  */
 int FileReader::GetVideoHeight() const { return video_height_; }
 
+/**
+ * @brief 是否含有音频轨道
+ */
+bool FileReader::HasAduio() const { return demuxer_ ? demuxer_->HasAudio() : false; }
+
+/**
+ * @brief 是否含有视频轨道
+ */
+bool FileReader::HasVideo() const { return demuxer_ ? demuxer_->HasVideo() : false; }
+
 // ================= 解复用器数据上行回调 (Demuxer -> FileReader) =================
 /**
  * @brief 接收视频流元数据，并初始化下游视频解码器
@@ -190,6 +189,10 @@ void FileReader::OnNotifyAudioStream(const StreamInfo& info) {
     if (audio_decoder_) {
         // 发送流参数至音频解码器进行初始化
         audio_decoder_->Init(info);
+
+        if (listener_) {
+            listener_->OnFileReaderAudioInfo(audio_decoder_->GetSample(), audio_decoder_->GetChannels());
+        }
     }
 }
 
@@ -222,9 +225,6 @@ bool FileReader::OnNotifyAudioPacket(std::shared_ptr<Packet> audio_packet) {
  * @brief 解复用引擎读取至文件末尾，触发解码器冲刷信令
  */
 void FileReader::OnNotifyDemuxerEOF() {
-    std::lock_guard<std::mutex> lock(eof_mutex_);
-    demuxer_eof_received_ = true;
-
     // 投递终止信令至解码器，触发其内部缓冲区排空机制
     if (video_decoder_) {
         video_decoder_->SendEOF();
@@ -265,21 +265,8 @@ void FileReader::OnSeekCompleteResumePlay() {
  */
 void FileReader::OnNotifyAudioFrame(std::shared_ptr<Frame> audio_frame) {
     if (listener_) {
-        // 将解码后的PCM交给Player模块
+        // 将解码后的 PCM 交给Player模块
         listener_->OnFileReaderNotifyAudioFrame(std::move(audio_frame));
-    }
-}
-
-/**
- * @brief 音频解码流彻底结束，给到Player通知
- */
-void FileReader::OnNotifyAudioEOF() {
-    std::lock_guard<std::mutex> lock(eof_mutex_);
-
-    audio_eof_received_ = true;
-
-    if (listener_) {
-        listener_->OnFileReaderNotifyAudioFinished();
     }
 }
 
@@ -290,19 +277,6 @@ void FileReader::OnNotifyVideoFrame(std::shared_ptr<VideoFrame> video_frame) {
     if (listener_) {
         // 将YUV图传给Player模块
         listener_->OnFileReaderNotifyVideoFrame(std::move(video_frame));
-    }
-}
-
-/**
- * @brief 视频解码流彻底结束，给到Player通知
- */
-void FileReader::OnNotifyVideoEOF() {
-    std::lock_guard<std::mutex> lock(eof_mutex_);
-
-    video_eof_received_ = true;
-
-    if (listener_) {
-        listener_->OnFileReaderNotifyVideoFinished();
     }
 }
 

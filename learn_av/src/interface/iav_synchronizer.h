@@ -32,6 +32,11 @@ public:
          * @param video_frame 视频帧数据 DTO
          */
         virtual void OnSyncNotifyVideoFrame(std::shared_ptr<VideoFrame> video_frame) = 0;
+    
+        /**
+         * @brief 通知Player收到了EOF包
+         */
+        virtual void OnSyncCompleted() = 0;
     };
 
     /**

@@ -22,6 +22,11 @@ namespace av {
 std::unique_ptr<IAudioSpeaker> IAudioSpeaker::Create() { return std::make_unique<SDLAudioSpeaker>(); }
 
 /**
+ * @brief 设置下游监听器
+ */
+void SDLAudioSpeaker::SetListener(Listener* listener) { listener_ = listener; }
+
+/**
  * @brief 构造函数
  */
 SDLAudioSpeaker::SDLAudioSpeaker() {}
@@ -135,7 +140,7 @@ void SDLAudioSpeaker::PushAudioFrame(std::shared_ptr<Frame> audio_frame) {
         return;
     }
 
-    // 拦截带内 Flush 信令
+    // 1. 如果是 Flush 信令
     if (audio_frame->HasFlag(av::AVFrameFlag::kFlush)) {
         LOG_DEBUG("SDLAudioSpeaker intercepted IN-BAND Flush signal. Executing hardware reset.");
 
@@ -167,10 +172,19 @@ void SDLAudioSpeaker::PushAudioFrame(std::shared_ptr<Frame> audio_frame) {
         return;
     }
 
+    // 2. 如果是 EOF 信令
+    if (audio_frame->HasFlag(AVFrameFlag::kEOF)) {
+        audio_queue_.Push(std::move(audio_frame));
+        return;
+    }
+
+    // 3. 如果 音频帧帧无效
     if (audio_frame->IsEmpty()) {
         LOG_WARN("SDLAudioSpeaker received empty audio frame");
         return;
     }
+
+    // 4. 入队
     audio_queue_.Push(std::move(audio_frame));
 }
 
@@ -229,9 +243,7 @@ double SDLAudioSpeaker::GetAudioClock() const {
 /**
  * @brief 重置时钟（用于跳转时进度条更新）
  */
-void SDLAudioSpeaker::ResetAlock() {
-    audio_clock_us_.store(-1);
-}
+void SDLAudioSpeaker::ResetAlock() { audio_clock_us_.store(-1); }
 
 /**
  * @brief SDL 硬件底层回调函数
@@ -279,6 +291,20 @@ void SDLAudioSpeaker::FillAudioData(Uint8* stream, int len) {
             }
             // 成功提取新帧，重置当前帧的内部读取偏移量
             current_frame_offset_ = 0;
+        }
+
+        // 处理 EOF
+        if (current_frame_->HasFlag(AVFrameFlag::kEOF)) {
+            LOG_INFO("SDL Receive EOF");
+
+            if (listener_) {
+                listener_->OnAudioCompleted();
+            }
+
+            current_frame_ = nullptr;
+
+            SDL_PauseAudioDevice(audio_device_id_, -1);
+            return;
         }
 
         // 更新全局音频时钟

@@ -178,7 +178,14 @@ void AVSynchronizer::PushVideoFrame(std::shared_ptr<VideoFrame> video_frame) {
         return;
     }
 
-    // 3. 普通视频帧的合法性校验
+    // 2. 处理带内EOF信令
+    if (video_frame->HasFlag(AVFrameFlag::kEOF)) {
+        LOG_INFO("AV_Sync received IN-BAND EOF signal, pushing to render queue.");
+        video_queue_.Push(std::move(video_frame));
+        return;
+    }
+
+    // 4. 普通视频帧的合法性校验
     if (!video_frame->IsValid()) {
         LOG_WARN("Received invalid video frame, dropped");
         return;
@@ -219,6 +226,16 @@ void AVSynchronizer::ThreadLoop() {
         if (!video_queue_.Pop(video_frame)) {
             LOG_ERROR("Video queue aborted, skipping frame");
             continue;
+        }
+
+        // 处理EOF帧
+        if (video_frame->HasFlag(AVFrameFlag::kEOF)) {
+            LOG_INFO("AVSynchronizer Receive KEOF");
+
+            std::lock_guard<std::mutex> lock(listener_mutex_);
+            if (listener_) {
+                listener_->OnSyncCompleted();
+            }
         }
 
         if (!video_frame || !video_frame->IsValid()) {
