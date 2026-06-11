@@ -32,7 +32,6 @@ PlayerWidget::~PlayerWidget() { DetachPlayer(); }
  * @details 自动解绑之前的播放器，绑定新的播放器，并建立双向事件流
  */
 void PlayerWidget::SetPlayer(std::shared_ptr<av::IPlayer> player) {
-
     // 先安全解绑之前的播放器，避免资源泄漏和悬空指针
     DetachPlayer();
 
@@ -62,6 +61,18 @@ void PlayerWidget::resizeEvent(QResizeEvent* event) {
     // 同步调整OpenGL渲染视图的大小
     if (m_opengl_view) {
         m_opengl_view->resize(event->size());
+    }
+}
+
+/**
+ * @brief 当鼠标产生中断，操作系统将消息发往应用程序界面,鼠标单击切换实现播放/暂停功能
+ */
+void PlayerWidget::mousePressEvent(QMouseEvent* event) {
+    if (event->button() == Qt::LeftButton) {
+        emit sigVideoClicked();
+        event->accept();
+    } else {
+        QWidget::mousePressEvent(event);
     }
 }
 

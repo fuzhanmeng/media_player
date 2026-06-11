@@ -80,6 +80,11 @@ signals:
      */
     void sigPlaybackError(int error_code, const QString& error_msg);
 
+    /**
+     * @brief 鼠标单击切换实现播放/暂停功能
+     */
+    void sigVideoClicked();
+
 protected:
     /**
      * @brief 窗口大小变化事件处理函数
@@ -87,6 +92,11 @@ protected:
      * @details 自动调整OpenGL渲染视图的大小
      */
     void resizeEvent(QResizeEvent* event) override;
+
+    /**
+     * @brief 当鼠标产生中断，操作系统将消息发往应用程序界面,鼠标单击切换实现播放/暂停功能
+     */
+    void mousePressEvent(QMouseEvent* event) override;
 
 private:
     // ================== IPlayer::Listener 底层回调接口实现 ==================

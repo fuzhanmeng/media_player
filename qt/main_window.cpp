@@ -5,9 +5,9 @@
 
 #include "main_window.h"
 
+#include <QCloseEvent>
 #include <QFileDialog>
 #include <QMessageBox>
-#include <QMouseEvent>
 #include <QOpenGLContext>
 #include <QVBoxLayout>
 
@@ -21,22 +21,19 @@
  * @brief 构造函数
  */
 MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
-    // 1. 开启自定义无边框窗口标志
-    setWindowFlags(Qt::FramelessWindowHint | Qt::WindowSystemMenuHint | Qt::WindowMinMaxButtonsHint);
-
-    // 2. 提取并包装全局共享的零拷贝 OpenGL 上下文环境
+    // 1. 提取并包装全局共享的零拷贝 OpenGL 上下文环境
     m_sharedGLContext = std::make_shared<av::IGLContext>(QOpenGLContext::globalShareContext());
 
-    // 3. 实例化播放核心大脑 (最高级生命周期持有者)
+    // 2. 实例化播放核心大脑 (最高级生命周期持有者)
     m_player = av::IPlayer::Create(m_sharedGLContext);
 
-    // 4. 初始化 UI 层次与布局管理
+    // 3. 初始化 UI 层次与布局管理
     SetupUI();
 
-    // 5. 构建 UI 信号槽路由桥梁
+    // 4. 构建 UI 信号槽路由桥梁
     SetupConnections();
 
-    // 6. 设置初始窗口标题
+    // 5. 设置初始窗口标题
     setWindowTitle("AI Media Player");
 }
 
@@ -49,16 +46,6 @@ MainWindow::~MainWindow() {
 }
 
 /**
- * @brief 重写窗口标题设置方法，同步更新自定义标题栏
- */
-void MainWindow::setWindowTitle(const QString& title) {
-    QWidget::setWindowTitle(title);
-    if (m_titleBar_) {
-        m_titleBar_->SetWindowTitle(title);
-    }
-}
-
-/**
  * @brief 初始化UI组件
  */
 void MainWindow::SetupUI() {
@@ -66,45 +53,33 @@ void MainWindow::SetupUI() {
     vbox->setContentsMargins(0, 0, 0, 0);
     vbox->setSpacing(0);
 
-    // 1. 添加自定义标题栏到最顶部
-    m_titleBar_ = new TitleBarWidget(this);
-    vbox->addWidget(m_titleBar_);
-
-    // 2. 实例化视频像素画布视图
+    // 1. 实例化视频像素画布视图
     m_playerWidget = new PlayerWidget(this);
     m_playerWidget->SetPlayer(m_player);
     vbox->addWidget(m_playerWidget, 1);
 
-    // 3. 实例化播放交互面板
+    // 2. 实例化播放交互面板
     m_controllerWidget = new ControllerWidget(this);
     vbox->addWidget(m_controllerWidget);
 
     // 规范多媒体终端标准展现窗格尺寸
-    setMinimumWidth(1280);
-    setMinimumHeight(720);
+    setMinimumWidth(800);
+    setMinimumHeight(600);
+    resize(1280, 720); // 默认打开尺寸
 }
 
 /**
  * @brief 建立信号槽连接
  */
 void MainWindow::SetupConnections() {
-    // ================== 标题栏控制信号 ==================
-    connect(m_titleBar_, &TitleBarWidget::sigMinimizeClicked, this, &MainWindow::showMinimized);
-    connect(m_titleBar_, &TitleBarWidget::sigMaximizeClicked, this, [this]() {
-        if (isMaximized() || isFullScreen()) {
-            showNormal();
-        } else {
-            showMaximized();
-        }
-        UpdateMaximizeButtonState();
-    });
-    connect(m_titleBar_, &TitleBarWidget::sigCloseClicked, this, &MainWindow::close);
-
     // ================== 上行：捕获用户交互，指挥底层 ==================
     connect(m_controllerWidget, &ControllerWidget::sigImportClicked, this, &MainWindow::onUserImportRequested);
     connect(m_controllerWidget, &ControllerWidget::sigPlayClicked, this, &MainWindow::onUserPlayRequested);
     connect(m_controllerWidget, &ControllerWidget::sigPauseClicked, this, &MainWindow::onUserPauseRequested);
     connect(m_controllerWidget, &ControllerWidget::sigSeekRequested, this, &MainWindow::onUserSeekRequested);
+
+    // 捕获画面点击以切换播放/暂停
+    connect(m_playerWidget, &PlayerWidget::sigVideoClicked, this, &MainWindow::onVideoAreaClicked);
 
     // ================== 下行：捕获底层反馈，更新UI ==================
     connect(m_playerWidget, &PlayerWidget::sigPlaybackStateChanged, this, &MainWindow::onEngineStateChanged);
@@ -119,25 +94,8 @@ void MainWindow::SetupConnections() {
                 // 微秒转换为秒
                 int64_t current_sec = current_us / 1000000;
                 int64_t total_sec = total_us / 1000000;
-                m_controllerWidget->SetTimeDisplay(current_us, total_us);
+                m_controllerWidget->SetTimeDisplay(current_sec, total_sec); // 已修复为传入秒数
             });
-}
-
-/**
- * @brief 更新最大化/还原按钮的显示状态
- */
-void MainWindow::UpdateMaximizeButtonState() {
-    if (!m_titleBar_)
-        return;
-
-    QPushButton* maximizeBtn = m_titleBar_->findChild<QPushButton*>("maximizeBtn");
-    if (maximizeBtn) {
-        if (isMaximized() || isFullScreen()) {
-            maximizeBtn->setText("❐");
-        } else {
-            maximizeBtn->setText("□");
-        }
-    }
 }
 
 /**
@@ -221,6 +179,25 @@ void MainWindow::onUserSeekRequested(float target_progress) {
     }
 }
 
+/**
+ * @brief 响应视频渲染区域的鼠标点击
+ * @details 判断当前引擎状态，智能切换播放与暂停
+ */
+void MainWindow::onVideoAreaClicked() {
+    if (!m_player)
+        return;
+
+    // 此处需要你在 av::IPlayer 中提供一个 GetState() 方法
+    // 如果没有，你可以把控制栏的 m_isPlaying 状态透传出来做判断
+    av::PlaybackState current_state = m_player->GetState();
+
+    if (current_state == av::PlaybackState::kPlaying) {
+        m_player->Pause();
+    } else if (current_state == av::PlaybackState::kPaused || current_state == av::PlaybackState::kOpened) {
+        m_player->Play();
+    }
+}
+
 // ================== 接收 PlayerWidget 底层状态反馈事件 ==================
 
 /**
@@ -255,76 +232,7 @@ void MainWindow::onEngineError(int error_code, const QString& error_msg) {
                           tr("底层引擎抛出异常:\n错误码: %1\n信息: %2").arg(error_code).arg(error_msg));
 }
 
-// ================== 无边框窗口原生事件处理 ==================
-
-/**
- * @brief 窗口大小变化事件处理函数
- * @param event 包含新旧窗口尺寸信息的事件对象
- */
-void MainWindow::resizeEvent(QResizeEvent* event) { QWidget::resizeEvent(event); }
-
-/**
- * @brief 鼠标按下事件处理函数
- * @param event 包含鼠标坐标和按键类型的事件对象
- * @details 用于实现无边框窗口的拖拽功能，记录按下时相对左上角的物理坐标差值
- */
-void MainWindow::mousePressEvent(QMouseEvent* event) {
-    if (event->button() == Qt::LeftButton && m_titleBar_ && m_titleBar_->geometry().contains(event->pos())) {
-        m_isDragging = true;
-        m_dragStartPosition = event->globalPosition().toPoint() - this->pos();
-        event->accept();
-        return;
-    }
-    QWidget::mousePressEvent(event);
-}
-
-/**
- * @brief 鼠标移动事件处理函数
- * @param event 包含鼠标坐标和按键状态的事件对象
- * @details 检查拖拽标志，根据全局坐标与初始偏移量实时重绘窗口位置
- */
-void MainWindow::mouseMoveEvent(QMouseEvent* event) {
-    if (m_isDragging && (event->buttons() & Qt::LeftButton)) {
-        this->move(event->globalPosition().toPoint() - m_dragStartPosition);
-        event->accept();
-        return;
-    }
-    QWidget::mouseMoveEvent(event);
-}
-
-/**
- * @brief 鼠标释放事件处理函数
- * @param event 包含鼠标坐标和按键类型的事件对象
- * @details 取消拖拽标志，终止坐标更新逻辑
- */
-void MainWindow::mouseReleaseEvent(QMouseEvent* event) {
-    if (event->button() == Qt::LeftButton) {
-        m_isDragging = false;
-        event->accept();
-        return;
-    }
-    QWidget::mouseReleaseEvent(event);
-}
-
-/**
- * @brief 鼠标双击事件处理函数
- * @param event 包含鼠标坐标和按键类型的事件对象
- * @details 实现双击切换全屏与普通窗口模式的业务逻辑
- */
-void MainWindow::mouseDoubleClickEvent(QMouseEvent* event) {
-    if (m_playerWidget && m_playerWidget->geometry().contains(event->pos())) {
-        if (isFullScreen()) {
-            LOG_INFO("Double click detected, exiting full screen mode.");
-            showNormal();
-        } else {
-            LOG_INFO("Double click detected, entering full screen mode.");
-            showFullScreen();
-        }
-        UpdateMaximizeButtonState();
-        event->accept();
-    }
-    QWidget::mouseDoubleClickEvent(event);
-}
+// ================== 原生事件处理 ==================
 
 /**
  * @brief 窗口关闭事件处理函数

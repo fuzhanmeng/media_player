@@ -100,6 +100,7 @@ void ControllerWidget::SetTimeDisplay(int64_t current_sec, int64_t total_sec) {
     QString timeStr = QString::asprintf("%02d:%02d / %02d:%02d", cur_m, cur_s, tot_m, tot_s);
     m_labelTime->setText(timeStr);
 }
+
 /**
  * @brief 更新进度条的位置
  * @param progress 当前进度百分比 [0.0, 1.0]
@@ -108,16 +109,21 @@ void ControllerWidget::SetSliderProgress(float progress) {
     if (!m_sliderProgress)
         return;
 
+    // 防御底层抢夺鼠标控制权
+    // 如果用户当前正在按住滑块进行拖拽，必须完全无视底层发来的进度更新，让鼠标拥有 100% 的控制权
+    if (m_sliderProgress->isSliderDown()) {
+        return; 
+    }
+
     // 计算实际应该设置的值 (0 ~ 1000)
     int value = static_cast<int>(progress * 1000.0f);
 
-    // 如果直接 setValue，会触发 QSlider 自己的 valueChanged 信号，这可能导致死循环或者误触发 Seek 事件 因此，在被动更新
-    // UI 时，必须暂时堵住屏蔽信号
+    // 如果直接 setValue，会触发 QSlider 自己的 valueChanged 信号，这可能导致死循环或者误触发 Seek 事件
+    // 因此，在被动更新 UI 时，必须暂时堵住屏蔽信号
     m_sliderProgress->blockSignals(true); // 信号屏蔽
-    m_sliderProgress->setValue(value); // 修改数值
+    m_sliderProgress->setValue(value);    // 修改数值
     m_sliderProgress->blockSignals(false); // 解除屏蔽
 }
-
 // ================= 内部响应 UI 物理点击的槽函数 =================
 
 /**
