@@ -67,7 +67,7 @@ public:
      * @brief 获取当前媒体容器的全局总时长
      * @return 总时长（单位：秒）
      */
-    double GetDuration() const override;
+    int64_t GetDuration() const override;
 
 private:
     /**

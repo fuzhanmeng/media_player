@@ -47,11 +47,11 @@ public:
 
         /**
          * @brief 播放进度更新
-         * @param progress 当前进度[0.0, 1.0]
-         * @param current_time 当前时间(微秒)
-         * @param total_time 总时长(秒)
+         * @param progress      当前播放进度，绝对比例范围 [0.0f, 1.0f]
+         * @param current_us    当前播放的绝对物理时间（单位：微秒）
+         * @param total_us      媒体全局总时长（单位：微秒）
          */
-        virtual void OnPlaybackProgress(float progress, int64_t current_time, float total_time) = 0;
+        virtual void OnPlaybackProgress(float progress, int64_t current_us, int64_t total_us) = 0;
     };
 
 public:
@@ -108,16 +108,16 @@ public:
 
     /**
      * @brief 触发媒体物理时间轴跳转 (Seek)
-     * @param target_time_sec 目标绝对时间（单位：秒）
+     * @param target_time_us 目标绝对时间（单位：微秒）
      * @note 内部将自动执行 Pause -> Flush(清空旧缓存) -> Seek -> 恢复状态 的组合原子操作
      */
-    virtual void SeekTo(double target_time_sec) = 0;
+    virtual void SeekTo(int64_t target_time_us) = 0;
 
     /**
      * @brief 获取当前媒体全局总时长
      * @return 总时长（单位：秒）若是直播流或未就绪，返回 0.0
      */
-    virtual double GetDuration() const = 0;
+    virtual int64_t GetDuration() const = 0;
 
     /**
      * @brief 获取图像物理宽度

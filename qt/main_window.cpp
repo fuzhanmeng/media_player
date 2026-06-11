@@ -113,9 +113,13 @@ void MainWindow::SetupConnections() {
 
     // 特殊路由：将 PlayerWidget 吐出的高频进度信号，直接通过 Lambda 表达式转发给 ControllerWidget 更新视图
     connect(m_playerWidget, &PlayerWidget::sigPlaybackProgress, this,
-            [this](float progress, float current, float total) {
+            [this](float progress, int64_t current_us, int64_t total_us) {
                 m_controllerWidget->SetSliderProgress(progress);
-                m_controllerWidget->SetTimeDisplay(current, total);
+
+                // 微秒转换为秒
+                int64_t current_sec = current_us / 1000000;
+                int64_t total_sec = total_us / 1000000;
+                m_controllerWidget->SetTimeDisplay(current_us, total_us);
             });
 }
 
@@ -207,13 +211,13 @@ void MainWindow::onUserPauseRequested() {
 /**
  * @brief 响应进度条拖拽完毕进行媒体时间轴跳转
  * @param target_progress 目标进度百分比 [0.0, 1.0]
- * @details 计算绝对时间(秒)并向底层派发 Seek 指令
+ * @details 计算绝对时间(微秒)并向底层派发 Seek 指令
  */
 void MainWindow::onUserSeekRequested(float target_progress) {
     if (m_player) {
         LOG_INFO("Seek to: {}", target_progress);
-        double target_time_sec = target_progress * m_player->GetDuration();
-        m_player->SeekTo(target_time_sec);
+        int64_t target_time_us = target_progress * m_player->GetDuration();
+        m_player->SeekTo(target_time_us);
     }
 }
 

@@ -228,7 +228,8 @@ void AVSynchronizer::ThreadLoop() {
 
         //  阶段3：暂停态强制渲染逻辑 (Seek强刷屏)  仅在暂停状态下，且拿到刚跳转后的第一张有效帧时触发
         if (sync_ctx_->state_.load() == PlaybackState::kPaused && force_render_.load()) {
-            LOG_INFO("========== Seek Completed: Force rendering new frame at {:.3f} sec ==========",
+            
+            LOG_INFO("Seek Completed: Force rendering new frame at {:.3f} sec",
                      video_frame->GetTimestampSec());
 
             std::unique_lock<std::mutex> lock(listener_mutex_);

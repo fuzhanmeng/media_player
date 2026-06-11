@@ -114,11 +114,11 @@ private:
 
     /**
      * @brief 播放进度更新
-     * @param progress 当前进度[0.0, 1.0]
-     * @param current_time 当前时间(秒)
-     * @param total_time 总时长(秒)
+     * @param progress      当前播放进度，绝对比例范围 [0.0f, 1.0f]
+     * @param current_us    当前播放的绝对物理时间（单位：微秒）
+     * @param total_us      媒体全局总时长（单位：微秒）
      */
-    void OnPlaybackProgress(float progress, int64_t current_time, float total_time) override;
+    void OnPlaybackProgress(float progress, int64_t current_us, int64_t total_us) override;
 
 private:
     /**

@@ -75,7 +75,7 @@ public:
     /**
      * @brief 查询媒体总时长
      */
-    double GetDuration() const override;
+    int64_t GetDuration() const override;
 
     /**
      * @brief 获取图像物理宽度

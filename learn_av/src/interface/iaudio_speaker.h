@@ -61,7 +61,6 @@ public:
      */
     virtual void Abort() = 0;
 
-
     /**
      * @brief 清空队列，唤醒阻塞
      */
@@ -71,7 +70,6 @@ public:
      * @brief 启动队列
      */
     virtual void StartQueue() = 0;
-
 
     /**
      * @brief 获取当前精准的音频播放时钟（微秒）
@@ -84,6 +82,11 @@ public:
      * @note 用于UI显示
      */
     virtual double GetAudioClock() const = 0;
+
+    /**
+     * @brief 重置时钟（用于跳转时进度条更新）
+     */
+    virtual void ResetAlock() = 0;
 };
 
 } // namespace av

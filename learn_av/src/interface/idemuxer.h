@@ -108,13 +108,13 @@ public:
      * @brief 触发绝对时间轴跳转
      * @param target_time_us 目标绝对时间（单位：微秒）
      */
-    virtual void SeekTo(int64_t target_time_sec) = 0;
+    virtual void SeekTo(int64_t target_time_us) = 0;
 
     /**
      * @brief 获取媒体总时长
-     * @return 总时长（单位：秒）
+     * @return 总时长（单位：微秒）
      */
-    virtual double GetDuration() const = 0;
+    virtual int64_t GetDuration() const = 0;
 };
 
 } // namespace av

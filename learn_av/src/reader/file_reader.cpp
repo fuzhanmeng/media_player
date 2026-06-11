@@ -13,7 +13,6 @@
 namespace av {
 
 std::unique_ptr<IFileReader> IFileReader::Create() {
-    LOG_INFO("FileReader Create...");
     return std::make_unique<FileReader>();
 }
 
@@ -62,7 +61,6 @@ bool FileReader::Open(const std::string& url) {
  * @brief 启动底层流水线，消费者先于生产者启动
  */
 void FileReader::Start(std::shared_ptr<SyncContext> sync_ctx) {
-    LOG_INFO("========== FileReader::Start ==========");
     if (audio_decoder_) {
         audio_decoder_->Start(sync_ctx);
     }
@@ -116,7 +114,6 @@ void FileReader::WaitForStop() {
  * @brief  触发绝对时间轴跳转，保证多线程状态同步
  */
 void FileReader::SeekTo(int64_t target_time_us) {
-    LOG_INFO("========== FileReader::SeekTo ==========");
 
     if (demuxer_) {
         demuxer_->SeekTo(target_time_us);
@@ -160,7 +157,7 @@ void FileReader::StartDecoderQueues() {
 /**
  * @brief 查询媒体总时长
  */
-double FileReader::GetDuration() const { return demuxer_ ? demuxer_->GetDuration() : 0; }
+int64_t FileReader::GetDuration() const { return demuxer_ ? demuxer_->GetDuration() : 0; }
 
 /**
  * @brief 获取已缓存的视频宽度

@@ -30,7 +30,6 @@ extern "C" {
 namespace av {
 
 std::unique_ptr<IAudioDecoder> IAudioDecoder::Create() {
-    LOG_INFO("AudioDecoder Create...");
     return std::make_unique<AudioDecoder>();
 }
 

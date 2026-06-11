@@ -49,7 +49,6 @@ VideoDecoder::~VideoDecoder() {
  * @brief 解码器创建
  */
 std::unique_ptr<IVideoDecoder> IVideoDecoder::Create() {
-    LOG_INFO("VideoDecoder Create...");
     return std::make_unique<VideoDecoder>();
 }
 

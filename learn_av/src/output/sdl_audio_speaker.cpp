@@ -227,6 +227,13 @@ double SDLAudioSpeaker::GetAudioClock() const {
 }
 
 /**
+ * @brief 重置时钟（用于跳转时进度条更新）
+ */
+void SDLAudioSpeaker::ResetAlock() {
+    audio_clock_us_.store(-1);
+}
+
+/**
  * @brief SDL 硬件底层回调函数
  * @note 运行在 SDL 独立的后台高级优先级线程中
  */

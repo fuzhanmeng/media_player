@@ -48,7 +48,6 @@ enum class PlaybackState;
  * @brief Player Create
  */
 std::shared_ptr<IPlayer> IPlayer::Create(std::shared_ptr<IGLContext> shared_gl_context) {
-    LOG_INFO("PLayer Create...");
     return std::make_shared<Player>(shared_gl_context);
 }
 
@@ -76,12 +75,24 @@ Player::Player(std::shared_ptr<IGLContext> gl_context)
     if (av_sync_) {
         av_sync_->SetListener(this);
     }
+
+    // 5. 创建心跳循环函数并启动
+    if (!progress_thread_.joinable()) {
+        is_progress_thread_running_.store(true);
+        progress_thread_ = std::thread(&Player::ProgressLoop, this);
+    }
 }
 
 /**
  * @brief 析构函数
  */
-Player::~Player() { Stop(); }
+Player::~Player() {
+    Stop();
+    is_progress_thread_running_.store(false);
+    if (progress_thread_.joinable()) {
+        progress_thread_.join();
+    }
+}
 
 // ================= 渲染管道控制 =================
 
@@ -263,7 +274,7 @@ void Player::Pause() {
 void Player::Stop() {
     LOG_INFO("========== Play Stop ==========");
 
-    // 1. 获取当前状态，如果已经停止，直接返回防抖
+    // 1. 获取当前状态，如果已经停止
     PlaybackState current_state = sync_ctx_->state_.load();
     if (current_state == PlaybackState::kStopped || current_state == PlaybackState::kIdle) {
         return;
@@ -308,16 +319,17 @@ void Player::Stop() {
 
 /**
  * @brief 触发媒体物理时间轴跳转 (Seek)
- * @param target_time_sec 目标绝对时间（单位：秒）
+ * @param target_time_us 目标绝对时间（单位：微秒）
  * @details 封装组合状态序列：Pause(强挂起) -> Flush(数据冲刷) -> Seek(时间轴重定位) -> Play(现场恢复)
  */
-void Player::SeekTo(double target_time_sec) {
-    LOG_INFO("========== Play SeekTo ==========");
+void Player::SeekTo(int64_t target_time_us) {
     if (!sync_ctx_)
         return;
 
-    int64_t target_time_us = static_cast<int64_t>(target_time_sec * 1000000.0);
     PlaybackState old_state = sync_ctx_->state_.load();
+    if (audio_speaker_) {
+        audio_speaker_->ResetAlock();
+    }
 
     // 1. 触发状态机向 kPaused 跃迁，执行休眠同步点
     Pause();
@@ -353,9 +365,9 @@ void Player::SeekTo(double target_time_sec) {
  * @brief 获取当前媒体全局总时长
  * @return 总时长（单位：秒）。若是直播流或未就绪，返回 0.0
  */
-double Player::GetDuration() const {
+int64_t Player::GetDuration() const {
     // if  file_reader_ != nullptr, return file_reader_->GetDuration()
-    return file_reader_ ? file_reader_->GetDuration() : 0.0;
+    return file_reader_ ? file_reader_->GetDuration() : 0;
 }
 
 /**
@@ -424,10 +436,10 @@ void Player::OnFileReaderNotifyVideoFrame(std::shared_ptr<VideoFrame> video_fram
 
     // 2. 判断是不是Flush包
     if (video_frame->HasFlag(AVFrameFlag::kFlush)) {
-       if (av_sync_) {
-           av_sync_->PushVideoFrame(std::move(video_frame));
-           return;
-       }
+        if (av_sync_) {
+            av_sync_->PushVideoFrame(std::move(video_frame));
+            return;
+        }
     }
 
     // 3. 常规数据的合法性校验
@@ -512,6 +524,49 @@ void Player::ChangeState(PlaybackState new_state) {
         if (listener_) {
             listener_->OnPlaybackStateChanged(new_state);
         }
+    }
+}
+
+/**
+ * @brief 心跳循环线程（用于进度条回调显示）
+ */
+void Player::ProgressLoop() {
+    const auto kUpdateInterval = std::chrono::milliseconds(100);
+
+    while (is_progress_thread_running_.load()) {
+        if (sync_ctx_ && sync_ctx_->state_.load() == PlaybackState::kPlaying) {
+            // 1. 获取当前时间（微妙）
+            int64_t current_time_us = 0;
+            if (audio_speaker_) {
+                current_time_us = audio_speaker_->GetAudioClockUs();
+            }
+
+            if (current_time_us < 0) {
+                std::this_thread::sleep_for(kUpdateInterval);
+                return;
+            }
+
+            // 2. 获取总时长（微妙）
+            int64_t total_time_us = 0;
+            if (file_reader_) {
+                total_time_us = file_reader_->GetDuration();
+            }
+
+            // 3. 计算百分比
+            float progress = 0.0f;
+            if (total_time_us > 0) {
+                progress =
+                    static_cast<float>(static_cast<double>(current_time_us) / static_cast<double>(total_time_us));
+                // 边界防御
+                progress = std::clamp(progress, 0.0f, 1.0f);
+            }
+
+            // 4. 触发回调
+            if (listener_) {
+                listener_->OnPlaybackProgress(progress, current_time_us, total_time_us);
+            }
+        }
+        std::this_thread::sleep_for(kUpdateInterval);
     }
 }
 }; // namespace av

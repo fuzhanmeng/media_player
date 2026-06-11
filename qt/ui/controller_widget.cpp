@@ -11,8 +11,6 @@
 #include <QPushButton> // 按钮
 #include <QSlider> // 滑块部件
 
-#include "logger.h"
-
 /**
  * @brief 构造函数实现
  * @param parent 父级窗口指针
@@ -23,8 +21,6 @@ ControllerWidget::ControllerWidget(QWidget* parent) : QWidget(parent) {
 
     // 2. 调用专门的 UI 组装函数
     SetupUI();
-
-    LOG_INFO("ControllerWidget initialized.");
 }
 
 /**
@@ -84,19 +80,26 @@ void ControllerWidget::SetPlayState(bool is_playing) {
 
 /**
  * @brief 设置时间文本显示
+ * @param current_sec 当前时间（单位：秒）
+ * @param total_sec   总时长（单位：秒）
  */
-void ControllerWidget::SetTimeDisplay(float current_time, float total_time) {
+void ControllerWidget::SetTimeDisplay(int64_t current_sec, int64_t total_sec) {
+    // 保护性归零，防止出现负数时间
+    if (current_sec < 0)
+        current_sec = 0;
+    if (total_sec < 0)
+        total_sec = 0;
+
     // 将秒数转换为 分:秒 格式
-    int cur_m = static_cast<int>(current_time) / 60;
-    int cur_s = static_cast<int>(current_time) % 60;
-    int tot_m = static_cast<int>(total_time) / 60;
-    int tot_s = static_cast<int>(total_time) % 60;
+    int cur_m = static_cast<int>(current_sec / 60);
+    int cur_s = static_cast<int>(current_sec % 60);
+    int tot_m = static_cast<int>(total_sec / 60);
+    int tot_s = static_cast<int>(total_sec % 60);
 
     // 格式化为 00:00 / 00:00 的字符串
     QString timeStr = QString::asprintf("%02d:%02d / %02d:%02d", cur_m, cur_s, tot_m, tot_s);
     m_labelTime->setText(timeStr);
 }
-
 /**
  * @brief 更新进度条的位置
  * @param progress 当前进度百分比 [0.0, 1.0]
@@ -132,11 +135,9 @@ void ControllerWidget::onPlayPauseButtonClicked() {
     // 根据当前记录的状态，决定执行哪个操作
     if (m_isPlaying) {
         // 当前在播放，用户点击意味着他想暂停
-        LOG_INFO("=================== Pause ===================");
         emit sigPauseClicked();
     } else {
         // 当前在暂停，用户点击意味着他想播放
-        LOG_INFO("=================== Play ===================");
         emit sigPlayClicked();
     }
 }

@@ -5,9 +5,11 @@
  */
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "interface/iav_synchronizer.h"
@@ -74,18 +76,18 @@ public:
 
     /**
      * @brief 触发媒体物理时间轴跳转 (Seek)
-     * @param target_time_sec 目标绝对时间（单位：秒）
+     * @param target_time_us 目标绝对时间（单位：微秒）
      * @note Pause -> Flush -> Seek -> 状态恢复 的多线程安全时序
      */
-    void SeekTo(double target_time_sec) override;
+    void SeekTo(int64_t target_time_us) override;
 
     // ================= 状态查询与事件订阅 =================
 
     /**
      * @brief 获取当前媒体全局总时长
-     * @return 总时长（单位：秒）。若是直播流或未就绪，返回 0.0
+     * @return 总时长（单位：微秒），若是直播流或未就绪，返回 0
      */
-    double GetDuration() const override;
+    int64_t GetDuration() const override;
 
     /**
      * @brief 获取图像物理宽度
@@ -158,6 +160,11 @@ private:
      */
     void ChangeState(PlaybackState new_state);
 
+    /**
+     * @brief 心跳循环函数（用于进度条回调显示）
+     */
+    void ProgressLoop();
+
 private:
     // ================= 核心基础设施 =================
 
@@ -189,6 +196,10 @@ private:
 
     /// 音画同步实例
     std::unique_ptr<IAVSynchronizer> av_sync_{nullptr};
+
+    // 心跳循环线程（用于进度条回调显示）
+    std::thread progress_thread_;
+    std::atomic<bool> is_progress_thread_running_{false};
 };
 
 } // namespace av

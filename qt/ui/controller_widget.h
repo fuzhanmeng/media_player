@@ -41,7 +41,7 @@ public:
      * @param current_time 当前时间(秒)
      * @param total_time 总时长(秒)
      */
-    void SetTimeDisplay(float current_time, float total_time);
+    void SetTimeDisplay(int64_t current_time, int64_t total_time);
 
     /**
      * @brief 更新进度条的位置

@@ -81,6 +81,11 @@ public:
      */
     double GetAudioClock() const override;
 
+    /**
+     * @brief 重置时钟（用于跳转时进度条更新）
+     */
+    void ResetAlock() override;
+
 private:
     /**
      * @brief SDL 硬件底层静态回调函数

@@ -32,7 +32,6 @@ PlayerWidget::~PlayerWidget() { DetachPlayer(); }
  * @details 自动解绑之前的播放器，绑定新的播放器，并建立双向事件流
  */
 void PlayerWidget::SetPlayer(std::shared_ptr<av::IPlayer> player) {
-    LOG_INFO("SetPlayer...");
 
     // 先安全解绑之前的播放器，避免资源泄漏和悬空指针
     DetachPlayer();
@@ -92,12 +91,12 @@ void PlayerWidget::OnPlaybackError(int error_code, const std::string& error_msg)
 
 /**
  * @brief 播放进度更新
- * @param progress 当前进度[0.0, 1.0]
- * @param current_time 当前时间(秒)
- * @param total_time 总时长(秒)
+ * @param progress      当前播放进度，绝对比例范围 [0.0f, 1.0f]
+ * @param current_us    当前播放的绝对物理时间（单位：微秒）
+ * @param total_us      媒体全局总时长（单位：微秒）
  */
-void PlayerWidget::OnPlaybackProgress(float progress, int64_t current_time, float total_time) {
-    emit sigPlaybackProgress(progress, current_time, total_time);
+void PlayerWidget::OnPlaybackProgress(float progress, int64_t current_us, int64_t total_us) {
+    emit sigPlaybackProgress(progress, current_us, total_us);
 }
 
 /**

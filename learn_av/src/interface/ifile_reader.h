@@ -107,7 +107,7 @@ public:
     /**
      * @brief 查询媒体总时长
      */
-    virtual double GetDuration() const = 0;
+    virtual int64_t GetDuration() const = 0;
 
     /**
      * @brief 获取图像宽度

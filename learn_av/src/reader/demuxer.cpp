@@ -26,10 +26,7 @@ extern "C" {
 
 namespace av {
 
-std::unique_ptr<IDemuxer> IDemuxer::Create() {
-    LOG_INFO("Demuxer Create...");
-    return std::make_unique<Demuxer>();
-}
+std::unique_ptr<IDemuxer> IDemuxer::Create() { return std::make_unique<Demuxer>(); }
 
 // 1. 构造/析构
 Demuxer::Demuxer() {}
@@ -146,7 +143,6 @@ bool Demuxer::Open(const std::string& url) {
  * @brief 启动异步解复用工作线程
  */
 void Demuxer::Start(std::shared_ptr<SyncContext> sync_ctx) {
-    LOG_INFO("========== Demuxer::Start ==========");
     // 1. 如果当前状态是停止状态直接返回
     if (demuxer_thread_.joinable()) {
         return;
@@ -218,7 +214,7 @@ void Demuxer::WaitForStop() {
 
     // 释放对全局共享状态的引用，防止悬空
     sync_ctx_.reset();
-    LOG_INFO("Demuxer Stoped...");
+    LOG_INFO("========== Demuxer::WaitForStop ==========");
 }
 
 /**
@@ -226,8 +222,6 @@ void Demuxer::WaitForStop() {
  * @param target_time_us 目标绝对时间（单位：微秒）
  */
 void Demuxer::SeekTo(int64_t target_time_us) {
-    LOG_INFO("========== Demuxer::SeekTo ==========");
-
     // 直接覆盖为最新的目标时间 (Last-writer wins)
     target_seek_time_.store(target_time_us);
 
@@ -243,7 +237,7 @@ void Demuxer::SeekTo(int64_t target_time_us) {
  * @brief 获取当前媒体容器的全局总时长
  * @return 总时长（单位：秒）
  */
-double Demuxer::GetDuration() const {
+int64_t Demuxer::GetDuration() const {
     std::lock_guard<std::mutex> lock(avformat_mutex_);
 
     // AV_NOPTS_VALUE 时长未知（无限制/直播/格式不支持文件损坏/正在下载）
@@ -252,7 +246,7 @@ double Demuxer::GetDuration() const {
     }
 
     // 将 FFmpeg 内部时基 (AV_TIME_BASE, 微秒) 换算为标准绝对秒数
-    return static_cast<double>(avformat_ctx_->duration) / AV_TIME_BASE;
+    return avformat_ctx_->duration;
 }
 
 /**
@@ -260,8 +254,6 @@ double Demuxer::GetDuration() const {
  * @note 仅供 Open() 和析构函数调用，对上层业务屏蔽
  */
 void Demuxer::Close() {
-    LOG_INFO("========== Demuxer::Close ==========");
-
     // 1. 清理资源前，先停止解复用线程
     RequestStop();
     WaitForStop();
@@ -272,7 +264,6 @@ void Demuxer::Close() {
         avformat_close_input(&avformat_ctx_);
         avformat_ctx_ = nullptr;
     }
-
     LOG_INFO("Demuxer closed successfully");
 }
 
@@ -281,8 +272,6 @@ void Demuxer::Close() {
  * @details 维护三级优先级调度：P0(中断/跳转响应) > P1(背压限流阻塞) > P2(物理分包读取)
  */
 void Demuxer::ThreadLoop() {
-    LOG_INFO("Demuxer I/O thread start.");
-
     while (!is_abort_requested_.load()) {
         // [优先级 P0]: 拦截与处理 Seek 请求
         if (is_seek_requested_.load()) {
