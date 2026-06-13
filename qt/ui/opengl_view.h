@@ -1,8 +1,8 @@
 /**
  * @file opengl_view.h
  * @brief 自定义视频渲染视图
- * @details 专门用于接管底层解码后推上来的视频帧（YUV420P），并使用自定义 Shader 进行 GPU 硬件加速渲染。
- * 融合了 Qt 窗口层、现代 OpenGL 核心 API 以及业务解耦接收器。
+ * @details 用于接管底层解码后推上来的视频帧（YUV420P），并使用自定义 Shader 进行 GPU 硬件加速渲染
+ *   CPU内存(YUV420P) → glTexSubImage2D → GPU显存(3个纹理) → Fragment Shader(YUV→RGB矩阵运算) → 帧缓冲 → 屏幕
  */
 #pragma once
 
@@ -40,20 +40,16 @@ public:
      */
     ~OpenGLView() override;
 
-    // ================== IVideoSink 接口实现 ==================
-
     /**
-     * @brief 接收底层投递上来的视频帧 (单帧覆盖机制)
+     * @brief 接收底层投递上来的视频帧（信箱模式，新帧覆盖旧帧）
      * @param video_frame 包含纯净 YUV420P 像素数据的智能指针
-     * @note 该函数由底层后台解码子线程极速触发，采用 O(1) 的指针移动并向主线程派发重绘事件
+     * @note 该函数由底层后台解码子线程极速触发，内部用 mutex 保护，通过 update() 投递 Paint 事件到主线程
      */
     void OnReceiveVideoFrame(std::shared_ptr<VideoFrame> video_frame) override;
 
 protected:
-    // ================== QOpenGLWidget 核心渲染管线 ==================
-
     /**
-     * @brief 初始化 OpenGL 渲染环境 (生命周期内仅调用一次)
+     * @brief 初始化 OpenGL 渲染环境
      * @details 负责加载 API 指针、编译着色器、搭建几何幕布、预分配纹理句柄
      */
     void initializeGL() override;
@@ -62,12 +58,13 @@ protected:
      * @brief 视口尺寸调整 (窗口大小改变时自动触发)
      * @param width 新的物理宽度
      * @param height 新的物理高度
+     * @param 更新 OpenGL 视口（Viewport），告知 GPU 绘图大小，实现 NDC 坐标（-1~1）到屏幕像素坐标的正确映射
      */
     void resizeGL(int width, int height) override;
 
     /**
-     * @brief 核心渲染循环 (主线程屏幕刷新时自动触发)
-     * @details 将最新的 YUV 内存数据推入显存，调用 Shader 矩阵换算并绘制到屏幕
+     * @brief 渲染循环
+     * @details 将最新 YUV 帧上传到 GPU 纹理，触发 Shader 绘制到帧缓冲
      */
     void paintGL() override;
 
@@ -80,7 +77,7 @@ private:
     void BuildShader();
 
     /**
-     * @brief 分配并初始化顶点与纹理坐标数据 (VAO/VBO/EBO)
+     * @brief  上传全屏矩形的顶点数据到 GPU (VAO/VBO/EBO)
      */
     void SetupGeometry();
 
@@ -90,12 +87,12 @@ private:
     /// 互斥锁：保护跨线程的视频帧指针交接
     std::mutex m_frameMutex;
 
-    /// 暂存区：当前需要被 GPU 渲染的最新的视频帧 (Mailbox 信箱模式)
+    /// 暂存区：当前需要被 GPU 渲染的最新的视频帧 (Mailbox 信箱模式，只保留最新一帧)
     std::shared_ptr<VideoFrame> m_currentFrame{nullptr};
 
     // ================== GPU 物理渲染资源 ==================
 
-    /// 着色器程序：负责管理运行在 GPU 上的微型程序
+    /// 着色器程序：（Vertex Shader + Fragment Shader 链接后的整体）
     QOpenGLShaderProgram m_shaderProgram;
 
     /// OpenGL 纹理句柄数组：分别对应 Y, U, V 三个颜色物理分量
@@ -107,6 +104,18 @@ private:
     GLuint m_vbo{0};
     /// OpenGL 索引缓冲对象 (告诉 GPU 怎么用 4 个点画出 2 个三角形来拼成一个矩形)
     GLuint m_ebo{0};
+
+    /// 纹理显存是否已通过 glTexImage2D 完成初次分配
+    /// false = 尚未分配，需要调用 glTexImage2D（分配+上传）
+    /// true  = 已分配，后续帧用 glTexSubImage2D（只上传，不重新分配）
+    bool m_textureInitialized{false};
+
+    /// 上一帧的视频宽度（像素）
+    /// 用于检测分辨率变化，变化时需重新调用 glTexImage2D 重新分配
+    int m_lastVideoWidth{0};
+
+    /// 上一帧的视频高度（像素）
+    int m_lastVideoHeight{0};
 };
 
 } // namespace av
