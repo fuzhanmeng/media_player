@@ -189,7 +189,7 @@ void AudioDecoder::Start(std::shared_ptr<SyncContext> sync_ctx) {
     sync_ctx_ = std::move(sync_ctx);
 
     // 5. 实例化并启动 OS 级解码线程
-    decode_thread_ = std::thread(&AudioDecoder::DecodeLoop, this);
+    decode_thread_ = std::thread(&AudioDecoder::ThreadLoop, this);
     LOG_INFO("Audio Decoder OS thread start successfully...");
 }
 
@@ -197,7 +197,6 @@ void AudioDecoder::Start(std::shared_ptr<SyncContext> sync_ctx) {
  * @brief 阶段一：异步发送终止信令 --非阻塞
  */
 void AudioDecoder::RequestStop() {
-    LOG_INFO("========== AudioDecoder::Stop ==========");
     // 1. 若已处于终止请求状态，避免重复操作
     if (is_abort_requested_.load()) {
         return;
@@ -212,8 +211,7 @@ void AudioDecoder::RequestStop() {
     }
 
     // 4. 强行中断可能阻塞在数据队列 Push/Pop 操作上的线程
-    packet_queue_.Abort();
-    LOG_INFO("========== AudioDecoder::RequestStop ==========");
+    packet_queue_.AbortAndClear();
 }
 
 /**
@@ -229,8 +227,6 @@ void AudioDecoder::WaitForStop() {
     is_abort_requested_.store(false);
     packet_queue_.Clear();
     sync_ctx_.reset();
-
-    LOG_INFO("========== AudioDecoder::WaitForStop ==========");
 }
 
 /**
@@ -286,8 +282,8 @@ void AudioDecoder::Close() {
 /**
  * @brief 音频解码与重采样核心事件循环 (Event Loop)
  */
-void AudioDecoder::DecodeLoop() {
-    LOG_INFO("AudioDecoder DecodeLoop started...");
+void AudioDecoder::ThreadLoop() {
+    LOG_INFO("AudioDecoder ThreadLoop started...");
 
     // 分配解码输出的复用物理内存载体，避免循环内高频内存分配
     AVFrame* av_frame = av_frame_alloc();
@@ -401,7 +397,7 @@ void AudioDecoder::DecodeLoop() {
     // 销毁物理内存载体，防范堆内存泄漏
     av_frame_free(&av_frame);
 
-    LOG_INFO("AudioDecoder DecodeLoop exited safely.");
+    LOG_INFO("AudioDecoder ThreadLoop exited safely.");
 }
 
 /**

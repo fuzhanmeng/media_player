@@ -95,7 +95,6 @@ public:
      */
     int GetChannels() const override;
 
-
 private:
     /**
      * @brief 释放 FFmpeg 解码器与重采样上下文资源
@@ -105,7 +104,7 @@ private:
     /**
      * @brief 异步解码循环，运行在 decode_thread_ 中
      */
-    void DecodeLoop();
+    void ThreadLoop();
 
     /**
      * @brief 处理解码后的原始音频帧，执行重采样并分发给下游

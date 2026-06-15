@@ -91,7 +91,6 @@ public:
      */
     void StartQueue() override;
 
-
 private:
     /**
      * @brief 释放 FFmpeg 解码器
@@ -101,7 +100,7 @@ private:
     /**
      * @brief 视频解码死循环，运行在 decode_thread_ 中
      */
-    void DecodeLoop();
+    void ThreadLoop();
 
     /**
      * @brief 处理解码出的裸帧，进行 YUV->RGBA 转换，并分发给监听器

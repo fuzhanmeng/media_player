@@ -307,6 +307,7 @@ void SDLAudioSpeaker::FillAudioData(Uint8* stream, int len) {
                 listener_->OnAudioCompleted();
             }
 
+            audio_clock_us_.store(-1);
             current_frame_ = nullptr;
 
             SDL_PauseAudioDevice(audio_device_id_, -1);

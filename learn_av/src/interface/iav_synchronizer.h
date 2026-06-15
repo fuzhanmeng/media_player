@@ -32,7 +32,7 @@ public:
          * @param video_frame 视频帧数据 DTO
          */
         virtual void OnSyncNotifyVideoFrame(std::shared_ptr<VideoFrame> video_frame) = 0;
-    
+
         /**
          * @brief 通知Player收到了EOF包
          */
@@ -91,6 +91,13 @@ public:
      * @details 该方法将帧压入同步器内部队列，非阻塞立即返回
      */
     virtual void PushVideoFrame(std::shared_ptr<VideoFrame> video_frame) = 0;
+
+    /**
+     * @brief 通知音画同步器：音频流已播放完毕
+     * @details 由 Player::OnAudioCompleted 调用
+     *          AVSync 内部据此区分"SDL 过渡期"和"音频永久停止"两种情况
+     */
+    virtual void NotifyAudioFinished() = 0;
 };
 
 } // namespace av

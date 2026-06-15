@@ -102,6 +102,9 @@ void MainWindow::SetupConnections() {
  * @brief 打开媒体文件
  */
 bool MainWindow::OpenMedia(const QString& url) {
+    // 记录路径，播放结束后重播用
+    m_currentFilePath = url;
+
     if (!m_player)
         return false;
 
@@ -114,6 +117,7 @@ bool MainWindow::OpenMedia(const QString& url) {
     }
 
     LOG_INFO("Successfully opened media asset, URL: {}", stdUrl);
+    
     // 打开成功后更新窗口标题为文件名
     setWindowTitle(QFileInfo(url).fileName() + " - AI Media Player");
 
@@ -153,8 +157,27 @@ void MainWindow::onUserImportRequested() {
  * @details 驱动底层状态机从 kOpened 或 kPaused 跃迁至 kPlaying
  */
 void MainWindow::onUserPlayRequested() {
-    if (m_player)
+    if (!m_player) {
+        return;
+    }
+
+    av::PlaybackState state = m_player->GetState();
+
+    if (state == av::PlaybackState::kStopped) {
+        // 播放完毕后处于Stop状态
+        if (!m_currentFilePath.isEmpty()) {
+            bool ok = m_player->Open(m_currentFilePath.toStdString());
+            if (!ok) {
+                LOG_ERROR("Failed to reopen media for replay: {}", m_currentFilePath.toStdString());
+                return;
+            }
+
+            m_player->Play();
+        }
+    } else {
+        // 首次播放
         m_player->Play();
+    }
 }
 
 /**
@@ -215,9 +238,10 @@ void MainWindow::onEngineStateChanged(av::PlaybackState state) {
  * @details 物理流排空后，强制 UI 回归未播放状态并重置所有进度数据
  */
 void MainWindow::onEnginePlaybackCompleted() {
+    // 1. 重置 UI
     m_controllerWidget->SetPlayState(false);
     m_controllerWidget->SetSliderProgress(0.0f);
-    m_controllerWidget->SetTimeDisplay(0LL, m_player->GetDuration()); // 使用正确的 int64_t 字面量
+    m_controllerWidget->SetTimeDisplay(0LL, m_player->GetDuration());
 }
 
 /**

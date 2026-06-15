@@ -48,9 +48,7 @@ VideoDecoder::~VideoDecoder() {
 /**
  * @brief 解码器创建
  */
-std::unique_ptr<IVideoDecoder> IVideoDecoder::Create() {
-    return std::make_unique<VideoDecoder>();
-}
+std::unique_ptr<IVideoDecoder> IVideoDecoder::Create() { return std::make_unique<VideoDecoder>(); }
 
 /**
  * @brief 设置下游监听器
@@ -177,7 +175,7 @@ void VideoDecoder::Start(std::shared_ptr<SyncContext> sync_ctx) {
     is_abort_requested_.store(false);
 
     // 5. 启动真正的解码线程
-    decode_thread_ = std::thread(&VideoDecoder::DecodeLoop, this);
+    decode_thread_ = std::thread(&VideoDecoder::ThreadLoop, this);
 
     LOG_INFO("Video Decoder OS thread start successfully...");
 }
@@ -224,7 +222,7 @@ void VideoDecoder::WaitForStop() {
 
 /**
  * @brief 执行物理层面的解码器内部状态冲刷
- * @note 仅允许在解码工作线程 (DecodeLoop) 内部捕获到 kFlush 信令包时调用
+ * @note 仅允许在解码工作线程 (ThreadLoop) 内部捕获到 kFlush 信令包时调用
  */
 void VideoDecoder::Flush() {
     std::lock_guard<std::mutex> lock(codec_mutex_);
@@ -264,8 +262,8 @@ void VideoDecoder::Close() {
  * @details 负责从 Demuxer 接收压缩比特流，驱动底层硬件/软件解码引擎，
  * 并在无锁环境下执行内存剥离对齐与下游路由投递。
  */
-void VideoDecoder::DecodeLoop() {
-    LOG_INFO("VideoDecoder DecodeLoop started...");
+void VideoDecoder::ThreadLoop() {
+    LOG_INFO("VideoDecoder ThreadLoop started...");
 
     // [阶段 0]: 申请一个 AVFrame 临时变量作为输出容器
     AVFrame* av_frame = av_frame_alloc();
@@ -356,7 +354,7 @@ void VideoDecoder::DecodeLoop() {
                     LOG_INFO("Video decoding reached physical EOF.");
 
                     // 创建一个空帧
-                    auto eof_frame = std::make_shared<VideoFrame>(0,0);
+                    auto eof_frame = std::make_shared<VideoFrame>(0, 0);
                     eof_frame->AddFlag(AVFrameFlag::kEOF);
 
                     // 传给音画同步模块
@@ -384,7 +382,7 @@ void VideoDecoder::DecodeLoop() {
     // [阶段 0 的闭环]: 销毁物理内存载体，防范堆内存泄漏
     av_frame_free(&av_frame);
 
-    LOG_INFO("VideoDecoder DecodeLoop exited safely.");
+    LOG_INFO("VideoDecoder ThreadLoop exited safely.");
 }
 
 /**

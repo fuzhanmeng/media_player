@@ -82,6 +82,13 @@ public:
      */
     void PushVideoFrame(std::shared_ptr<VideoFrame> video_frame) override;
 
+    /**
+     * @brief 通知音画同步器：音频流已播放完毕
+     * @details 由 Player::OnAudioCompleted 调用
+     *          AVSync 内部据此区分"SDL 过渡期"和"音频永久停止"两种情况
+     */
+    void NotifyAudioFinished() override;
+
 private:
     /**
      * @brief 内部核心工作线程
@@ -119,6 +126,9 @@ private:
 
     /// 替代 ThreadLoop 内的 static 变量，这样每次 Start() 时可以重置
     std::chrono::steady_clock::time_point last_render_log_time_;
+
+    // 音频是否已永久停止 - SDL 收到 EOF 后由外部设置
+    std::atomic<bool> audio_finished_{false};
 };
 
 } // namespace av

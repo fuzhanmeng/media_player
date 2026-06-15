@@ -492,6 +492,11 @@ void Player::OnAudioCompleted() {
     // 1. 标记音频管线已结束
     audio_finished_.store(true);
 
+    // 2. 通知 AVSync 音频已永久停止，让 AVSync 策略B不再等待音频时钟，直接处理剩余帧和 EOF 帧
+    if (av_sync_) {
+        av_sync_->NotifyAudioFinished();
+    }
+
     // 2. 触发判定
     CheckAndNotifyPlaybackCompleted();
 }

@@ -141,4 +141,7 @@ private:
 
     /// 播放控制面板控件指针 (负责UI展示与物理交互信号发送)
     ControllerWidget* m_controllerWidget{nullptr};
+
+    /// 记录当前播放的文件路径
+    QString m_currentFilePath;  
 };
