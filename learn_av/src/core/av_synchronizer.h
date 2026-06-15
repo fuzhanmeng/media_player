@@ -116,7 +116,7 @@ private:
     std::thread sync_thread_;
 
     /// 线程物理死亡标志位
-    std::atomic<bool> is_abort_{false};
+    std::atomic<bool> is_abort_{true};
 
     /// 强制渲染单帧，解决暂停态拖动无画面的问题
     std::atomic<bool> force_render_{false};

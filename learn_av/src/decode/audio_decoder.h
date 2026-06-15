@@ -133,7 +133,7 @@ private:
 
     // 5. 并发生命周期与状态控制原语
     std::thread decode_thread_;
-    std::atomic<bool> is_abort_requested_{false}; ///< 物理线程终止信令
+    std::atomic<bool> is_abort_requested_{true}; ///< 物理线程终止信令，true=线程应退出
 
     // 6. 全局状态同步上下文 (The Source of Truth)
     std::shared_ptr<SyncContext> sync_ctx_{nullptr};

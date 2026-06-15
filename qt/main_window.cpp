@@ -241,7 +241,7 @@ void MainWindow::onEnginePlaybackCompleted() {
     // 1. 重置 UI
     m_controllerWidget->SetPlayState(false);
     m_controllerWidget->SetSliderProgress(0.0f);
-    m_controllerWidget->SetTimeDisplay(0LL, m_player->GetDuration());
+    m_controllerWidget->SetTimeDisplay(0LL, 0LL);    
 }
 
 /**

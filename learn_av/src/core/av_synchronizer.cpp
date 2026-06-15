@@ -73,12 +73,16 @@ void AVSynchronizer::SetListener(Listener* listener) {
  */
 void AVSynchronizer::Start() {
     // 防止重复启动导致的线程句柄覆盖
-    if (sync_thread_.joinable()) {
-        LOG_WARN("AVSynchronizer thread is already running, Start() ignored");
+    if (!is_abort_.load()) {
         return;
     }
 
-    // 重置终止标志位
+    // 2. 回收上次可能遗留的线程句柄
+    if (sync_thread_.joinable()) {
+        sync_thread_.join();
+    }
+
+    // 3.设置线程标志
     is_abort_.store(false);
     force_render_.store(false);
     audio_finished_.store(false);
@@ -86,10 +90,11 @@ void AVSynchronizer::Start() {
     // 每次启动时重置日志节流时间，防止跨 Play 周期的 static 变量问题
     last_render_log_time_ = std::chrono::steady_clock::now();
 
-    // 激活队列
+    // 4. 清空&&启动队列
+    video_queue_.Clear();
     video_queue_.Start();
 
-    // 启动后台同步线程
+    // 5. 启动后台同步线程
     sync_thread_ = std::thread(&AVSynchronizer::ThreadLoop, this);
 
     LOG_INFO("AVSynchronizer working thread started successfully");
@@ -100,22 +105,17 @@ void AVSynchronizer::Start() {
  * @details 发送终止信号，唤醒所有可能阻塞的操作
  */
 void AVSynchronizer::RequestStop() {
-    // 防止重复发送终止信号
-    if (is_abort_.load()) {
-        return;
-    }
 
-    // 设置终止标志位
+    // 1. 下发终止信令
     is_abort_.store(true);
 
-    // 唤醒可能阻塞在状态条件变量上的线程
+    // 2. 唤醒阻塞在 state_cv_ 上的线程
     if (sync_ctx_) {
         sync_ctx_->state_cv_.notify_all();
     }
 
-    // 中止视频队列，解除所有阻塞在Pop/Push操作上的线程
+    // 3.  唤醒阻塞在 video_queue_ 上的线程
     video_queue_.Abort();
-    LOG_INFO("----- AVSynchronizer::RequestStop -----");
 }
 
 /**
@@ -126,11 +126,6 @@ void AVSynchronizer::WaitForStop() {
     if (sync_thread_.joinable()) {
         sync_thread_.join();
     }
-
-    // 2. 清空队列中残留的视频帧，释放内存
-    video_queue_.Clear();
-
-    LOG_INFO("----- AVSynchronizer::WaitForStop -----");
 }
 
 /**
@@ -186,8 +181,9 @@ void AVSynchronizer::PushVideoFrame(std::shared_ptr<VideoFrame> video_frame) {
 
     // 2. 处理带内EOF信令
     if (video_frame->HasFlag(AVFrameFlag::kEOF)) {
-        video_queue_.Push(std::move(video_frame));
         LOG_INFO("AV_Sync received IN-BAND EOF signal, pushing to render queue.");
+        video_queue_.Start();   // EOF 帧入队前确保队列处于可用状态
+        video_queue_.Push(std::move(video_frame));
         return;
     }
     // 4. 普通视频帧的合法性校验
@@ -233,35 +229,38 @@ void AVSynchronizer::NotifyAudioFinished() {
  *              break 后回到外层 while，阶段2 Pop 取下一帧
  */
 void AVSynchronizer::ThreadLoop() {
+
+    if (!sync_ctx_) {
+        return;
+    }
+
     while (!is_abort_.load()) {
         // 阶段1：线程调度
         // 在 kPaused 或 is_seeking 时挂起，避免空转浪费 CPU
         {
             std::unique_lock<std::mutex> lock(sync_ctx_->state_mutex_);
             sync_ctx_->state_cv_.wait(lock, [this]() {
-                return is_abort_.load() || sync_ctx_->state_.load() == PlaybackState::kStopped ||
+                return is_abort_.load() ||
                     (sync_ctx_->state_.load() == PlaybackState::kPaused && force_render_.load()) ||
                     (!sync_ctx_->is_seeking_.load() && sync_ctx_->state_.load() == PlaybackState::kPlaying);
             });
         }
 
         // 唤醒后先确认生命周期
-        // kStopped 时资源即将释放，不再处理任何帧，直接退出
-        if (is_abort_.load() || sync_ctx_->state_.load() == PlaybackState::kStopped) {
+        if (is_abort_.load()) {
             break;
         }
 
         // 阶段2：阻塞式取帧，Pop 阻塞直到队列有帧或队列被 Abort
-        
+
         std::shared_ptr<VideoFrame> video_frame;
         if (!video_queue_.Pop(video_frame)) {
             LOG_DEBUG("Video queue aborted (seek in progress), returning to wait.");
             continue;
         }
 
-        
         // 阶段3：带内控制信令处理
-        
+
         // EOF 信令：视频解码器已排空所有帧
         // 通知 Player 视频已结束，然后 continue 回到阶段1
         if (video_frame->HasFlag(AVFrameFlag::kEOF)) {
@@ -281,12 +280,11 @@ void AVSynchronizer::ThreadLoop() {
             continue;
         }
 
-        
         // 阶段4：暂停态强制渲染（Seek 完成后刷新画面）
         // 正常 kPaused 时线程在阶段1挂起，能走到这里说明 force_render_=true
         // 此时跳过音画同步，直接上屏，让用户看到跳转后的位置
         // 渲染完成后 force_render_ 置 false，下次 Pause 时不再触发
-        
+
         if (sync_ctx_->state_.load() == PlaybackState::kPaused && force_render_.load()) {
             LOG_INFO("Seek Completed: Force rendering new frame at {:.3f} sec", video_frame->GetTimestampSec());
             {
@@ -299,10 +297,9 @@ void AVSynchronizer::ThreadLoop() {
             continue;
         }
 
-        
         // 阶段5：纯视频播放（无音频轨道）
         // audio_speaker_ 为空说明文件没有音频流，不需要同步，直接渲染
-        
+
         if (!audio_speaker_) {
             std::unique_lock<std::mutex> lock(listener_mutex_);
             if (listener_) {
@@ -311,7 +308,6 @@ void AVSynchronizer::ThreadLoop() {
             continue;
         }
 
-        
         // 阶段6：音画同步核心逻辑
         //
         // 内层 while 对同一帧反复评估时间差：
@@ -328,7 +324,7 @@ void AVSynchronizer::ThreadLoop() {
         //          处理：直接 break 出内层 while，让外层取到 EOF 帧在阶段3处理
         //          如果不处理情况B，策略B会死循环：
         //          音频时钟永远不增长 → diff 永远是负数 → 永远休眠等待 → EOF 帧永远出不来
-        
+
         while (!is_abort_.load() && !sync_ctx_->is_seeking_.load() &&
                sync_ctx_->state_.load() == PlaybackState::kPlaying) {
             int64_t video_pts_us = video_frame->GetTimestampUs();

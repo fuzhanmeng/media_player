@@ -13,7 +13,7 @@
 #include <vector>
 
 #include "interface/iav_synchronizer.h"
-#include "interface/ifile_reader.h"
+#include "demux/interface/ifile_reader.h"
 #include "iplayer.h"
 #include "output/sdl_audio_speaker.h"
 #include "playback_state.h"

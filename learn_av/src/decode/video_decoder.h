@@ -114,7 +114,7 @@ private:
 
     // 2. 线程与并发状态控制
     std::thread decode_thread_; ///< 独立的视频解码后台 OS 线程
-    std::atomic<bool> is_abort_requested_{false}; ///< 物理线程终止信令
+    std::atomic<bool> is_abort_requested_{true}; ///< 物理线程终止信令，true=线程应退出
 
     // 3. 数据流转通道
     ThreadSafeQueue<std::shared_ptr<Packet>> packet_queue_{60}; ///< 阻塞式背压队列，缓存约 1~2 秒视频包

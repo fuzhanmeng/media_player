@@ -168,33 +168,40 @@ void AudioDecoder::SendEOF() {
 
 /**
  * @brief 启动异步解码工作线程
+ * @details 防重入判断：线程句柄有效且未收到终止请求，说明线程正在运行，拒绝重复启动
+ *          线程句柄有效但已收到终止请求，说明线程正在退出，先 join 回收再重新创建
  */
 void AudioDecoder::Start(std::shared_ptr<SyncContext> sync_ctx) {
-    LOG_INFO("========== AudioDecoder::Start ==========");
 
-    // 1. 物理线程状态校验：防止对活动线程句柄进行覆盖赋值触发 std::terminate
-    if (decode_thread_.joinable()) {
+    // 1. 防止线程重入
+    if (!is_abort_requested_.load()) {
         LOG_WARN("Audio Decoder thread is already running.");
         return;
     }
 
-    // 2. 清空历队列包
+    // 2. 回收上次可能遗留的线程句柄
+    if (decode_thread_.joinable()) {
+        decode_thread_.join();
+    }
+
+    // 3. 设置线程标志
+    is_abort_requested_.store(false);
+
+    // 4. 清空&&启动队列
     packet_queue_.Clear();
     packet_queue_.Start();
 
-    // 3. 生命周期状态复位
-    is_abort_requested_.store(false);
-
-    // 4. 保存全局状态同步上下文
+    // 5. 保存全局同步状态
     sync_ctx_ = std::move(sync_ctx);
 
-    // 5. 实例化并启动 OS 级解码线程
+    // 6. 启动真正的解码线程
     decode_thread_ = std::thread(&AudioDecoder::ThreadLoop, this);
     LOG_INFO("Audio Decoder OS thread start successfully...");
 }
 
 /**
- * @brief 阶段一：异步发送终止信令 --非阻塞
+ * @brief 阶段一：异步下发终止信令（非阻塞）
+ * @details  同时唤醒两处可能的阻塞点：1. state_cv_.wait（阶段A的状态机挂起）2. packet_queue_.Pop（阶段B的队列等待）
  */
 void AudioDecoder::RequestStop() {
     // 1. 若已处于终止请求状态，避免重复操作
@@ -202,31 +209,26 @@ void AudioDecoder::RequestStop() {
         return;
     }
 
-    // 2. 下发中断带外信令
+    // 2. 下发终止信令
     is_abort_requested_.store(true);
 
-    // 3. 解除可能由全局状态机 kPaused 引起的条件变量挂起
+    // 3. 唤醒阻塞在 state_cv_ 上的线程
     if (sync_ctx_) {
         sync_ctx_->state_cv_.notify_all();
     }
 
-    // 4. 强行中断可能阻塞在数据队列 Push/Pop 操作上的线程
-    packet_queue_.AbortAndClear();
+    // 4. 唤醒阻塞在 packet_queue_.Pop() 上的线程
+    packet_queue_.Abort();
 }
 
 /**
- * @brief 阶段二：同步等待线程退出
+ * @brief 阶段二：同步等待线程退出并回收句柄（阻塞）
  */
 void AudioDecoder::WaitForStop() {
     // 1. 同步等待 OS 线程指令流执行完毕并回收句柄
     if (decode_thread_.joinable()) {
         decode_thread_.join();
     }
-
-    // 2. 状态复位与残余数据清理
-    is_abort_requested_.store(false);
-    packet_queue_.Clear();
-    sync_ctx_.reset();
 }
 
 /**
@@ -265,7 +267,6 @@ int AudioDecoder::GetChannels() const { return out_channels_; }
  * @brief 释放 FFmpeg 解码器与重采样上下文物理内存
  */
 void AudioDecoder::Close() {
-    LOG_INFO("========== AudioDecoder::Close ==========");
     std::lock_guard<std::mutex> lock(codec_mutex_);
 
     if (av_codec_ctx_) {
@@ -280,12 +281,14 @@ void AudioDecoder::Close() {
 }
 
 /**
- * @brief 音频解码与重采样核心事件循环 (Event Loop)
+ * @brief 音频解码核心事件循环
  */
 void AudioDecoder::ThreadLoop() {
-    LOG_INFO("AudioDecoder ThreadLoop started...");
+   
+    if (!sync_ctx_) {
+        return;
+    }
 
-    // 分配解码输出的复用物理内存载体，避免循环内高频内存分配
     AVFrame* av_frame = av_frame_alloc();
     if (!av_frame) {
         LOG_ERROR("Failed to allocate raw AVFrame container.");
@@ -293,33 +296,37 @@ void AudioDecoder::ThreadLoop() {
     }
 
     while (!is_abort_requested_.load()) {
-        // [阶段 A]: 并发挂起与状态机同步控制
+        // [阶段 A]: 状态机挂起控制
+        //   1. 收到终止请求（is_abort_）
+        //   2. 发生跳转（is_seeking_），需要处理 Flush 包
+        //   3. 处于播放状态（kPlaying）
         {
             std::unique_lock<std::mutex> lock(sync_ctx_->state_mutex_);
-            // 1. 线程停止
-            // 2. 发生跳转
-            // 3. 处于播放状态
-            // 4. 全局Stop
-            sync_ctx_->state_cv_.wait(lock, [this]() {
-                return is_abort_requested_.load() || sync_ctx_->is_seeking_.load() ||
-                    sync_ctx_->state_.load() == PlaybackState::kPlaying ||
-                    sync_ctx_->state_.load() == PlaybackState::kStopped;
-            });
+            if (sync_ctx_) {
+                sync_ctx_->state_cv_.wait(lock, [this]() {
+                    return is_abort_requested_.load() || sync_ctx_->is_seeking_.load() ||
+                        sync_ctx_->state_.load() == PlaybackState::kPlaying;
+                });
+            }
         }
 
-        // 唤醒后的生命周期确认，防止处于挂起时被下发终止信令
+        // 唤醒后立即确认终止信令，防止在挂起期间收到 RequestStop
         if (is_abort_requested_.load()) {
             break;
         }
 
-        // [阶段 B]: 阻塞式提取音频
+        // [阶段 B]: 阻塞式取包
+        // Pop 阻塞直到：有数据可取 OR 队列被 Abort
+        // RequestStop() 会调用 packet_queue_.Abort()，让 Pop 立刻返回 false
         std::shared_ptr<Packet> packet;
         if (!packet_queue_.Pop(packet)) {
-            if (is_abort_requested_.load() || sync_ctx_->state_.load() == PlaybackState::kStopped) {
+            // Pop 返回 false 只有一种情况：队列被 Abort
+            // 此时检查是否收到终止请求，是则退出，否则 continue 回到阶段A
+            if (is_abort_requested_.load()) {
                 break;
             }
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            // Seek 时 AbortAndClearQueue 也会让 Pop 返回 false
+            // 此时不是终止，回到阶段A重新等待
             continue;
         }
 
@@ -327,29 +334,26 @@ void AudioDecoder::ThreadLoop() {
             continue;
         }
 
-        // [阶段 C]: 带内信令处理
+        // [阶段 C]: 带内信令处理Flush
         if (packet->HasFlag(av::AVFrameFlag::kFlush)) {
             LOG_DEBUG("Audio Decoder Received In-band Flush packet, executing codec synchronization.");
             Flush();
 
-            // 向下游发送带Flush标志的空帧
             auto audio_frame = std::make_shared<Frame>(nullptr);
             audio_frame->AddFlag(av::AVFrameFlag::kFlush);
             if (listener_) {
                 listener_->OnNotifyAudioFrame(std::move(audio_frame));
             }
-
             continue;
         }
 
-        // [阶段 D]: packet送入解码器d)
+        // [阶段 D]: packet 送入解码器
         int ret = 0;
         {
             std::lock_guard<std::mutex> lock(codec_mutex_);
             ret = avcodec_send_packet(av_codec_ctx_, packet->GetRawPacket());
         }
 
-        // 校验投递状态 (过滤正常输入和 EOF 冲刷空包)
         if (ret < 0 && ret != AVERROR_EOF) {
             std::array<char, AV_ERROR_MAX_STRING_SIZE> err_buf{};
             av_strerror(ret, err_buf.data(), err_buf.size());
@@ -357,7 +361,7 @@ void AudioDecoder::ThreadLoop() {
             continue;
         }
 
-        // [阶段 E]: 提取音频帧
+        // [阶段 E]: 提取解码后的音频帧
         while (true) {
             {
                 std::lock_guard<std::mutex> lock(codec_mutex_);
@@ -365,39 +369,29 @@ void AudioDecoder::ThreadLoop() {
             }
 
             if (ret == AVERROR(EAGAIN)) {
-                // 内部参考帧不足，要求补充新 AVPacket
                 break;
             } else if (ret == AVERROR_EOF) {
-                // 播放结束 EOF
                 if (listener_) {
                     LOG_INFO("Audio decoding reached physical EOF.");
-
                     auto audio_frame = std::make_shared<Frame>();
-                    // 构造 EOF 包
                     audio_frame->AddFlag(AVFrameFlag::kEOF);
                     listener_->OnNotifyAudioFrame(std::move(audio_frame));
                 }
                 break;
             } else if (ret < 0) {
-                // 底层硬件或解码库发生不可恢复异常
                 std::array<char, AV_ERROR_MAX_STRING_SIZE> err_buf{};
                 av_strerror(ret, err_buf.data(), err_buf.size());
                 LOG_ERROR("avcodec_receive_frame failed: {}", err_buf.data());
                 break;
             }
 
-            // [阶段 F]: 执行格式适配与重采样
             ProcessAndResample(av_frame);
-
-            // [阶段 G]: 释放由 FFmpeg 在内部分配的图像堆内存，将 av_frame 容器复位以供下一圈复用
             av_frame_unref(av_frame);
         }
     }
 
-    // 销毁物理内存载体，防范堆内存泄漏
     av_frame_free(&av_frame);
-
-    LOG_INFO("AudioDecoder ThreadLoop exited safely.");
+    LOG_INFO("AudioDecoder DecodeLoop exited safely.");
 }
 
 /**
@@ -466,11 +460,9 @@ void AudioDecoder::ProcessAndResample(AVFrame* av_frame) {
         final_frame->SetTimestamp(pts_sec);
     }
 
-    // 跳转过程中丢弃所有旧帧
+    // 跳转过程中丢弃所有旧帧，不发送给下游
     if (sync_ctx_ && sync_ctx_->is_seeking_.load()) {
-        // 正在跳转中，直接丢弃这一帧，不发送给下游
-        // LOG_DEBUG("Discarding pre-seek audio frame, timestamp: {} us", final_frame->GetTimestampUs());
-        return; // 直接返回，不执行后面的OnNotifyAudioFrame
+        return;
     }
 
     if (listener_) {

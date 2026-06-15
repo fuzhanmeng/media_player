@@ -7,13 +7,12 @@
 #pragma once
 
 #include <memory>
-#include <mutex>
 #include <string>
 
-#include "interface/iaudio_decoder.h"
+#include "decode/interface/iaudio_decoder.h"
 #include "interface/idemuxer.h"
 #include "interface/ifile_reader.h"
-#include "interface/ivideo_decoder.h"
+#include "decode/interface/ivideo_decoder.h"
 
 namespace av {
 struct SyncContext;

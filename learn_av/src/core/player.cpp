@@ -13,7 +13,7 @@
 #include "define/av_frame.h"
 #include "interface/iaudio_speaker.h"
 #include "interface/iav_synchronizer.h"
-#include "interface/ifile_reader.h"
+#include "demux/interface/ifile_reader.h"
 #include "iplayer.h"
 #include "ivideo_sink.h"
 #include "logger.h"
@@ -282,7 +282,7 @@ void Player::Stop() {
 
     // 1. 获取当前状态，如果已经停止
     PlaybackState current_state = sync_ctx_->state_.load();
-    if (current_state == PlaybackState::kStopped || current_state == PlaybackState::kIdle) {
+    if (current_state == PlaybackState::kIdle) {
         return;
     }
 

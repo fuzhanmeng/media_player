@@ -123,7 +123,7 @@ private:
 
     // 线程与并发控制原语
     std::thread demuxer_thread_;
-    std::atomic<bool> is_abort_requested_{false}; ///< 线程生命周期终结信令
+    std::atomic<bool> is_abort_requested_{true}; ///< 线程生命周期终结信令
 
     // 保存来自Player的的同步上下文
     std::shared_ptr<SyncContext> sync_ctx_;
