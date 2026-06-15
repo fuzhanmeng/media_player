@@ -82,6 +82,9 @@ void AVSynchronizer::Start() {
     is_abort_.store(false);
     force_render_.store(false);
 
+    // 每次启动时重置日志节流时间，防止跨 Play 周期的 static 变量问题
+    last_render_log_time_ = std::chrono::steady_clock::now();
+
     // 激活队列
     video_queue_.Start();
 
@@ -141,8 +144,10 @@ void AVSynchronizer::Flush() {
 /**
  * @brief 清空队列，唤醒阻塞
  */
-void AVSynchronizer::AbortAndClearQueue() { video_queue_.Clear(); }
-
+void AVSynchronizer::AbortAndClearQueue() {
+    // AbortAndClear = 先设 is_abort_=true 唤醒阻塞线程，再清空数据
+    video_queue_.AbortAndClear();
+}
 /**
  * @brief 启动队列
  */
@@ -223,19 +228,20 @@ void AVSynchronizer::ThreadLoop() {
 
         // 阶段2：从队列中提取视频帧 - Pop是阻塞提取的
         std::shared_ptr<VideoFrame> video_frame;
-        if (!video_queue_.Pop(video_frame)) {
-            LOG_ERROR("Video queue aborted, skipping frame");
-            continue;
-        }
-
-        // 处理EOF帧
+if (!video_queue_.Pop(video_frame)) {
+    // 队列 Abort 是 Seek 时的预期行为，不是错误，降级为 DEBUG
+    LOG_DEBUG("Video queue aborted (seek in progress), returning to wait.");
+    continue;
+}
+        // 阶段3：处理EOF帧
         if (video_frame->HasFlag(AVFrameFlag::kEOF)) {
-            LOG_INFO("AVSynchronizer Receive KEOF");
-
-            std::lock_guard<std::mutex> lock(listener_mutex_);
-            if (listener_) {
-                listener_->OnSyncCompleted();
+            LOG_INFO("AVSynchronizer received EOF, notifying Player.");
+            {
+                std::lock_guard<std::mutex> lock(listener_mutex_);
+                if (listener_)
+                    listener_->OnSyncCompleted();
             }
+            continue; // 明确跳过后续处理，不渲染空帧
         }
 
         if (!video_frame || !video_frame->IsValid()) {
@@ -243,11 +249,9 @@ void AVSynchronizer::ThreadLoop() {
             continue;
         }
 
-        //  阶段3：暂停态强制渲染逻辑 (Seek强刷屏)  仅在暂停状态下，且拿到刚跳转后的第一张有效帧时触发
+        //  阶段4：暂停态强制渲染逻辑 (Seek强刷屏)  仅在暂停状态下，且拿到刚跳转后的第一张有效帧时触发
         if (sync_ctx_->state_.load() == PlaybackState::kPaused && force_render_.load()) {
-            
-            LOG_INFO("Seek Completed: Force rendering new frame at {:.3f} sec",
-                     video_frame->GetTimestampSec());
+            LOG_INFO("Seek Completed: Force rendering new frame at {:.3f} sec", video_frame->GetTimestampSec());
 
             std::unique_lock<std::mutex> lock(listener_mutex_);
             if (listener_) {
@@ -258,7 +262,7 @@ void AVSynchronizer::ThreadLoop() {
             continue;
         }
 
-        //  阶段4： 不进行音画同步，纯视频播放
+        //  阶段5： 不进行音画同步，纯视频播放
         if (!audio_speaker_) {
             std::unique_lock<std::mutex> lock(listener_mutex_);
             if (listener_) {
@@ -267,79 +271,62 @@ void AVSynchronizer::ThreadLoop() {
             continue;
         }
 
-        //  阶段5：音画同步核心逻辑
+        //  阶段6：音画同步核心逻辑
         while (!is_abort_.load() && !sync_ctx_->is_seeking_.load() &&
                sync_ctx_->state_.load() == PlaybackState::kPlaying) {
-
-            static auto last_time = std::chrono::steady_clock::now();
-            static auto current_time = std::chrono::steady_clock::now();
-
-
             int64_t video_pts_us = video_frame->GetTimestampUs();
-            if (std::chrono::duration_cast<std::chrono::seconds>(last_time - current_time).count() >= 1) {
-                LOG_INFO("video_pts_us is: {}", video_pts_us);
-            }
-
             int64_t audio_clock_us = audio_speaker_->GetAudioClockUs();
-            if (std::chrono::duration_cast<std::chrono::seconds>(last_time - current_time).count() >= 1) {
-                LOG_INFO("audio_clock_us is: {}", audio_clock_us);
-            }
 
             if (audio_clock_us < 0) {
                 audio_clock_us = video_pts_us;
             }
 
+            // 每秒打印一次同步状态日志
+            // 使用成员变量 last_render_log_time_ 替代原来的 static 变量
+            auto log_now = std::chrono::steady_clock::now();
+            if (log_now - last_render_log_time_ >= std::chrono::seconds(1)) {
+                last_render_log_time_ = log_now;
+                LOG_INFO("[AV Sync] video={:.3f}s  audio={:.3f}s  diff={:+.1f}ms",
+                         static_cast<double>(video_pts_us) / 1000000.0, static_cast<double>(audio_clock_us) / 1000000.0,
+                         static_cast<double>(audio_clock_us - video_pts_us) / 1000.0);
+            }
+
             int64_t time_diff_us = audio_clock_us - video_pts_us;
 
-            // 必须且仅能在非 Seeking 状态下激活
-            if (std::abs(time_diff_us) > 1000000 && !sync_ctx_->is_seeking_.load()) {
-                LOG_WARN("PTS anomaly (>1s) detected. video: {:.3f}s, audio: {:.3f}s. Dropping frame.",
-                         video_frame->GetTimestampSec(), static_cast<double>(audio_clock_us) / 1000000.0);
-                // 直接跳出内层循环，进入外层重新 Pop 丢弃当前帧
+            // 异常检测：差值超过 5s（改为 5s，原来 1s 太严格）
+            // seek 后视频可能领先音频若干百毫秒，1s 会误触发
+            if (time_diff_us > 5000000LL && !sync_ctx_->is_seeking_.load()) {
+                LOG_WARN("[AV Sync] Anomaly >5s: video={:.3f}s audio={:.3f}s, dropping frame.",
+                         static_cast<double>(video_pts_us) / 1000000.0,
+                         static_cast<double>(audio_clock_us) / 1000000.0);
                 break;
             }
 
-            // 同步策略A：视频太慢 (晚于音频播放进度)，直接抛弃脏帧
+            // 策略A：视频落后，丢帧追赶
             if (time_diff_us > kSyncThresholdUs) {
-                LOG_INFO("Dropping late video frame: current PTS={:.3f}s, behind audio by {:.3f}s",
-                         video_frame->GetTimestampSec(), static_cast<double>(time_diff_us) / 1000000.0);
-                break; // 跳出内层等待，去抓取下一个新帧
+                LOG_DEBUG("[AV Sync] Drop late frame: pts={:.3f}s, behind by {:.1f}ms",
+                          static_cast<double>(video_pts_us) / 1000000.0, static_cast<double>(time_diff_us) / 1000.0);
+                break;
             }
 
-            // 同步策略B：视频太快 (早于音频进度)，进行短时休眠
-            else if (time_diff_us < -kSyncThresholdUs) {
+            // 策略B：视频超前，休眠等待
+            if (time_diff_us < -kSyncThresholdUs) {
                 std::unique_lock<std::mutex> lock(sync_ctx_->state_mutex_);
-
-                // 最多浅睡 10 毫秒
                 sync_ctx_->state_cv_.wait_for(lock, std::chrono::milliseconds(10), [this]() {
                     return is_abort_.load() || sync_ctx_->is_seeking_.load() ||
                         sync_ctx_->state_.load() != PlaybackState::kPlaying;
                 });
-
-                // 醒来后使用 continue，强制重新获取最新的 audio_clock_us 重新评估时间差
                 continue;
             }
 
-            // 同步策略C：时间差位于容忍阈值内 (+/- 25ms)，完美对齐
-            else {
-                static std::atomic<std::chrono::steady_clock::time_point> last_print_time{
-                    std::chrono::steady_clock::now()};
-
-                auto now = std::chrono::steady_clock::now();
-                auto last = last_print_time.load(std::memory_order_relaxed);
-
-                // compare_exchange_strong保证一秒内最多打印一次
-                if (now - last >= std::chrono::seconds(1) &&
-                    last_print_time.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
-                    LOG_DEBUG("Video frame rendered successfully: Playback Time = {:.3f}s",
-                              video_frame->GetTimestampSec());
-                }
+            // 策略C：在阈值范围内，渲染
+            {
                 std::unique_lock<std::mutex> lock(listener_mutex_);
                 if (listener_) {
                     listener_->OnSyncNotifyVideoFrame(std::move(video_frame));
                 }
-                break;
             }
+            break;
         }
     }
 

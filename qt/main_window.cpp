@@ -217,7 +217,7 @@ void MainWindow::onEngineStateChanged(av::PlaybackState state) {
 void MainWindow::onEnginePlaybackCompleted() {
     m_controllerWidget->SetPlayState(false);
     m_controllerWidget->SetSliderProgress(0.0f);
-    m_controllerWidget->SetTimeDisplay(0.0f, m_player->GetDuration());
+    m_controllerWidget->SetTimeDisplay(0LL, m_player->GetDuration()); // 使用正确的 int64_t 字面量
 }
 
 /**

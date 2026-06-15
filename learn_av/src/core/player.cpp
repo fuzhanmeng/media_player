@@ -575,16 +575,14 @@ void Player::ProgressLoop() {
                 current_time_us = audio_speaker_->GetAudioClockUs();
             }
 
+            // 时钟未就绪时跳过本次更新，继续循环等待
             if (current_time_us < 0) {
                 std::this_thread::sleep_for(kUpdateInterval);
-                return;
+                continue;
             }
 
             // 2. 获取总时长（微妙）
-            int64_t total_time_us = 0;
-            if (file_reader_) {
-                total_time_us = file_reader_->GetDuration();
-            }
+            int64_t total_time_us = file_reader_ ? file_reader_->GetDuration() : 0;
 
             // 3. 计算百分比
             float progress = 0.0f;

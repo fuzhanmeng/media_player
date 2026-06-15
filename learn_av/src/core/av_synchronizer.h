@@ -65,7 +65,7 @@ public:
      * @brief 刷新跳转后的队列
      */
     void Flush() override;
-    
+
     /**
      * @brief 清空队列，唤醒阻塞
      */
@@ -116,6 +116,9 @@ private:
 
     /// 同步阈值：25ms = 25000 微秒
     const int64_t kSyncThresholdUs = 25000;
+
+    /// 替代 ThreadLoop 内的 static 变量，这样每次 Start() 时可以重置
+    std::chrono::steady_clock::time_point last_render_log_time_;
 };
 
 } // namespace av
