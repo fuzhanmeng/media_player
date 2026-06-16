@@ -5,6 +5,7 @@
 
 #include <SDL2/SDL.h>
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 
@@ -46,12 +47,39 @@ public:
      * @brief 接收解码后的 PCM 音频帧并放入硬件缓冲队列
      * @param audio_frame 纯净 PCM 帧
      */
-    void PushAudioData(std::shared_ptr<Frame> audio_frame) override;
+    void PushAudioFrame(std::shared_ptr<Frame> audio_frame) override;
 
     /**
      * @brief 清空内部缓存（用于 Seek 时防范历史声音串扰）
      */
     void Flush() override;
+
+    /**
+     * @brief 唤醒队列
+     */
+    void Abort() override;
+
+    /**
+     * @brief 清空队列，唤醒阻塞
+     */
+    void AbortAndClearQueue() override;
+
+    /**
+     * @brief 启动队列
+     */
+    void StartQueue() override;
+
+    /**
+     * @brief 获取当前精准的音频播放时钟（微秒）
+     * @note 供音画同步模块调用以音频为基准进行对齐
+     */
+    int64_t GetAudioClockUs() const override;
+
+    /**
+     * @brief 获取当前精准的音频播放时钟（秒）
+     * @note 用于UI显示
+     */
+    double GetAudioClock() const override;
 
 private:
     /**
@@ -81,5 +109,9 @@ private:
 
     std::mutex sync_mutex_;
     std::atomic<bool> is_playing_{false};
+
+    // 设计原则：内部计算全部使用整数，对外提供浮点接口
+    std::atomic<int64_t> audio_clock_us_{-1};
 };
+
 } // namespace av

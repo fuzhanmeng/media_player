@@ -19,10 +19,7 @@ namespace av {
 /**
  * @brief 创建音频播放实例
  */
-std::unique_ptr<IAudioSpeaker> IAudioSpeaker::Create() {
-    LOG_INFO("SDLAudioSpeaker Create...");
-    return std::make_unique<SDLAudioSpeaker>();
-}
+std::unique_ptr<IAudioSpeaker> IAudioSpeaker::Create() { return std::make_unique<SDLAudioSpeaker>(); }
 
 /**
  * @brief 构造函数
@@ -55,13 +52,12 @@ bool SDLAudioSpeaker::Open(int sample_rate, int channels) {
     SDL_AudioSpec obtained_spec;
 
     wanted_spec.freq = sample_rate_; // 采样率
-    // 强制使用 16位有符号整数，交错排布
-    wanted_spec.format = AUDIO_S16SYS; // 采样格式
+    wanted_spec.format = AUDIO_S16SYS; // 采样格式 强制使用 16位有符号整数，交错排布
     wanted_spec.silence = 0; // 静音值
     wanted_spec.samples = 1024; // 单次回调样本数
 
     // 3. 绑定回调与指针
-    // 告诉 SDL：缺数据了就调这个叫 SDLAudioCallback 的静态函数
+    // 告诉 SDL：缺数据了就调这个叫 SDLAudioCallback
     wanted_spec.callback = SDLAudioCallback;
     // 告诉 SDL：调用回调时，请把这个 this 指针作为参数带进去！
     wanted_spec.userdata = this;
@@ -70,16 +66,20 @@ bool SDLAudioSpeaker::Open(int sample_rate, int channels) {
     audio_device_id_ = SDL_OpenAudioDevice(nullptr, 0, &wanted_spec, &obtained_spec, 0);
     if (audio_device_id_ == 0) {
         LOG_ERROR("SDL_OpenAudioDevice failed: {}", SDL_GetError());
-        return false; // 打开失败应该直接拦截
+        return false; // 打开失败应该直接返回
     }
 
-    // 5. 此时环境已就绪，硬件已打开，可以安全地读取驱动和真实参数了！
+    // 5. 此时环境已就绪，硬件已打开，可以安全地读取驱动和真实参数了
     const char* driver_name = SDL_GetCurrentAudioDriver();
     LOG_INFO("SDL Audio Device opened successfully. Driver: {}, Freq: {}, channels: {}",
              driver_name ? driver_name : "Unknown", obtained_spec.freq, obtained_spec.channels);
 
     // 重新激活队列
     audio_queue_.Start();
+
+    // -1 的语义是："声卡当前尚未发声，时钟状态未就绪"
+    audio_clock_us_.store(-1);
+
     return true;
 }
 
@@ -127,39 +127,107 @@ void SDLAudioSpeaker::Close() {
 
 /**
  * @brief 接收解码后的 PCM 音频帧并放入硬件缓冲队列
- * @param audio_frame 纯净 PCM 帧
+ * @param audio_frame 纯净 PCM 帧，或者带内信令帧
  */
-void SDLAudioSpeaker::PushAudioData(std::shared_ptr<Frame> audio_frame) {
-    if (audio_frame->IsEmpty()) {
-        LOG_INFO("the audio_frame is empty");
+void SDLAudioSpeaker::PushAudioFrame(std::shared_ptr<Frame> audio_frame) {
+    if (!audio_frame) {
+        LOG_ERROR("SDLAudioSpeaker received null audio frame!");
+        return;
     }
 
-    if (audio_frame && !audio_frame->IsEmpty()) {
-        // 加上日志：每收到 50 帧打印一次，证明快递员(Player)确实送货了
-        static int push_count = 0;
-        if (++push_count % 50 == 0) {
-            LOG_INFO("Speaker received 50 frames from Player. Queue size: {}", audio_queue_.Size());
+    // 拦截带内 Flush 信令
+    if (audio_frame->HasFlag(av::AVFrameFlag::kFlush)) {
+        LOG_DEBUG("SDLAudioSpeaker intercepted IN-BAND Flush signal. Executing hardware reset.");
+
+        std::lock_guard<std::mutex> lock(sync_mutex_);
+
+        // 1. 暂停音频设备，防止在清空过程中发生硬件回调
+        SDL_PauseAudioDevice(audio_device_id_, 1);
+
+        // 2. 暴力清空 SDL 内部硬件缓冲区（防范跳转后出现前一秒的爆音残留）
+        SDL_ClearQueuedAudio(audio_device_id_);
+
+        // 3. 清空应用层队列（排空尚未送入硬件的旧数据）
+        audio_queue_.Clear();
+
+        // 4. 彻底重置当前正在拆解的帧状态
+        current_frame_ = nullptr;
+        current_frame_offset_ = 0;
+
+        // 5.设置音频时钟
+        audio_clock_us_.store(-1);
+
+        // 6. 如果之前是播放状态，立刻恢复设备运转，准备迎接紧随其后的新声音
+        if (is_playing_.load()) {
+            SDL_PauseAudioDevice(audio_device_id_, 0);
         }
-        audio_queue_.Push(std::move(audio_frame));
-    } else {
-        LOG_ERROR("SDLAudioSpeaker received invalid audio frame!");
+
+        LOG_DEBUG("SDLAudioSpeaker IN-BAND flush completed, clock reset to -1.");
+
+        return;
     }
+
+    if (audio_frame->IsEmpty()) {
+        LOG_WARN("SDLAudioSpeaker received empty audio frame");
+        return;
+    }
+    audio_queue_.Push(std::move(audio_frame));
 }
 
 /**
- * @brief 清空内部缓存（用于 Seek 时防范历史声音串扰）
+ * @brief 清空内部缓存
  */
 void SDLAudioSpeaker::Flush() {
     std::lock_guard<std::mutex> lock(sync_mutex_);
+    // 1. 暂停音频设备
+    SDL_PauseAudioDevice(audio_device_id_, 1);
+
+    // 2. 清空SDL内部缓冲区
+    SDL_ClearQueuedAudio(audio_device_id_);
+
+    // 3. 清空应用层队列
     audio_queue_.Clear();
 
-    // 清空当前正在被剥削的帧和进度
+    // 4. 重置当前帧状态
     current_frame_ = nullptr;
     current_frame_offset_ = 0;
+
+    audio_clock_us_.store(-1);
 }
 
 /**
- * @brief SDL 硬件底层静态回调函数
+ * @brief audio_queue_队列唤醒
+ */
+void SDLAudioSpeaker::Abort() { audio_queue_.Abort(); }
+
+/**
+ * @brief 清空队列，唤醒阻塞
+ */
+void SDLAudioSpeaker::AbortAndClearQueue() { audio_queue_.AbortAndClear(); }
+
+/**
+ * @brief 启动队列
+ */
+void SDLAudioSpeaker::StartQueue() { audio_queue_.Start(); }
+
+/**
+ * @brief 获取当前精准的音频播放时钟（微秒）
+ * @note 供音画同步模块调用以音频为基准进行对齐
+ */
+int64_t SDLAudioSpeaker::GetAudioClockUs() const { return audio_clock_us_.load(); }
+
+/**
+ * @brief 获取当前精准的音频播放时钟（秒）
+ * @note 用于UI显示
+ */
+double SDLAudioSpeaker::GetAudioClock() const {
+    int64_t current_us = audio_clock_us_.load();
+    // 防御处理：如果时钟尚未就绪，向 UI 输出 0 秒
+    return (current_us < 0) ? 0.0 : static_cast<double>(current_us) / 1000000.0;
+}
+
+/**
+ * @brief SDL 硬件底层回调函数
  * @note 运行在 SDL 独立的后台高级优先级线程中
  */
 void SDLAudioSpeaker::SDLAudioCallback(void* userdata, Uint8* stream, int len) {
@@ -167,7 +235,7 @@ void SDLAudioSpeaker::SDLAudioCallback(void* userdata, Uint8* stream, int len) {
     // 2. 我们把它强转回 C++ 的对象指针
     auto* speaker = static_cast<SDLAudioSpeaker*>(userdata);
 
-    // 3. 然后调用这个对象内部的成员函数，完美回到了 C++ 的面向对象世界！
+    // 3. 然后调用这个对象内部的成员函数
     speaker->FillAudioData(stream, len);
 }
 
@@ -177,10 +245,9 @@ void SDLAudioSpeaker::SDLAudioCallback(void* userdata, Uint8* stream, int len) {
  * @param len 本次硬件回调请求填充的字节总长度
  */
 void SDLAudioSpeaker::FillAudioData(Uint8* stream, int len) {
-    // 加锁，防止 Flush 操作与回调读取发生数据竞争
     std::lock_guard<std::mutex> lock(sync_mutex_);
 
-    // 1. 初始化静音：如果后面拿不到数据，声卡播的就是静音，而不是上一秒残留的刺耳爆音
+    // 1. 初始化静音：如果后面拿不到数据，声卡播的就是静音
     SDL_memset(stream, 0, len);
 
     // 若当前处于暂停状态，直接跳出执行，硬件将输出上述初始化的静音数据
@@ -195,7 +262,7 @@ void SDLAudioSpeaker::FillAudioData(Uint8* stream, int len) {
     while (len > 0) {
         // 步骤 A：若当前无可用音频帧（初始状态或上一帧已读取完毕），从线程安全队列中提取新帧
         if (!current_frame_) {
-            // 严禁在此处死锁等待，否则将导致操作系统的音频硬件线程发生死锁阻塞
+            // 严禁在此处死锁等待
             if (!audio_queue_.TryPop(current_frame_)) {
                 static int empty_count = 0;
                 if (++empty_count % 100 == 0) {
@@ -205,16 +272,33 @@ void SDLAudioSpeaker::FillAudioData(Uint8* stream, int len) {
             }
             // 成功提取新帧，重置当前帧的内部读取偏移量
             current_frame_offset_ = 0;
-
-            // 成功拿到数据，执行了内存拷贝
-            static int pop_count = 0;
-            if (++pop_count % 50 == 0) {
-                LOG_INFO("SDL successfully popped & copied 50 frames to hardware buffer!");
-            }
         }
 
-        // 步骤 B：计算当前音频帧的剩余有效字节数
-        // 帧总字节数 = 采样点数 * 通道数 * 采样位深
+        // 更新全局音频时钟
+        if (current_frame_ && current_frame_->IsValid()) {
+            // 1. 获取这一帧的起始时间 - 微秒
+            int64_t base_pts_us = current_frame_->GetTimestampUs();
+
+            // 2. 帧总字节数 = 采样点数 * 通道数 * 采样位深
+            int frame_total_bytes = current_frame_->GetRawFrame()->nb_samples * channels_ * 2;
+
+            // 3. 计算这一帧的持续总时长 - 微秒
+            // 公式：时长(微秒) = (采样点数 * 1000000) / 采样率
+            int64_t frame_duration_us =
+                (static_cast<int64_t>(current_frame_->GetRawFrame()->nb_samples) * 1000000LL) / sample_rate_;
+
+            // 4. 计算当前已经被声卡消耗的字节占比
+            double consumed_ratio = static_cast<double>(current_frame_offset_) / frame_total_bytes;
+
+            // 5. 当前精准音频时钟 = 帧起始时间 + (帧总时长 * 已消耗占比)
+            int64_t current_exact_clock_us =
+                base_pts_us + static_cast<int64_t>(frame_duration_us) * static_cast<int64_t>(consumed_ratio);
+
+            // 6. 更新给全局，供视频线程读取
+            audio_clock_us_.store(current_exact_clock_us);
+        }
+
+        // 步骤 B：计算剩余字节
         int frame_total_bytes = current_frame_->GetRawFrame()->nb_samples * channels_ * 2;
         int remain_bytes = frame_total_bytes - current_frame_offset_;
 
@@ -242,4 +326,5 @@ void SDLAudioSpeaker::FillAudioData(Uint8* stream, int len) {
         }
     }
 }
+
 } // namespace av

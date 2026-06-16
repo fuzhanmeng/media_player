@@ -61,17 +61,31 @@ public:
     void Start(std::shared_ptr<SyncContext> sync_ctx) override;
 
     /**
-     * @brief 停止解码线程并释放相关资源
+     * @brief 阶段一：下发异步终止信令 --非阻塞
      */
-    void Stop() override;
+    void RequestStop() override;
+
+    /**
+     * @brief 阶段二：同步等待回收线程 --阻塞
+     */
+    void WaitForStop() override;
 
     /**
      * @brief 清洗解码器内部的缓存
      */
     void Flush() override;
 
-private:
+    /**
+     * @brief 清空队列，唤醒阻塞
+     */
+    void AbortAndClearQueue() override;
 
+    /**
+     * @brief 启动队列
+     */
+    void StartQueue() override;
+
+private:
     /**
      * @brief 释放 FFmpeg 解码器与重采样上下文资源
      */

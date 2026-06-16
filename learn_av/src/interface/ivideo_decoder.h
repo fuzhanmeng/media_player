@@ -15,7 +15,7 @@ namespace av {
 class Packet;
 struct VideoFrame;
 struct StreamInfo;
-struct SyncContext; // 全局状态同步上下文
+struct SyncContext;
 
 /**
  * @class IVideoDecoder
@@ -44,18 +44,12 @@ public:
         virtual void OnNotifyVideoEOF() = 0;
     };
 
-    // ================= 静态工厂方法 =================
-
     /**
      * @brief 创建并返回视频解码器实例
      */
     static std::unique_ptr<IVideoDecoder> Create();
 
-    // ================= 构造与析构 =================
-
     virtual ~IVideoDecoder() = default;
-
-    // ================= 接口方法 =================
 
     /**
      * @brief 设置下游监听器
@@ -89,15 +83,30 @@ public:
     virtual void Start(std::shared_ptr<SyncContext> sync_ctx) = 0;
 
     /**
-     * @brief 停止解码线程并彻底清理相关 OS 线程资源
+     * @brief 阶段一：下发异步终止信令 -- 非阻塞
      */
-    virtual void Stop() = 0;
+    virtual void RequestStop() = 0;
+
+    /**
+     * @brief 阶段二：同步等待回收线程 -- 阻塞
+     */
+    virtual void WaitForStop() = 0;
 
     /**
      * @brief 清洗解码器内部参考帧缓存
      * @details 在 Seek 操作时调用，防止解码出花屏或马赛克 (因 I/P/B 帧时序依赖断裂)
      */
     virtual void Flush() = 0;
+
+    /**
+     * @brief 清空队列，唤醒阻塞
+     */
+    virtual void AbortAndClearQueue() = 0;
+
+    /**
+     * @brief 启动队列
+     */
+    virtual void StartQueue() = 0;
 };
 
 } // namespace av

@@ -5,16 +5,16 @@
  */
 #pragma once
 
-#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 
+#include "interface/iav_synchronizer.h"
 #include "interface/ifile_reader.h"
 #include "iplayer.h"
-#include "playback_state.h"
 #include "output/sdl_audio_speaker.h"
+#include "playback_state.h"
 
 namespace av {
 
@@ -28,7 +28,7 @@ class VideoFrame;
  * @inherit IPlayer 面向 UI 层的标准播放控制契约
  * @inherit IFileReader::Listener 底层音视频纯净帧数据的唯一合法接收通道
  */
-class Player : public IPlayer, public IFileReader::Listener {
+class Player : public IPlayer, public IFileReader::Listener, public IAVSynchronizer::Listener {
 public:
     explicit Player(std::shared_ptr<IGLContext> gl_context);
     ~Player() override;
@@ -123,6 +123,11 @@ private:
     void OnFileReaderNotifyVideoFrame(std::shared_ptr<VideoFrame> video_frame) override;
 
     /**
+     * @brief 将接收的YUV420P传给音画同步模块
+     */
+    void OnSyncNotifyVideoFrame(std::shared_ptr<VideoFrame> video_frame) override;
+
+    /**
      * @brief 音频物理管线彻底枯竭 (Audio EOF)
      * @details 底层音频解码器内部残留帧已全部排空
      */
@@ -133,6 +138,16 @@ private:
      * @details 底层视频解码器内部残留帧已全部排空
      */
     void OnFileReaderNotifyVideoFinished() override;
+
+    /**
+     * @brief 通知上层重置所有相关数据队列的状态标志
+     */
+    void OnFileReaderSeekResetQueues() override;
+
+    /**
+     * @brief 通知上层底层 Seek 操作已完成，申请恢复播放状态
+     */
+    void OnFileReaderSeekCompleteResumePlay() override;
 
     // ================= 内部控制逻辑 =================
 
@@ -158,6 +173,7 @@ private:
     // ================= 视频渲染分发 =================
     // 保存注册上来的 OpenGLView 等接收端
     std::vector<IVideoSink*> video_sinks_;
+
     // 保护 video_sinks_ 读写的互斥锁，防止 UI 销毁组件时底层还在刷帧
     std::mutex sinks_mutex_;
 
@@ -170,6 +186,9 @@ private:
 
     /// 音频播放实例
     std::unique_ptr<IAudioSpeaker> audio_speaker_{nullptr};
+
+    /// 音画同步实例
+    std::unique_ptr<IAVSynchronizer> av_sync_{nullptr};
 };
 
 } // namespace av

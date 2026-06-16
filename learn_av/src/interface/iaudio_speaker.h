@@ -49,12 +49,41 @@ public:
      * @brief 接收解码后的 PCM 音频帧并放入硬件缓冲队列
      * @param audio_frame 纯净 PCM 帧
      */
-    virtual void PushAudioData(std::shared_ptr<Frame> audio_frame) = 0;
+    virtual void PushAudioFrame(std::shared_ptr<Frame> audio_frame) = 0;
 
     /**
      * @brief 清空内部缓存（用于 Seek 时防范历史声音串扰）
      */
     virtual void Flush() = 0;
+
+    /**
+     * @brief 唤醒队列
+     */
+    virtual void Abort() = 0;
+
+
+    /**
+     * @brief 清空队列，唤醒阻塞
+     */
+    virtual void AbortAndClearQueue() = 0;
+
+    /**
+     * @brief 启动队列
+     */
+    virtual void StartQueue() = 0;
+
+
+    /**
+     * @brief 获取当前精准的音频播放时钟（微秒）
+     * @note 供音画同步模块调用以音频为基准进行对齐
+     */
+    virtual int64_t GetAudioClockUs() const = 0;
+
+    /**
+     * @brief 获取当前精准的音频播放时钟（秒）
+     * @note 用于UI显示
+     */
+    virtual double GetAudioClock() const = 0;
 };
 
 } // namespace av

@@ -38,7 +38,8 @@ AudioDecoder::AudioDecoder() {}
 
 AudioDecoder::~AudioDecoder() {
     // 严格遵循时序：先终止 OS 线程，确认无并发访问后再释放底层资源
-    Stop();
+    RequestStop();
+    WaitForStop();
     Close();
 }
 
@@ -149,6 +150,11 @@ void AudioDecoder::PushPacket(std::shared_ptr<Packet> packet) {
         LOG_ERROR("NO Recv AAC Frame  from Demuxer");
         return;
     }
+
+    if (packet->HasFlag(av::AVFrameFlag::kFlush)) {
+        packet_queue_.Clear();
+    }
+
     packet_queue_.Push(std::move(packet));
 }
 
@@ -167,6 +173,8 @@ void AudioDecoder::SendEOF() {
  * @brief 启动异步解码工作线程
  */
 void AudioDecoder::Start(std::shared_ptr<SyncContext> sync_ctx) {
+    LOG_INFO("========== AudioDecoder::Start ==========");
+
     // 1. 物理线程状态校验：防止对活动线程句柄进行覆盖赋值触发 std::terminate
     if (decode_thread_.joinable()) {
         LOG_WARN("Audio Decoder thread is already running.");
@@ -189,9 +197,10 @@ void AudioDecoder::Start(std::shared_ptr<SyncContext> sync_ctx) {
 }
 
 /**
- * @brief 终止解码线程
+ * @brief 阶段一：异步发送终止信令 --非阻塞
  */
-void AudioDecoder::Stop() {
+void AudioDecoder::RequestStop() {
+    LOG_INFO("========== AudioDecoder::Stop ==========");
     // 1. 若已处于终止请求状态，避免重复操作
     if (is_abort_requested_.load()) {
         return;
@@ -201,24 +210,30 @@ void AudioDecoder::Stop() {
     is_abort_requested_.store(true);
 
     // 3. 解除可能由全局状态机 kPaused 引起的条件变量挂起
-    if (sync_ctx_ && sync_ctx_->IsValid()) {
+    if (sync_ctx_) {
         sync_ctx_->state_cv_.notify_all();
     }
 
     // 4. 强行中断可能阻塞在数据队列 Push/Pop 操作上的线程
     packet_queue_.Abort();
+    LOG_INFO("========== AudioDecoder::RequestStop ==========");
+}
 
-    // 5. 同步等待 OS 线程指令流执行完毕并回收句柄
+/**
+ * @brief 阶段二：同步等待线程退出
+ */
+void AudioDecoder::WaitForStop() {
+    // 1. 同步等待 OS 线程指令流执行完毕并回收句柄
     if (decode_thread_.joinable()) {
         decode_thread_.join();
     }
 
-    // 6. 状态复位与残余数据清理
+    // 2. 状态复位与残余数据清理
     is_abort_requested_.store(false);
     packet_queue_.Clear();
     sync_ctx_.reset();
 
-    LOG_INFO("AudioDecoder OS thread joined safely...");
+    LOG_INFO("========== AudioDecoder::WaitForStop ==========");
 }
 
 /**
@@ -234,9 +249,20 @@ void AudioDecoder::Flush() {
 }
 
 /**
+ * @brief 清空队列，唤醒阻塞
+ */
+void AudioDecoder::AbortAndClearQueue() { packet_queue_.AbortAndClear(); }
+
+/**
+ * @brief 启动队列
+ */
+void AudioDecoder::StartQueue() { packet_queue_.Start(); }
+
+/**
  * @brief 释放 FFmpeg 解码器与重采样上下文物理内存
  */
 void AudioDecoder::Close() {
+    LOG_INFO("========== AudioDecoder::Close ==========");
     std::lock_guard<std::mutex> lock(codec_mutex_);
 
     if (av_codec_ctx_) {
@@ -267,9 +293,14 @@ void AudioDecoder::DecodeLoop() {
         // [阶段 A]: 并发挂起与状态机同步控制
         {
             std::unique_lock<std::mutex> lock(sync_ctx_->state_mutex_);
+            // 1. 线程停止
+            // 2. 发生跳转
+            // 3. 处于播放状态
+            // 4. 全局Stop
             sync_ctx_->state_cv_.wait(lock, [this]() {
-                // 条件屏障：响应终止请求，或在播放状态下持续运转
-                return is_abort_requested_.load() || sync_ctx_->state_.load() == PlaybackState::kPlaying;
+                return is_abort_requested_.load() || sync_ctx_->is_seeking_.load() ||
+                    sync_ctx_->state_.load() == PlaybackState::kPlaying ||
+                    sync_ctx_->state_.load() == PlaybackState::kStopped;
             });
         }
 
@@ -278,32 +309,44 @@ void AudioDecoder::DecodeLoop() {
             break;
         }
 
-        // [阶段 B]: 阻塞式提取比特流 (Blocking Bitstream Extraction)
+        // [阶段 B]: 阻塞式提取音频
         std::shared_ptr<Packet> packet;
         if (!packet_queue_.Pop(packet)) {
-            LOG_INFO("Audio packet queue aborted. Exiting DecodeLoop.");
-            break;
+            if (is_abort_requested_.load() || sync_ctx_->state_.load() == PlaybackState::kStopped) {
+                break;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
         }
 
         if (!packet) {
             continue;
         }
 
-        // [阶段 C]: 带内信令处理 (In-band Control Signaling)
+        // [阶段 C]: 带内信令处理
         if (packet->HasFlag(av::AVFrameFlag::kFlush)) {
-            LOG_INFO("Audio Decoder Received In-band Flush packet, executing codec synchronization.");
+            LOG_DEBUG("Audio Decoder Received In-band Flush packet, executing codec synchronization.");
             Flush();
+
+            // 向下游发送带Flush标志的空帧
+            auto audio_frame = std::make_shared<Frame>(nullptr);
+            audio_frame->AddFlag(av::AVFrameFlag::kFlush);
+            if (listener_) {
+                listener_->OnNotifyAudioFrame(std::move(audio_frame));
+            }
+
             continue;
         }
 
-        // [阶段 D]: 投递压缩载荷 (Submit Payload)
+        // [阶段 D]: packet送入解码器d)
         int ret = 0;
         {
             std::lock_guard<std::mutex> lock(codec_mutex_);
             ret = avcodec_send_packet(av_codec_ctx_, packet->GetRawPacket());
         }
 
-        // 放行 AVERROR_EOF，允许循环抽干内部缓存
+        // 校验投递状态 (过滤正常输入和 EOF 冲刷空包)
         if (ret < 0 && ret != AVERROR_EOF) {
             std::array<char, AV_ERROR_MAX_STRING_SIZE> err_buf{};
             av_strerror(ret, err_buf.data(), err_buf.size());
@@ -318,7 +361,6 @@ void AudioDecoder::DecodeLoop() {
                 ret = avcodec_receive_frame(av_codec_ctx_, av_frame);
             }
 
-            // 评估解码引擎状态机反馈
             if (ret == AVERROR(EAGAIN)) {
                 // 内部参考帧不足，要求补充新 AVPacket
                 break;
@@ -337,10 +379,10 @@ void AudioDecoder::DecodeLoop() {
                 break;
             }
 
-            // [阶段 F]: 执行格式适配与重采样 (Resampling)
+            // [阶段 F]: 执行格式适配与重采样
             ProcessAndResample(av_frame);
 
-            // [阶段 G]: 剥离并释放内存引用，备用下一轮抽取
+            // [阶段 G]: 释放由 FFmpeg 在内部分配的图像堆内存，将 av_frame 容器复位以供下一圈复用
             av_frame_unref(av_frame);
         }
     }
@@ -403,6 +445,26 @@ void AudioDecoder::ProcessAndResample(AVFrame* av_frame) {
 
     // 5. 跨系统边界所有权移交：将 C 指针移交至 RAII 智能资产容器，交由下游接管生命周期
     auto final_frame = std::make_shared<av::Frame>(resampled_frame);
+
+    // 6. 设置当前音频帧的物理时间，即将PTS转换为秒
+    // 如果这一帧携带了有效的显示时间戳，我才去计算它的秒数
+    // AV_NOPTS_VALUE 的全称是 "No Presentation Time Stamp Value"（没有显示时间戳值）
+    if (final_frame->GetPts() != AV_NOPTS_VALUE) {
+        AVRational us_q = {1, 1000000};
+
+        // 使用 FFmpeg 底层的全整数无损换算，直接将当前流时基(time_base_)转换为微秒时基(us_q)
+        int64_t pts_sec = av_rescale_q(final_frame->GetPts(), time_base_, us_q);
+
+        // 注入微秒时间戳
+        final_frame->SetTimestamp(pts_sec);
+    }
+
+    // 跳转过程中丢弃所有旧帧
+    if (sync_ctx_ && sync_ctx_->is_seeking_.load()) {
+        // 正在跳转中，直接丢弃这一帧，不发送给下游
+        // LOG_DEBUG("Discarding pre-seek audio frame, timestamp: {} us", final_frame->GetTimestampUs());
+        return; // 直接返回，不执行后面的OnNotifyAudioFrame
+    }
 
     if (listener_) {
         listener_->OnNotifyAudioFrame(std::move(final_frame));

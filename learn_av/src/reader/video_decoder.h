@@ -66,15 +66,31 @@ public:
     void Start(std::shared_ptr<SyncContext> sync_ctx) override;
 
     /**
-     * @brief 停止解码线程并彻底清理相关 OS 线程资源
+     * @brief 阶段一：下发异步终止信令 --非阻塞
      */
-    void Stop() override;
+    void RequestStop() override;
+
+    /**
+     * @brief 阶段二：同步等待回收线程 --阻塞
+     */
+    void WaitForStop() override;
 
     /**
      * @brief 清洗解码器内部参考帧缓存
      * @details 在 Seek 操作时调用，防止解码出花屏或马赛克 (因 I/P/B 帧时序依赖断裂)
      */
     void Flush() override;
+
+    /**
+     * @brief 清空队列，唤醒阻塞
+     */
+    void AbortAndClearQueue() override;
+
+    /**
+     * @brief 启动队列
+     */
+    void StartQueue() override;
+
 
 private:
     /**
