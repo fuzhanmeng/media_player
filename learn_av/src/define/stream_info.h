@@ -1,6 +1,6 @@
 /**
  * @file stream_info.h
- * @brief 媒体流参数 DTO (跨模块公共结构)
+ * @brief 媒体流参数 DTO
  */
 #pragma once
 

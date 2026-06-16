@@ -38,11 +38,14 @@ FileReader::FileReader() {
  * @brief 析构函数
  */
 FileReader::~FileReader() {
-    Stop();
+    RequestStop();
+    WaitForStop();
     listener_ = nullptr;
 }
 
-//
+/**
+ * @brief 设置下游回调监听
+ */
 void FileReader::SetListener(IFileReader::Listener* listener) { listener_ = listener; }
 
 /**
@@ -56,9 +59,10 @@ bool FileReader::Open(const std::string& url) {
 }
 
 /**
- * @brief 启动底层流水线，严格遵循消费者先于生产者启动原则
+ * @brief 启动底层流水线，消费者先于生产者启动
  */
 void FileReader::Start(std::shared_ptr<SyncContext> sync_ctx) {
+    LOG_INFO("========== FileReader::Start ==========");
     if (audio_decoder_) {
         audio_decoder_->Start(sync_ctx);
     }
@@ -73,31 +77,49 @@ void FileReader::Start(std::shared_ptr<SyncContext> sync_ctx) {
 }
 
 /**
- * @brief 停止所有底层线程并重置状态机
+ * @brief 停止所有底层线程并重置状态机 -- 非阻塞
  */
-
-void FileReader::Stop() {
-    if (demuxer_) {
-        demuxer_->Stop();
-    }
-
+void FileReader::RequestStop() {
     if (audio_decoder_) {
-        audio_decoder_->Stop();
+        audio_decoder_->RequestStop();
     }
 
     if (video_decoder_) {
-        video_decoder_->Stop();
+        video_decoder_->RequestStop();
     }
+
+    if (demuxer_) {
+        demuxer_->RequestStop();
+    }
+    LOG_INFO("========== FileReader::RequestStop ==========");
+}
+
+/**
+ * @brief 阶段二：同步等待回收线程 -- 阻塞
+ */
+void FileReader::WaitForStop() {
+    if (demuxer_) {
+        demuxer_->WaitForStop();
+    }
+
+    if (audio_decoder_) {
+        audio_decoder_->WaitForStop();
+    }
+
+    if (video_decoder_) {
+        video_decoder_->WaitForStop();
+    }
+    LOG_INFO("========== FileReader::WaitForStop ==========");
 }
 
 /**
  * @brief  触发绝对时间轴跳转，保证多线程状态同步
  */
-
-void FileReader::SeekTo(double pts_seconds) {
+void FileReader::SeekTo(int64_t target_time_us) {
+    LOG_INFO("========== FileReader::SeekTo ==========");
 
     if (demuxer_) {
-        demuxer_->SeekTo(pts_seconds);
+        demuxer_->SeekTo(target_time_us);
     }
 
     //  重置 EOF 状态机
@@ -106,6 +128,32 @@ void FileReader::SeekTo(double pts_seconds) {
         demuxer_eof_received_ = false;
         audio_eof_received_ = false;
         video_eof_received_ = false;
+    }
+}
+
+/**
+ * @brief 强制中断解码器内部的 Packet 队列阻塞，并清空遗留数据
+ */
+void FileReader::AbortAndClearDecoderQueues() {
+    if (audio_decoder_) {
+        audio_decoder_->AbortAndClearQueue();
+    }
+
+    if (video_decoder_) {
+        video_decoder_->AbortAndClearQueue();
+    }
+}
+
+/**
+ * @brief 恢复解码器内部 Packet 队列的入队/出队能力
+ */
+void FileReader::StartDecoderQueues() {
+    if (audio_decoder_) {
+        audio_decoder_->StartQueue();
+    }
+
+    if (video_decoder_) {
+        video_decoder_->StartQueue();
     }
 }
 
@@ -125,7 +173,6 @@ int FileReader::GetVideoWidth() const { return video_width_; }
 int FileReader::GetVideoHeight() const { return video_height_; }
 
 // ================= 解复用器数据上行回调 (Demuxer -> FileReader) =================
-
 /**
  * @brief 接收视频流元数据，并初始化下游视频解码器
  */
@@ -152,20 +199,25 @@ void FileReader::OnNotifyAudioStream(const StreamInfo& info) {
 /**
  * @brief 接收压缩视频包，并路由至视频解码队列
  */
-void FileReader::OnNotifyVideoPacket(std::shared_ptr<Packet> video_packet) {
+bool FileReader::OnNotifyVideoPacket(std::shared_ptr<Packet> video_packet) {
     if (video_decoder_) {
         // 路由至视频解码管线
         video_decoder_->PushPacket(std::move(video_packet));
+        return true;
+    } else {
+        return false;
     }
 }
-
 /**
  * @brief 接收压缩音频包，并路由至音频解码队列
  */
-void FileReader::OnNotifyAudioPacket(std::shared_ptr<Packet> audio_packet) {
+bool FileReader::OnNotifyAudioPacket(std::shared_ptr<Packet> audio_packet) {
     if (audio_decoder_) {
         // 路由至音频解码管线
         audio_decoder_->PushPacket(std::move(audio_packet));
+        return true;
+    } else {
+        return false;
     }
 }
 
@@ -174,7 +226,7 @@ void FileReader::OnNotifyAudioPacket(std::shared_ptr<Packet> audio_packet) {
  */
 void FileReader::OnNotifyDemuxerEOF() {
     std::lock_guard<std::mutex> lock(eof_mutex_);
-    demuxer_eof_received_ = true; 
+    demuxer_eof_received_ = true;
 
     // 投递终止信令至解码器，触发其内部缓冲区排空机制
     if (video_decoder_) {
@@ -186,21 +238,43 @@ void FileReader::OnNotifyDemuxerEOF() {
     }
 }
 
+/**
+ * @brief 实现 IDemuxer::Listener 接口
+ * @details 接收底层 Demuxer 寻址成功信号，并向顶层 Player 透传
+ */
+void FileReader::OnSeekResetQueues() {
+    LOG_INFO("FileReader received OnSeekResetQueues from Demuxer. Forwarding to Player.");
+    if (listener_) {
+        listener_->OnFileReaderSeekResetQueues();
+    }
+}
+
+/**
+ * @brief 实现 IDemuxer::Listener 接口
+ * @details 接收底层 Demuxer 状态恢复信号，并向顶层 Player 透传
+ */
+void FileReader::OnSeekCompleteResumePlay() {
+    LOG_INFO("FileReader received OnSeekCompleteResumePlay from Demuxer. Forwarding to Player.");
+    if (listener_) {
+        // 调用 IFileReader::Listener 的接口，透传给 Player
+        listener_->OnFileReaderSeekCompleteResumePlay();
+    }
+}
+
 // ================= 解码器数据上行回调 (Decoder -> FileReader -> Player) =================
 
 /**
- * @brief 接收解码后的纯净 PCM 音频帧，并透传至上层总控
+ * @brief 接收解码后的纯净 PCM 音频帧，传给Player
  */
-
 void FileReader::OnNotifyAudioFrame(std::shared_ptr<Frame> audio_frame) {
     if (listener_) {
-        // 将解码后的PCM交给FileReader模块
+        // 将解码后的PCM交给Player模块
         listener_->OnFileReaderNotifyAudioFrame(std::move(audio_frame));
     }
 }
 
 /**
- * @brief 音频解码流彻底结束，向上层总控抛出终极信令
+ * @brief 音频解码流彻底结束，给到Player通知
  */
 void FileReader::OnNotifyAudioEOF() {
     std::lock_guard<std::mutex> lock(eof_mutex_);
@@ -213,17 +287,17 @@ void FileReader::OnNotifyAudioEOF() {
 }
 
 /**
- * @brief 接收解码后的纯净 YUV 视频帧，并透传至上层总控
+ * @brief 接收解码后的纯净 YUV 视频帧，传给Player
  */
 void FileReader::OnNotifyVideoFrame(std::shared_ptr<VideoFrame> video_frame) {
     if (listener_) {
-        // 将YUV图传给FileReader模块
+        // 将YUV图传给Player模块
         listener_->OnFileReaderNotifyVideoFrame(std::move(video_frame));
     }
 }
 
 /**
- * @brief 视频解码流彻底结束，向上层总控抛出终极信令
+ * @brief 视频解码流彻底结束，给到Player通知
  */
 void FileReader::OnNotifyVideoEOF() {
     std::lock_guard<std::mutex> lock(eof_mutex_);

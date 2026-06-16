@@ -118,7 +118,7 @@ private:
      * @param current_time 当前时间(秒)
      * @param total_time 总时长(秒)
      */
-    void OnPlaybackProgress(float progress, float current_time, float total_time) override;
+    void OnPlaybackProgress(float progress, int64_t current_time, float total_time) override;
 
 private:
     /**

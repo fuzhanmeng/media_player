@@ -6,16 +6,13 @@
 
 #include <functional>
 
+#include "av_core_def.h"
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 }
 
 namespace av {
-
-enum AVFrameFlag {
-    kNone = 0,
-    kFlush = 1 << 0, // 遇到这个标志，表示发生了 Seek 跳转，下游需要清空历史缓存
-};
 
 class Packet {
 public:
@@ -44,7 +41,7 @@ public:
     Packet(Packet&& other) noexcept
         : packet_(other.packet_), flags_(other.flags_), release_callback_(std::move(other.release_callback_)) {
         other.packet_ = nullptr;
-        other.flags_ = 0;
+        other.flags_ = AVFrameFlag::kNone;
         other.release_callback_ = nullptr; // 移交后清空对方的回调
     }
 
@@ -59,25 +56,25 @@ public:
             release_callback_ = std::move(other.release_callback_);
 
             other.packet_ = nullptr;
-            other.flags_ = 0;
+            other.flags_ = AVFrameFlag::kNone;
             other.release_callback_ = nullptr;
         }
         return *this;
     }
 
     // 4. 供外部调用的 API
-
     AVPacket* GetRawPacket() const { return packet_; }
     AVPacket* operator->() const { return packet_; }
 
-    void AddFlag(int flag) { flags_ |= flag; }
-    bool HasFlag(int flag) const { return (flags_ & flag) != 0; }
+    void AddFlag(AVFrameFlag flag) { flags_ |= flag; }
+    bool HasFlag(AVFrameFlag flag) const { return (flags_ & flag) != AVFrameFlag::kNone; }
 
     void SetReleaseCallback(std::function<void()> cb) { release_callback_ = std::move(cb); }
 
 private:
     AVPacket* packet_{nullptr};
-    int flags_{0};
+
+    AVFrameFlag flags_{AVFrameFlag::kNone};
 
     std::function<void()> release_callback_{nullptr};
 };

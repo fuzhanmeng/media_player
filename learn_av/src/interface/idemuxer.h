@@ -7,7 +7,7 @@
 #include <memory>
 #include <string>
 
-#include "define/stream_info.h" // 引入公共的流信息 DTO
+#include "define/stream_info.h"
 
 namespace av {
 
@@ -24,13 +24,13 @@ public:
         virtual ~Listener() = default;
 
         /**
-         * @brief 通知发现视频流
+         * @brief 传递 流信息 到 视频解码
          * @param info 经过抽象后的视频流参数
          */
         virtual void OnNotifyVideoStream(const StreamInfo& info) = 0;
 
         /**
-         * @brief 通知发现音频流
+         * @brief 传递 流信息 到 音频解码
          * @param info 经过抽象后的音频流参数
          */
         virtual void OnNotifyAudioStream(const StreamInfo& info) = 0;
@@ -38,17 +38,27 @@ public:
         /**
          * @brief 通知收到视频数据包
          */
-        virtual void OnNotifyVideoPacket(std::shared_ptr<Packet> packet) = 0;
+        virtual bool OnNotifyVideoPacket(std::shared_ptr<Packet> packet) = 0;
 
         /**
          * @brief 通知收到音频数据包
          */
-        virtual void OnNotifyAudioPacket(std::shared_ptr<Packet> packet) = 0;
+        virtual bool OnNotifyAudioPacket(std::shared_ptr<Packet> packet) = 0;
 
         /**
          * @brief 通知到达文件末尾
          */
         virtual void OnNotifyDemuxerEOF() = 0;
+
+        /**
+         * @brief 通知监听器（FileReader）重置下游所有的阻塞队列状态
+         */
+        virtual void OnSeekResetQueues() = 0;
+
+        /**
+         * @brief 通知监听器（FileReader）底层寻址与上下文冲刷已完成，申请恢复播放
+         */
+        virtual void OnSeekCompleteResumePlay() = 0;
     };
 
 public:
@@ -61,7 +71,7 @@ public:
 
     /**
      * @brief 注册监听器
-     * 必须在 Open 之前调用，否则漏掉流初始化信息
+     * 必须在 Open 之前调用
      */
     virtual void SetListener(Listener* listener) = 0;
 
@@ -78,10 +88,15 @@ public:
     virtual void Start(std::shared_ptr<SyncContext> sync_ctx) = 0;
 
     /**
-     * @brief 停止解复用线程并释放资源
-     * @note 调用后需要重新Open才能再次使用
+     * @note 阶段一：异步发送终止信令 -- 非阻塞
      */
-    virtual void Stop() = 0;
+    virtual void RequestStop() = 0;
+
+    /**
+     * @file idemuxer.h
+     * @brief 阶段二：同步等待线程退出 -- 阻塞
+     */
+    virtual void WaitForStop() = 0;
 
     /**
      * @brief 清空解复用器内部缓存
@@ -90,16 +105,14 @@ public:
     virtual void Flush() = 0;
 
     /**
-     * @brief 进度跳转
-     * @param target_time_sec 目标绝对时间（单位：秒）
-     * @note 由上层 UI 负责计算好绝对秒数后传入，以支持直播流和时长异常的文件
+     * @brief 触发绝对时间轴跳转
+     * @param target_time_us 目标绝对时间（单位：微秒）
      */
-    virtual void SeekTo(double target_time_sec) = 0;
+    virtual void SeekTo(int64_t target_time_sec) = 0;
 
     /**
      * @brief 获取媒体总时长
      * @return 总时长（单位：秒）
-     * @note 增加 const 约束，保证查询操作的安全性；返回值改为 double 提升计算精度
      */
     virtual double GetDuration() const = 0;
 };

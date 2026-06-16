@@ -7,13 +7,15 @@
 #include "player.h"
 
 #include <atomic>
-#include <fstream>
 #include <memory>
 #include <string>
 
 #include "define/av_frame.h"
+#include "interface/iaudio_speaker.h"
+#include "interface/iav_synchronizer.h"
 #include "interface/ifile_reader.h"
 #include "iplayer.h"
+#include "ivideo_sink.h"
 #include "logger.h"
 #include "playback_state.h"
 #include "playback_sync.h"
@@ -68,16 +70,18 @@ Player::Player(std::shared_ptr<IGLContext> gl_context)
     if (audio_speaker_) {
         audio_speaker_->Open(44100, 2);
     }
+
+    // 4. 创建音画同步模块
+    av_sync_ = std::unique_ptr<IAVSynchronizer>(IAVSynchronizer::Create(sync_ctx_, audio_speaker_.get()));
+    if (av_sync_) {
+        av_sync_->SetListener(this);
+    }
 }
 
 /**
  * @brief 析构函数
  */
-Player::~Player() { Stop();
-    if (audio_speaker_) {
-        audio_speaker_->Close();
-    }
-}
+Player::~Player() { Stop(); }
 
 // ================= 渲染管道控制 =================
 
@@ -87,7 +91,15 @@ Player::~Player() { Stop();
  */
 void Player::Player::AttachDisplayView(IVideoSink* sink) {
     std::lock_guard<std::mutex> lock(sinks_mutex_);
-    video_sinks_.push_back(sink);
+
+    // 检查是否已经绑定，防止重复添加导致同一帧被渲染两次
+    auto it = std::find(video_sinks_.begin(), video_sinks_.end(), sink);
+
+    // 如果遍历完毕后还没有找到，就将其 Attach
+    if (it == video_sinks_.end()) {
+        video_sinks_.push_back(sink);
+        LOG_INFO("Video sink attached successfully. Current sink count: {}", video_sinks_.size());
+    }
 }
 
 /**
@@ -100,9 +112,10 @@ void Player::Player::DetachDisplayView(IVideoSink* sink) {
     // find 要解绑的 sink
     auto it = std::find(video_sinks_.begin(), video_sinks_.end(), sink);
 
-    // 如果找到了
+    // 从名单中剔除该裸指针，切断后续推流
     if (it != video_sinks_.end()) {
         video_sinks_.erase(it);
+        LOG_INFO("Video sink detached successfully. Current sink count: {}", video_sinks_.size());
     }
 }
 
@@ -117,11 +130,11 @@ bool Player::Open(const std::string& url) {
     // 1. 中断并回收既有的后台线程资源
     Stop();
 
+    // 2. 打开文件
     if (!file_reader_) {
         return false;
     }
 
-    // 2. 打开文件
     bool ret = file_reader_->Open(url);
     if (ret) {
         ChangeState(PlaybackState::kOpened);
@@ -133,7 +146,7 @@ bool Player::Open(const std::string& url) {
  * @brief 点击播放
  */
 void Player::Play() {
-    if (!sync_ctx_ || !sync_ctx_->IsValid()) {
+    if (!sync_ctx_) {
         LOG_ERROR("Fatal: SyncContext is invalid before Play().");
         return;
     }
@@ -143,12 +156,18 @@ void Player::Play() {
     if (sync_ctx_->state_.compare_exchange_strong(expected_opened, PlaybackState::kPlaying)) {
         LOG_INFO("====== State transition: kOpened -> kPlaying. Initializing worker threads ======");
 
-        if (file_reader_) {
-            file_reader_->Start(sync_ctx_);
+        // 1. 先启动消费者
+        if (av_sync_) {
+            av_sync_->Start();
         }
 
         if (audio_speaker_) {
             audio_speaker_->Play();
+        }
+
+        // 2. 再启动生产者
+        if (file_reader_) {
+            file_reader_->Start(sync_ctx_);
         }
 
         if (listener_) {
@@ -180,13 +199,18 @@ void Player::Play() {
     if (sync_ctx_->state_.compare_exchange_strong(expected_stopped, PlaybackState::kPlaying)) {
         LOG_INFO("====== State transition: kStopped -> kPlaying. Re-initializing worker threads ======");
 
-        if (file_reader_) {
-            // 线程已在 Stop 时销毁，需重新执行创建序列
-            file_reader_->Start(sync_ctx_);
+        // 1. 先启动消费者
+        if (av_sync_) {
+            av_sync_->Start();
         }
 
         if (audio_speaker_) {
             audio_speaker_->Play();
+        }
+
+        // 2. 再启动生产者
+        if (file_reader_) {
+            file_reader_->Start(sync_ctx_);
         }
 
         if (listener_) {
@@ -205,13 +229,14 @@ void Player::Pause() {
         return;
     }
 
+    LOG_INFO("========== Play Pause ==========");
+
     PlaybackState expected_playing = PlaybackState::kPlaying;
 
     if (sync_ctx_->state_.compare_exchange_strong(expected_playing, PlaybackState::kPaused)) {
         // 返回 true 的分支：跃迁成功
         // 发生条件：CPU 读取 sync_ctx_->state_ 发现它等于 kPlaying
         // 底层行为：CPU 瞬间将 sync_ctx_->state_ 修改为 kPaused
-        // 业务执行：因为成功抢占了状态机，当前线程可以合法地执行暂停相关的收尾工作
 
         LOG_INFO("State transition: kPlaying -> kPaused. Notifying threads to suspend.");
 
@@ -228,11 +253,6 @@ void Player::Pause() {
             listener_->OnPlaybackStateChanged(PlaybackState::kPaused);
         }
     } else {
-        // 返回 false 的分支：跃迁被拒绝
-        // 发生条件：CPU 读取 sync_ctx_->state_ 发现它不等于 kPlaying（可能是 kPaused, kStopped 等）
-        // 底层行为：拒绝修改 state_，保持原样
-        // 业务执行：防御性编程，跳过 if 块内部的逻辑，直接丢弃本次无效的暂停请求
-
         LOG_DEBUG("Pause() invoked but state is not kPlaying.");
     }
 }
@@ -241,22 +261,49 @@ void Player::Pause() {
  * @brief 终止播放状态机，安全释放底层的解码与解复用引擎
  */
 void Player::Stop() {
-    PlaybackState current_state = sync_ctx_->state_.load();
+    LOG_INFO("========== Play Stop ==========");
 
+    // 1. 获取当前状态，如果已经停止，直接返回防抖
+    PlaybackState current_state = sync_ctx_->state_.load();
     if (current_state == PlaybackState::kStopped || current_state == PlaybackState::kIdle) {
         return;
     }
 
-    // 1. 标记全链路终止
+    // 阶段 1：下发全局信令
+    // 1. 改变全局状态，唤醒所有因 Pause 挂起的线程
     ChangeState(PlaybackState::kStopped);
-
-    // 2. 触发条件变量广播，防止底层线程死锁于 kPaused 的 wait() 屏障中，确保可被成功 join
     sync_ctx_->state_cv_.notify_all();
 
-    // 3. 执行底层物理线程回收与缓冲清理
-    if (file_reader_) {
-        file_reader_->Stop();
+    // 2. 唤醒所有因队列满/空而挂起的线程
+    if (av_sync_) {
+        av_sync_->RequestStop(); // 唤醒 AVSync 内部阻塞，并 Abort video_queue
     }
+
+    if (audio_speaker_) {
+        audio_speaker_->Abort();
+    }
+
+    if (file_reader_) {
+        file_reader_->RequestStop(); // 内部依次调用 decoder 和 demuxer 的 RequestStop
+    }
+
+    // 阶段 2： 回收线程
+    // 2A. 回收最上游：Demuxer/AV_Decoder
+    if (file_reader_) {
+        file_reader_->WaitForStop(); // 内部先 join demuxer，再 join decoders
+    }
+
+    // 2B. 回收下游：音画同步器
+    if (av_sync_) {
+        av_sync_->WaitForStop();
+    }
+
+    // 2C. 回收最下游：物理硬件声卡
+    if (audio_speaker_) {
+        audio_speaker_->Close();
+    }
+
+    LOG_INFO("========== Player resources fully released ==========");
 }
 
 /**
@@ -265,49 +312,41 @@ void Player::Stop() {
  * @details 封装组合状态序列：Pause(强挂起) -> Flush(数据冲刷) -> Seek(时间轴重定位) -> Play(现场恢复)
  */
 void Player::SeekTo(double target_time_sec) {
-    if (!sync_ctx_) {
-        LOG_ERROR("sync_ctx_ is nullptr...");
+    LOG_INFO("========== Play SeekTo ==========");
+    if (!sync_ctx_)
         return;
+
+    int64_t target_time_us = static_cast<int64_t>(target_time_sec * 1000000.0);
+    PlaybackState old_state = sync_ctx_->state_.load();
+
+    // 1. 触发状态机向 kPaused 跃迁，执行休眠同步点
+    Pause();
+
+    // 2. 解除阻塞状态并销毁队列内的历史数据
+    if (file_reader_) {
+        file_reader_->AbortAndClearDecoderQueues(); // 处理 Demuxer 到 Decoder 的 packet_queue
+    }
+    if (av_sync_) {
+        av_sync_->AbortAndClearQueue(); // 处理 Player 到渲染器的 video_queue
+    }
+    if (audio_speaker_) {
+        audio_speaker_->AbortAndClearQueue(); // 处理 Player 到音频设备的 audio_queue
     }
 
-    // 1. 记录跳转前的原状态
-    PlaybackState old_state_ = sync_ctx_->state_.load();
-
-    // 2. 触发挂起信令：如果当前正在播放，那么先暂停
-    if (old_state_ == PlaybackState::kPlaying) {
-        LOG_INFO("when seeking, first pause");
-        Pause();
-    }
-
-    // 3. 开启 Seek 瞬态标志，并穿透 Pause 屏障强行唤醒解码线程
+    // 3. 配置上下文状态变量
     {
         std::lock_guard<std::mutex> lock(sync_ctx_->state_mutex_);
         sync_ctx_->is_seeking_.store(true);
+        sync_ctx_->target_time_us_.store(target_time_us);
+        sync_ctx_->resume_play_after_seek_ = (old_state == PlaybackState::kPlaying);
         sync_ctx_->state_cv_.notify_all();
     }
 
-    // 4. 通知file_reader_模块进行绝对时间跳转
+    // 4. 调用解封装层执行物理重定位
     if (file_reader_) {
-        file_reader_->SeekTo(target_time_sec);
-    }
-
-    // 5. 音频播放模块跳转
-    if (audio_speaker_) {
-        audio_speaker_->Flush();
-    }
-
-    // 6. 跳转后is_seeking_设置为false
-    {
-        std::lock_guard<std::mutex> lock(sync_ctx_->state_mutex_);
-        sync_ctx_->is_seeking_.store(false);
-    }
-
-    // 7. 若原状态为播放，则完成跳转后自动恢复播放
-    if (old_state_ == PlaybackState::kPlaying) {
-        Play();
+        file_reader_->SeekTo(sync_ctx_->target_time_us_);
     }
 }
-
 // ================= 状态查询与事件订阅 =================
 
 /**
@@ -350,17 +389,28 @@ void Player::SetListener(IPlayer::Listener* listener) { listener_ = listener; }
  */
 void Player::OnFileReaderNotifyAudioFrame(std::shared_ptr<Frame> audio_frame) {
     // 1. 判断audio_frame合法性
-    if (!audio_frame || audio_frame->IsEmpty()) {
+    if (!audio_frame) {
         return;
     }
 
-    // 2. 将音频帧直接投递至物理扬声器的线程安全队列中
-    if (audio_speaker_) {
+    // 2. 如果是Flush包
+    if (audio_frame->HasFlag(AVFrameFlag::kFlush)) {
+        if (audio_speaker_) {
+            audio_speaker_->PushAudioFrame(std::move(audio_frame));
+        }
+        return;
+    }
 
-        audio_speaker_->PushAudioData(std::move(audio_frame));
+    // 3. 常规数据的合法性校验
+    if (audio_frame->IsEmpty()) {
+        return;
+    }
+
+    // 4. 将音频帧直接投递至物理扬声器的线程安全队列中
+    if (audio_speaker_) {
+        audio_speaker_->PushAudioFrame(std::move(audio_frame));
     }
 }
-
 
 /**
  * @brief 接收底层解码输出的纯净 YUV/RGB 视频帧
@@ -368,14 +418,38 @@ void Player::OnFileReaderNotifyAudioFrame(std::shared_ptr<Frame> audio_frame) {
  */
 void Player::OnFileReaderNotifyVideoFrame(std::shared_ptr<VideoFrame> video_frame) {
     // 1. 判断video_frame合法性
-    if (!video_frame || !video_frame->buffer_ || video_frame->width_ <= 0 || video_frame->height_ <= 0) {
-        LOG_ERROR("Invalid video frame! width: {}, height: {}, buffer: {}", video_frame ? video_frame->width_ : 0,
-                  video_frame ? video_frame->height_ : 0,
-                  static_cast<void*>(video_frame ? video_frame->buffer_.get() : nullptr));
+    if (!video_frame) {
         return;
     }
 
+    // 2. 判断是不是Flush包
+    if (video_frame->HasFlag(AVFrameFlag::kFlush)) {
+       if (av_sync_) {
+           av_sync_->PushVideoFrame(std::move(video_frame));
+           return;
+       }
+    }
+
+    // 3. 常规数据的合法性校验
+    if (!video_frame->IsValid()) {
+        return;
+    }
+
+    // 4. 将视频送入音画同步模块
+    if (av_sync_) {
+        av_sync_->PushVideoFrame(std::move(video_frame));
+    }
+}
+
+void Player::OnSyncNotifyVideoFrame(std::shared_ptr<VideoFrame> video_frame) {
     // 2. 将视频帧传递给后续渲染模块
+    std::lock_guard<std::mutex> lock(sinks_mutex_);
+
+    for (auto* sink : video_sinks_) {
+        if (sink) {
+            sink->OnReceiveVideoFrame(video_frame);
+        }
+    }
 }
 
 /**
@@ -390,10 +464,38 @@ void Player::OnFileReaderNotifyAudioFinished() {
  * @brief Video EOF
  * @details 底层视频解码器内部残留帧已全部排空
  */
-void Player::OnFileReaderNotifyVideoFinished() {
-    // 预留接口，后续可在此处增加 video_eof_ 标志位的设置与播放完成检查
+void Player::OnFileReaderNotifyVideoFinished() {}
+
+/**
+ * @brief 实现 IFileReader::Listener 接口
+ * @details 响应底层复位信令，解除全局所有数据队列的 Abort 状态
+ */
+void Player::OnFileReaderSeekResetQueues() {
+    LOG_INFO("Player received SeekResetQueues. Re-enabling all pipeline queues.");
+
+    // 1. 解除 FileReader 内部解码器 Packet 队列的阻塞状态
+    if (file_reader_) {
+        file_reader_->StartDecoderQueues();
+    }
+    // 2. 解除音视频同步器视频队列的阻塞状态
+    if (av_sync_) {
+        av_sync_->StartQueue();
+    }
+    // 3. 解除音频输出组件音频队列的阻塞状态
+    if (audio_speaker_) {
+        audio_speaker_->StartQueue();
+    }
 }
 
+/**
+ * @brief 实现 IFileReader::Listener 接口
+ * @details 响应底层 Seek 完成信令，正式恢复有限状态机至播放状态
+ */
+void Player::OnFileReaderSeekCompleteResumePlay() {
+    LOG_INFO("Player received SeekCompleteResumePlay. Restarting playback loop.");
+
+    Play();
+}
 // ================= 内部控制逻辑 =================
 
 /**

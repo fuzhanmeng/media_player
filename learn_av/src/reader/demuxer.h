@@ -48,16 +48,20 @@ public:
     void Flush() override;
 
     /**
-     * @brief 安全终止解复用线程并释放 I/O 资源
-     * @note 会触发中断信令，唤醒所有挂起的锁与条件变量，等待线程 join
+     * @brief 阶段一：异步发送终止信令 -- 非阻塞
      */
-    void Stop() override;
+    void RequestStop() override;
 
     /**
-     * @brief 触发媒体物理时间轴跳转 (Seek)
-     * @param target_time_sec 目标绝对时间（单位：秒）
+     * @brief 同步等待线程退出 -- 阻塞
      */
-    void SeekTo(double target_time_sec) override;
+    void WaitForStop() override;
+
+    /**
+     * @brief 触发绝对时间轴跳转
+     * @param target_time_us 目标绝对时间（单位：微秒）
+     */
+    void SeekTo(int64_t target_time_us) override;
 
     /**
      * @brief 获取当前媒体容器的全局总时长
@@ -116,9 +120,9 @@ private:
     std::atomic<bool> is_seek_requested_{false}; ///< Seek 触发信令
 
     std::atomic<bool> is_eof_{false}; ///< 标记是否已经到达文件末尾
-    
+
     // 跳转目标位置
-    std::atomic<double> target_seek_time_{-1.0};
+    std::atomic<int64_t> target_seek_time_{0};
 };
 
 } // namespace av

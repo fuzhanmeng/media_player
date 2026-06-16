@@ -96,7 +96,7 @@ void PlayerWidget::OnPlaybackError(int error_code, const std::string& error_msg)
  * @param current_time 当前时间(秒)
  * @param total_time 总时长(秒)
  */
-void PlayerWidget::OnPlaybackProgress(float progress, float current_time, float total_time) {
+void PlayerWidget::OnPlaybackProgress(float progress, int64_t current_time, float total_time) {
     emit sigPlaybackProgress(progress, current_time, total_time);
 }
 

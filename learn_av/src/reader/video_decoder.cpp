@@ -2,7 +2,7 @@
  * @file video_decoder.cpp
  * @brief 视频解码类的核心实现
  * @details 负责从 Demuxer 接收压缩比特流，驱动底层硬/软件解码引擎，
- * 提取 YUV420P 裸数据并封装至 DTO 中，交由下游 GPU 管线进行色彩空间转换与渲染。
+ * 提取 YUV420P 裸数据并封装至 DTO 中，交由下游 GPU 管线进行色彩空间转换与渲染
  */
 #include "video_decoder.h"
 
@@ -40,7 +40,8 @@ VideoDecoder::VideoDecoder() {}
  * @details 严格遵循时序：先终止 OS 线程，后清理物理内存，防止段错误
  */
 VideoDecoder::~VideoDecoder() {
-    Stop();
+    RequestStop();
+    WaitForStop();
     Close();
 }
 
@@ -55,10 +56,7 @@ std::unique_ptr<IVideoDecoder> IVideoDecoder::Create() {
 /**
  * @brief 设置下游监听器
  */
-void VideoDecoder::SetListener(Listener* listener) {
-    LOG_INFO("VideoDecoder SetListener...");
-    listener_ = listener;
-}
+void VideoDecoder::SetListener(Listener* listener) { listener_ = listener; }
 
 /**
  * @brief 初始化解码线程与上下文
@@ -139,6 +137,9 @@ void VideoDecoder::PushPacket(std::shared_ptr<Packet> packet) {
         return;
     }
 
+    if (packet->HasFlag(av::AVFrameFlag::kFlush)) {
+        packet_queue_.Clear();
+    }
     // 隐式背压：队列容量满载时将阻塞 Demuxer 线程
     packet_queue_.Push(std::move(packet));
 }
@@ -159,13 +160,14 @@ void VideoDecoder::SendEOF() {
  * @param sync_ctx 注入全局状态同步上下文
  */
 void VideoDecoder::Start(std::shared_ptr<SyncContext> sync_ctx) {
+    LOG_INFO("========== VideoDecoder::Start ==========");
     // 1. 判断要不要启动新的解码线程 (看物理 OS 线程是否存在)
     if (decode_thread_.joinable()) {
         LOG_WARN("Video Decoder thread is already running.");
         return;
     }
 
-    // 2. 清空历史脏包，并彻底复活队列！
+    // 2. 清空历史脏包，启动队列
     packet_queue_.Clear();
     packet_queue_.Start();
 
@@ -182,10 +184,9 @@ void VideoDecoder::Start(std::shared_ptr<SyncContext> sync_ctx) {
 }
 
 /**
- * @brief 停止解码线程
- * @details 下发停止信令，唤醒休眠线程，并回收 OS 线程句柄
+ * @brief 阶段一：下发异步终止信令 --非阻塞
  */
-void VideoDecoder::Stop() {
+void VideoDecoder::RequestStop() {
     // 1. 若已处于终止请求状态，避免重复操作
     if (is_abort_requested_.load()) {
         return;
@@ -195,24 +196,31 @@ void VideoDecoder::Stop() {
     is_abort_requested_.store(true);
 
     // 3. 通知其他模块视频解码线程停止，唤醒可能挂起的条件变量
-    if (sync_ctx_ && sync_ctx_->IsValid()) {
+    if (sync_ctx_) {
         sync_ctx_->state_cv_.notify_all();
     }
 
     // 4. 强行中断可能阻塞在数据队列 Push/Pop 操作上的线程
     packet_queue_.Abort();
 
-    // 5. 同步等待 OS 线程指令流执行完毕并回收句柄
+    LOG_INFO("========== VideoDecoder::RequestStop ==========");
+}
+
+/**
+ * @brief 阶段二：同步等待回收线程 --阻塞
+ */
+void VideoDecoder::WaitForStop() {
+    // 1. 同步等待 OS 线程指令流执行完毕并回收句柄
     if (decode_thread_.joinable()) {
         decode_thread_.join();
     }
 
-    // 6. 状态复位与残余数据清理
+    // 2. 状态复位与残余数据清理
     packet_queue_.Clear();
     is_abort_requested_.store(false);
     sync_ctx_.reset();
 
-    LOG_INFO("VideoDecoder OS thread joined safely.");
+    LOG_INFO("========== VideoDecoder::WaitForStop ==========");
 }
 
 /**
@@ -222,11 +230,21 @@ void VideoDecoder::Stop() {
 void VideoDecoder::Flush() {
     std::lock_guard<std::mutex> lock(codec_mutex_);
     if (av_codec_ctx_) {
-        // 清空 FFmpeg 内部的历史参考帧，确保新画面不花屏
+        // 清空 FFmpeg 内部的视频帧，确保新画面不花屏
         avcodec_flush_buffers(av_codec_ctx_);
     }
     LOG_INFO("Video Decoder internal codec buffers flushed...");
 }
+
+/**
+ * @brief 清空队列，唤醒阻塞
+ */
+void VideoDecoder::AbortAndClearQueue() { packet_queue_.AbortAndClear(); }
+
+/**
+ * @brief 启动队列
+ */
+void VideoDecoder::StartQueue() { packet_queue_.Start(); }
 
 /**
  * @brief 释放 FFmpeg 解码器物理内存
@@ -239,6 +257,7 @@ void VideoDecoder::Close() {
         av_codec_ctx_ = nullptr;
     }
     packet_queue_.Clear();
+    LOG_INFO("========== VideoDecoder::Close ==========");
 }
 
 /**
@@ -256,16 +275,20 @@ void VideoDecoder::DecodeLoop() {
         return;
     }
 
-    // 主事件循环：生命周期校验 (修正为不要求 abort 时循环)
+    // 主事件循环：生命周期校验
     while (!is_abort_requested_.load()) {
         // [阶段 A]: 线程调度与管线挂起控制
         {
             std::unique_lock<std::mutex> lock(sync_ctx_->state_mutex_);
 
-            // 1. 处于正在播放 2. 发生了跳转 3. 被停止 就醒来
+            // 1. 线程停止
+            // 2. 发生了跳转
+            // 3. 处于播放状态
+            // 4. 全局Stop
             sync_ctx_->state_cv_.wait(lock, [this]() {
                 return is_abort_requested_.load() || sync_ctx_->is_seeking_.load() ||
-                    sync_ctx_->state_.load() == PlaybackState::kPlaying;
+                    sync_ctx_->state_.load() == PlaybackState::kPlaying ||
+                    sync_ctx_->state_.load() == PlaybackState::kStopped;
             });
         }
 
@@ -274,26 +297,36 @@ void VideoDecoder::DecodeLoop() {
             break;
         }
 
-        // [阶段 B]: 从线程安全队列中阻塞式提取压缩比特流
+        // [阶段 B]: 阻塞式提取视频
         std::shared_ptr<Packet> packet;
         if (!packet_queue_.Pop(packet)) {
-            LOG_INFO("Bitstream queue aborted. Gracefully exiting DecodeLoop.");
-            break;
+            if (is_abort_requested_.load() || sync_ctx_->state_.load() == PlaybackState::kStopped) {
+                break;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
         }
 
-        // 防御性拦截空指针，防止段错误 (Segfault)
         if (!packet) {
             continue;
         }
 
         // [阶段 C]: 处理带内控制信令
         if (packet->HasFlag(av::AVFrameFlag::kFlush)) {
-            LOG_INFO("Video Decoder Received In-band Flush packet, executing codec synchronization.");
+            LOG_DEBUG("Video Decoder Received In-band Flush packet, executing codec synchronization.");
             Flush();
+
+            // 向下游发送带Flush标志的空帧
+            auto video_frame = std::make_shared<VideoFrame>(0, 0);
+            video_frame->AddFlag(av::AVFrameFlag::kFlush);
+            if (listener_) {
+                listener_->OnNotifyVideoFrame(std::move(video_frame));
+            }
             continue;
         }
 
-        // [阶段 D]: 向解码器引擎投递压缩码流
+        // [阶段 D]: packet送入解码器
         int ret = 0;
         {
             std::lock_guard<std::mutex> lock(codec_mutex_);
@@ -302,11 +335,13 @@ void VideoDecoder::DecodeLoop() {
 
         // 校验投递状态 (过滤正常输入和 EOF 冲刷空包)
         if (ret < 0 && ret != AVERROR_EOF) {
-            LOG_ERROR("Codec engine rejected the packet.");
+            std::array<char, AV_ERROR_MAX_STRING_SIZE> err_buf{};
+            av_strerror(ret, err_buf.data(), err_buf.size());
+            LOG_ERROR("avcodec_send_packet failed: {}", err_buf.data());
             continue;
         }
 
-        // [阶段 E]: 贪婪模式 (Greedy Approach) 循环抽取，清空解码器输出缓冲环
+        // [阶段 E]: 提取视频帧
         while (true) {
             {
                 std::lock_guard<std::mutex> lock(codec_mutex_);
@@ -314,22 +349,24 @@ void VideoDecoder::DecodeLoop() {
             }
 
             if (ret == AVERROR(EAGAIN)) {
-                // 状态机反馈：内部参考帧不足，需继续供给 AVPacket 才能输出画面
+                // 内部参考帧不足，需继续供给 AVPacket 才能输出画面
                 break;
             } else if (ret == AVERROR_EOF) {
-                // 状态机反馈：解码管线彻底排空，触达物理流末尾
+                // 解码管线彻底排空
                 if (listener_) {
                     LOG_INFO("Video decoding reached physical EOF.");
                     listener_->OnNotifyVideoEOF();
                 }
                 break;
             } else if (ret < 0) {
-                // 状态机反馈：底层硬件或解码库发生不可恢复异常
-                LOG_ERROR("Fatal error during frame extraction.");
+                // 底层硬件或解码库发生不可恢复异常
+                std::array<char, AV_ERROR_MAX_STRING_SIZE> err_buf{};
+                av_strerror(ret, err_buf.data(), err_buf.size());
+                LOG_ERROR("avcodec_receive_frame failed: {}", err_buf.data());
                 break;
             }
 
-            // [阶段 F]: 剔除 Padding 并传给渲染模块
+            // [阶段 F]: 处理解码出的裸帧
             ProcessAndPack(av_frame);
 
             // [阶段 G]: 释放由 FFmpeg 在内部分配的图像堆内存，将 av_frame 容器复位以供下一圈复用
@@ -340,7 +377,7 @@ void VideoDecoder::DecodeLoop() {
     // [阶段 0 的闭环]: 销毁物理内存载体，防范堆内存泄漏
     av_frame_free(&av_frame);
 
-    LOG_INFO("VideoDecoder DecodeLoop pipeline gracefully exited.");
+    LOG_INFO("VideoDecoder DecodeLoop exited safely.");
 }
 
 /**
@@ -357,10 +394,8 @@ void VideoDecoder::ProcessAndPack(AVFrame* frame) {
     // 2. 实例化 DTO (Data Transfer Object)，内部预分配完全紧凑的内存
     auto video_frame = std::make_shared<av::VideoFrame>(frame->width, frame->height);
 
-    // =========================================================================
     // 3. 内存对齐剥离算法 (Memory Alignment Stripping)
     // 结合 ptrdiff_t 强制转换，杜绝 32 位整数溢出风险
-    // =========================================================================
 
     // 1. 拷贝 Luma (Y 分量)
     for (int i = 0; i < frame->height; ++i) {
@@ -388,17 +423,26 @@ void VideoDecoder::ProcessAndPack(AVFrame* frame) {
         memcpy(video_frame->data_[1] + dst_offset, frame->data[1] + src_u_offset, chroma_width);
         memcpy(video_frame->data_[2] + dst_offset, frame->data[2] + src_v_offset, chroma_width);
     }
+
     // 4. 显示时间戳 (PTS) 的换算
     // AV_NOPTS_VALUE 表示无显示时间戳值，需回退使用 best_effort_timestamp
     int64_t actual_pts = (frame->pts == AV_NOPTS_VALUE) ? frame->best_effort_timestamp : frame->pts;
-    double pts_seconds = 0.0;
+
+    int64_t time_us = 0;
 
     if (actual_pts != AV_NOPTS_VALUE) {
+        AVRational us_q = {1, 1000000};
+
         // 将时钟滴答数转换为绝对时间 (秒)
-        pts_seconds = static_cast<double>(actual_pts) * av_q2d(time_base_);
+        time_us = av_rescale_q(actual_pts, time_base_, us_q);
+        video_frame->SetTimestamp(time_us);
     }
 
-    video_frame->SetTimestamp(pts_seconds);
+    if (sync_ctx_ && sync_ctx_->is_seeking_.load()) {
+        // 正处于跳转状态
+        LOG_DEBUG("Discarding pre-seek audio frame, timestamp: {} us", video_frame->GetTimestampUs());
+        return;
+    }
 
     // 5. 将封装完毕的 YUV420P 帧传到下游监听器
     if (listener_) {

@@ -1,6 +1,6 @@
 /**
  * @file iplayer.h
- * @brief 播放器控制接口, 采用纯虚函数设计，隔离具体实现
+ * @brief 播放器控制接口，采用纯虚函数设计，隔离具体实现
  */
 #pragma once
 
@@ -12,7 +12,7 @@
 
 namespace av {
 
-// 前置声明，彻底解耦 UI 渲染层
+// 前置声明，解耦 UI 渲染层
 class IVideoSink;
 
 class IPlayer {
@@ -48,10 +48,10 @@ public:
         /**
          * @brief 播放进度更新
          * @param progress 当前进度[0.0, 1.0]
-         * @param current_time 当前时间(秒)
+         * @param current_time 当前时间(微秒)
          * @param total_time 总时长(秒)
          */
-        virtual void OnPlaybackProgress(float progress, float current_time, float total_time) = 0;
+        virtual void OnPlaybackProgress(float progress, int64_t current_time, float total_time) = 0;
     };
 
 public:
@@ -63,8 +63,6 @@ public:
      * @param shared_gl_context 共享的 OpenGL 上下文句柄
      */
     static std::shared_ptr<av::IPlayer> Create(std::shared_ptr<IGLContext> shared_gl_context);
-
-    // ================= 渲染管道控制 =================
 
     /**
      * @brief 绑定视频渲染槽，将底层的视频帧输出推送到指定的接收端上
@@ -78,8 +76,6 @@ public:
      */
     virtual void DetachDisplayView(IVideoSink* sink) = 0;
 
-    // ================= 生命周期与基础控制 =================
-
     /**
      * @brief 打开媒体文件
      * @param url 文件路径或流媒体网络地址
@@ -90,14 +86,12 @@ public:
     /**
      * @brief 播放请求
      * @details 内部将触发状态机向 PlaybackState::kPlaying 跃迁
-     * 若当前处于 kOpened 或 kPaused 状态，底层时钟和渲染管线将被激活或唤醒
      */
     virtual void Play() = 0;
 
     /**
      * @brief 挂起播放请求
      * @details 内部将触发状态机向 PlaybackState::kPaused 跃迁
-     * 底层解封装和解码线程将被条件变量安全挂起，渲染时钟冻结，画面停留在当前帧
      */
     virtual void Pause() = 0;
 
@@ -118,8 +112,6 @@ public:
      * @note 内部将自动执行 Pause -> Flush(清空旧缓存) -> Seek -> 恢复状态 的组合原子操作
      */
     virtual void SeekTo(double target_time_sec) = 0;
-
-    // ================= 状态查询与事件订阅 =================
 
     /**
      * @brief 获取当前媒体全局总时长

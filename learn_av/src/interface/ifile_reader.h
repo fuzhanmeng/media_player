@@ -41,10 +41,19 @@ public:
          * @brief Video 读到了末尾
          */
         virtual void OnFileReaderNotifyVideoFinished() = 0;
+
+        /**
+         * @brief 通知上层重置所有相关数据队列的状态标志
+         */
+        virtual void OnFileReaderSeekResetQueues() = 0;
+
+        /**
+         * @brief 通知上层底层 Seek 操作已完成，申请恢复播放状态
+         */
+        virtual void OnFileReaderSeekCompleteResumePlay() = 0;
     };
 
     /**
-     * @file ifile_reader.h
      * @brief 创建FileReader实例
      */
     static std::unique_ptr<IFileReader> Create();
@@ -70,16 +79,30 @@ public:
     virtual void Start(std::shared_ptr<SyncContext> sync_ctx) = 0;
 
     /**
-     * @brief 挂起底层工作线程
+     * @brief 阶段一：下发异步终止信令 -- 非阻塞
      */
-    virtual void Stop() = 0;
+    virtual void RequestStop() = 0;
+
+    /**
+     * @brief 阶段二：同步等待回收线程 -- 阻塞
+     */
+    virtual void WaitForStop() = 0;
 
     /**
      * @brief 触发绝对时间轴跳转
-     * @param time_sec 目标绝对时间（单位：秒）
-     * @note 上层需保证调用此接口前，并发管线已处于 kPaused 挂起状态
+     * @param target_time_us 目标绝对时间（单位：微秒）
      */
-    virtual void SeekTo(double time_sec) = 0;
+    virtual void SeekTo(int64_t target_time_us) = 0;
+
+    /**
+     * @brief 强制中断解码器内部的 Packet 队列阻塞，并清空遗留数据
+     */
+    virtual void AbortAndClearDecoderQueues() = 0;
+
+    /**
+     * @brief 恢复解码器内部 Packet 队列的入队/出队能力
+     */
+    virtual void StartDecoderQueues() = 0;
 
     /**
      * @brief 查询媒体总时长

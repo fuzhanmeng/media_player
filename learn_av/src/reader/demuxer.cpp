@@ -36,7 +36,8 @@ Demuxer::Demuxer() {}
 
 Demuxer::~Demuxer() {
     // 1. 停止解复用线程
-    Stop();
+    RequestStop();
+    WaitForStop();
 
     // 2. 释放内部资源
     Close();
@@ -145,6 +146,7 @@ bool Demuxer::Open(const std::string& url) {
  * @brief 启动异步解复用工作线程
  */
 void Demuxer::Start(std::shared_ptr<SyncContext> sync_ctx) {
+    LOG_INFO("========== Demuxer::Start ==========");
     // 1. 如果当前状态是停止状态直接返回
     if (demuxer_thread_.joinable()) {
         return;
@@ -161,31 +163,30 @@ void Demuxer::Start(std::shared_ptr<SyncContext> sync_ctx) {
 }
 
 /**
- * @brief 清空解复用器内部状态并向下游发送Flush信令
- * @note 主要用于Seek操作后清除旧数据，防止花屏
+ * @brief 清空解复用器内部状态并向下游分别发送独立的 Flush 信令
+ * @note 主要用于Seek操作后清除旧数据，防止花屏与爆音
  */
 void Demuxer::Flush() {
-
-    // 向音频和视频流分别发送Flush包
-    auto flush_packet = std::make_shared<Packet>(nullptr);
-    flush_packet->AddFlag(av::AVFrameFlag::kFlush);
-
+    // 1. 音频
     if (audio_stream_index_ != -1 && listener_) {
-        listener_->OnNotifyAudioPacket(flush_packet);
+        auto audio_flush_packet = std::make_shared<Packet>(nullptr);
+        audio_flush_packet->AddFlag(av::AVFrameFlag::kFlush);
+        listener_->OnNotifyAudioPacket(std::move(audio_flush_packet));
     }
 
+    // 2. 视频
     if (video_stream_index_ != -1 && listener_) {
-        listener_->OnNotifyVideoPacket(flush_packet);
+        auto video_flush_packet = std::make_shared<Packet>(nullptr);
+        video_flush_packet->AddFlag(av::AVFrameFlag::kFlush);
+        listener_->OnNotifyVideoPacket(std::move(video_flush_packet));
     }
 
-    LOG_INFO("Demuxer flush completed, Flush packets sent to decoders");
+    LOG_INFO("Demuxer flush completed, independent Flush packets sent to decoders");
 }
-
 /**
- * @brief 安全终止解复用线程并释放 I/O 资源
- * @note 会触发中断信令，唤醒所有挂起的锁与条件变量，等待线程 join
+ * @brief 阶段一：下发异步终止信令 --非阻塞
  */
-void Demuxer::Stop() {
+void Demuxer::RequestStop() {
     // 1. 如果已经是退出状态,直接返回
     if (is_abort_requested_.load()) {
         return;
@@ -195,16 +196,23 @@ void Demuxer::Stop() {
     is_abort_requested_.store(true);
 
     // 3. 唤醒可能正在沉睡的线程，让它看到 is_abort_requested_ 为 true，从而退出循环
-    if (sync_ctx_ && sync_ctx_->IsValid()) {
+    if (sync_ctx_) {
         sync_ctx_->state_cv_.notify_all();
     }
 
-    // 4. 停止解解复用
+    LOG_INFO("========== Demuxer::RequestStop ==========");
+}
+
+/**
+ * @brief 阶段二：同步等待回收线程 --阻塞
+ */
+void Demuxer::WaitForStop() {
+    // 1. 停止解解复用
     if (demuxer_thread_.joinable()) {
         demuxer_thread_.join();
     }
 
-    // 5. 状态与指令复位
+    // 2. 状态与指令复位
     is_abort_requested_.store(false);
     is_seek_requested_.store(false);
 
@@ -214,23 +222,20 @@ void Demuxer::Stop() {
 }
 
 /**
- * @brief 触发媒体物理时间轴跳转 (Seek)
- * @param target_time_sec 目标绝对时间（单位：秒）
- * @note 异步非阻塞信令投递。摒弃比例跳转，由外部业务态统一维持绝对时间系。
+ * @brief 触发绝对时间轴跳转
+ * @param target_time_us 目标绝对时间（单位：微秒）
  */
-void Demuxer::SeekTo(double target_time_sec) {
-    // 防抖机制：若上一次跳转请求尚未处理，则丢弃本次冗余请求   
-    if (is_seek_requested_.load()) {
-        LOG_DEBUG("Seek request debounced. A seek is already in progress.");
-        return;
-    }
+void Demuxer::SeekTo(int64_t target_time_us) {
+    LOG_INFO("========== Demuxer::SeekTo ==========");
 
-    is_seek_requested_.store(true);
-    target_seek_time_.store(target_time_sec);
+    // 直接覆盖为最新的目标时间 (Last-writer wins)
+    target_seek_time_.store(target_time_us);
 
-    // 发射唤醒信令，中断 ThreadLoop 可能的挂起状态，令其优先处理 P0 级任务
-    if (sync_ctx_ && sync_ctx_->IsValid()) {
-        sync_ctx_->state_cv_.notify_all();
+    if (!is_seek_requested_.exchange(true)) {
+        // 只有当之前没有挂起的 seek 请求时，才需要唤醒条件变量
+        if (sync_ctx_) {
+            sync_ctx_->state_cv_.notify_all();
+        }
     }
 }
 
@@ -255,8 +260,11 @@ double Demuxer::GetDuration() const {
  * @note 仅供 Open() 和析构函数调用，对上层业务屏蔽
  */
 void Demuxer::Close() {
+    LOG_INFO("========== Demuxer::Close ==========");
+
     // 1. 清理资源前，先停止解复用线程
-    Stop();
+    RequestStop();
+    WaitForStop();
 
     // 2. 清理相关资源
     std::lock_guard<std::mutex> lock(avformat_mutex_);
@@ -282,12 +290,17 @@ void Demuxer::ThreadLoop() {
             continue;
         }
 
-        // [优先级 P1]: 管线挂起控制机制
-        if (sync_ctx_ && sync_ctx_->IsValid()) {
+        // [优先级 P1]: 线程唤醒机制
+        if (sync_ctx_) {
             std::unique_lock<std::mutex> lock(sync_ctx_->state_mutex_);
             sync_ctx_->state_cv_.wait(lock, [this]() {
+                // 1. ThreadLoop 被停止了
+                // 2. 发生了跳转
+                // 3. 处于播放状态
+                // 4. 全局停止
                 return is_abort_requested_.load() || is_seek_requested_.load() ||
-                    sync_ctx_->state_.load() == PlaybackState::kPlaying;
+                    sync_ctx_->state_.load() == PlaybackState::kPlaying ||
+                    sync_ctx_->state_.load() == PlaybackState::kStopped;
             });
         }
 
@@ -307,7 +320,6 @@ void Demuxer::ThreadLoop() {
         // [优先级 P2]: 提取流数据包并派发
         try {
             if (!ReadAndSendPacket()) {
-                // 【只需要在这里标记 EOF，下一轮循环会自动被上面的拦截网接管休眠
                 is_eof_.store(true);
             }
         } catch (const std::exception& e) {
@@ -317,13 +329,17 @@ void Demuxer::ThreadLoop() {
     }
     LOG_INFO("Demuxer I/O thread exited gracefully.");
 }
+
 /**
  * @brief 响应并执行跳帧逻辑
  * @note 必须在 I/O 线程上下文中执行，防止与 av_read_frame 发生跨线程上下文撕裂
  * 操作完成后向数据总线注入 kFlush 带内信令包
  */
+/**
+ * @brief 响应并执行绝对时间轴跳转逻辑
+ * @note 必须在 I/O 线程上下文中执行，防止与 av_read_frame 发生跨线程并发冲突
+ */
 void Demuxer::ProcessSeek() {
-    // 1. 加锁
     std::unique_lock<std::mutex> lock(avformat_mutex_);
 
     if (!avformat_ctx_) {
@@ -331,64 +347,89 @@ void Demuxer::ProcessSeek() {
         return;
     }
 
-    // 2. 转换物理时间为FFmpeg认识的内部微妙 (AV_TIME_BASE = 1000000)
-    int64_t target_timestamp = static_cast<int64_t>(target_seek_time_.load() * AV_TIME_BASE);
+    int64_t target_timestamp = target_seek_time_.load();
 
-    // 调用底层API av_seek_frame, 定位至目标时间戳之前的最近的一个 I帧 AVSEEK_FLAG_BACKWARD
+    // 1. 调用 FFmpeg 底层 API 执行容器级别的物理寻址
     if (av_seek_frame(avformat_ctx_, -1, target_timestamp, AVSEEK_FLAG_BACKWARD) >= 0) {
-        LOG_INFO("Demuxer seek execution succeeded. Target: {} sec", target_seek_time_.load());
+        LOG_INFO("Demuxer seek succeeded. Target: {} us", target_timestamp);
         is_eof_.store(false);
 
+        // 2. 触发向下游的队列复位信令 (解除 is_abort_ 阻塞状态)
+        if (listener_) {
+            listener_->OnSeekResetQueues();
+        }
+
+        // 3. 清理 FFmpeg 上下文以及下游解码器内部的历史帧参考缓存
         Flush();
     } else {
-        LOG_ERROR("Demuxer seek execution failed for target: {} sec", target_seek_time_.load());
+        LOG_ERROR("Demuxer seek failed for target: {} us", target_timestamp);
+        // 寻址失败亦需复位队列，防止管线永久处于 Abort 阻塞状态
+        if (listener_) {
+            listener_->OnSeekResetQueues();
+        }
+    }
+
+    bool should_resume = false;
+
+    // 4. 状态机标志位重置与跨线程参数读取
+    if (sync_ctx_) {
+        std::lock_guard<std::mutex> lock(sync_ctx_->state_mutex_);
+        sync_ctx_->is_seeking_.store(false);
+        should_resume = sync_ctx_->resume_play_after_seek_.load(); // 获取跳转前的播放意图
+        sync_ctx_->state_cv_.notify_all();
     }
 
     is_seek_requested_.store(false);
+
+    // 5. 触发向上层的回调，请求重新拉起管线进入 kPlaying 状态
+    if (should_resume && listener_) {
+        listener_->OnSeekCompleteResumePlay();
+    }
 }
 
 /**
  * @brief 执行底层裸包提取与跨模块派发
- * @return true 代表循环继续；false 代表触发 EOF 或严重物理读取异常
+ * @return true 循环继续; false 触发 EOF 或物理读取异常
  */
 bool Demuxer::ReadAndSendPacket() {
-    // 1. RAII 申请空包载体
     auto packet = std::make_shared<Packet>();
-
     int ret = 0;
 
-    // 2. 判断av_format_ctx_
     if (!avformat_ctx_) {
         return false;
     }
 
-    // 3. 从 avformat_ctx_ 中读取数据到 packet
     {
         std::lock_guard<std::mutex> lock(avformat_mutex_);
         ret = av_read_frame(avformat_ctx_, packet->GetRawPacket());
     }
 
     if (ret >= 0) {
-        // ================= send video packet =================
+        // ================= 发送视频包 =================
         if (packet->GetRawPacket()->stream_index == video_stream_index_) {
             try {
-                // 直接扔给下游,如果下游 Decoder 的 ThreadSafeQueue 满了，线程将在这里自动挂起
-                listener_->OnNotifyVideoPacket(std::move(packet));
+                // 若底层队列已满，当前线程将挂起；若处于 Abort 状态，返回 false
+                bool push_success = listener_->OnNotifyVideoPacket(std::move(packet));
+                if (!push_success) {
+                    LOG_INFO("Video packet push aborted by downstream. Exiting block context.");
+                    return true; // 抛弃当前 packet，直接进入下一次循环探测指令
+                }
             } catch (const std::exception& e) {
                 LOG_ERROR("Video packet routing exception: {}", e.what());
             }
         }
-        // ================= send audio packet =================
+        // ================= 发送音频包 =================
         else if (packet->GetRawPacket()->stream_index == audio_stream_index_) {
             try {
-                // 直接扔给下游,如果下游 Decoder 的 ThreadSafeQueue 满了，线程将在这里自动挂起
-                listener_->OnNotifyAudioPacket(std::move(packet));
+                bool push_success = listener_->OnNotifyAudioPacket(std::move(packet));
+                if (!push_success) {
+                    LOG_INFO("Audio packet push aborted by downstream. Exiting block context.");
+                    return true; // 抛弃当前 packet，直接进入下一次循环探测指令
+                }
             } catch (const std::exception& e) {
                 LOG_ERROR("Audio packet routing exception: {}", e.what());
             }
         }
-
-        // 非核心轨道（比如字幕等），直接忽略并继续读取下一个包
         return true;
     }
     // ================= 文件末尾 =================
@@ -399,7 +440,7 @@ bool Demuxer::ReadAndSendPacket() {
         }
         return false;
     }
-    // ================= 底层物理读取异常 =================
+    // ================= 物理读取异常 =================
     else {
         std::array<char, AV_ERROR_MAX_STRING_SIZE> error_buf{0};
         av_strerror(ret, error_buf.data(), error_buf.size());

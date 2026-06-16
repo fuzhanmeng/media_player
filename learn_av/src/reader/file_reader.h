@@ -6,14 +6,13 @@
 
 #pragma once
 
-#include <atomic>
 #include <memory>
 #include <mutex>
 #include <string>
 
-#include "interface/ifile_reader.h"
 #include "interface/iaudio_decoder.h"
 #include "interface/idemuxer.h"
+#include "interface/ifile_reader.h"
 #include "interface/ivideo_decoder.h"
 
 namespace av {
@@ -42,24 +41,36 @@ public:
 
     /**
      * @brief 物理启动所有底层工作线程
-     * @details 仅在线程首次创建（或 Stop 后重新 Open）时调用。
-     * 线程启动后，将自主监听全局 PlaybackState 进行运转或休眠。
+     * @details 仅在线程首次创建（或 Stop 后重新 Open）时调用
+     * 线程启动后，将自主监听全局 PlaybackState 进行运转或休眠
      */
     void Start(std::shared_ptr<SyncContext> sync_ctx) override;
 
+    /**
+     * @brief 阶段一：下发异步终止信令 -- 非阻塞
+     */
+    void RequestStop() override;
 
     /**
-     * @brief 物理销毁底层所有工作线程并释放资源
-     * @details 执行标准的拆除流程：发送退出信号 -> 唤醒所有死锁线程 -> Join 线程 -> 释放上下文
+     * @brief 阶段二：同步等待回收线程 --阻塞
      */
-    void Stop() override;
+    void WaitForStop() override;
 
     /**
      * @brief 触发绝对时间轴跳转
-     * @param pts_seconds 目标绝对时间（单位：秒）
-     * @note 内部自动协调 Demuxer 的文件指针偏移与 Decoder 的脏数据冲刷 (Flush)
+     * @param target_time_us 目标绝对时间（单位：微秒）
      */
-    void SeekTo(double pts_seconds) override;
+    void SeekTo(int64_t target_time_us) override;
+
+    /**
+     * @brief 强制中断解码器内部的 Packet 队列阻塞，并清空遗留数据
+     */
+    void AbortAndClearDecoderQueues() override;
+
+    /**
+     * @brief 恢复解码器内部 Packet 队列的入队/出队能力
+     */
+    void StartDecoderQueues() override;
 
     /**
      * @brief 查询媒体总时长
@@ -91,17 +102,27 @@ private:
     /**
      * @brief 响应解封装器：收到压缩视频包，路由至视频解码管线
      */
-    void OnNotifyVideoPacket(std::shared_ptr<Packet> packet) override;
+    bool OnNotifyVideoPacket(std::shared_ptr<Packet> packet) override;
 
     /**
      * @brief 响应解封装器：收到压缩音频包，路由至音频解码管线
      */
-    void OnNotifyAudioPacket(std::shared_ptr<Packet> packet) override;
+    bool OnNotifyAudioPacket(std::shared_ptr<Packet> packet) override;
 
     /**
      * @brief 响应解封装器：文件物理读取完毕 (EOF)
      */
     void OnNotifyDemuxerEOF() override;
+
+    /**
+     * @brief 通知监听器（FileReader）重置下游所有的阻塞队列状态
+     */
+    void OnSeekResetQueues() override;
+
+    /**
+     * @brief 通知监听器（FileReader）底层寻址与上下文冲刷已完成，申请恢复播放
+     */
+    void OnSeekCompleteResumePlay() override;
 
     // ================= IAudioDecoder::Listener =================
     /**

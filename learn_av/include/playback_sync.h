@@ -15,8 +15,7 @@ namespace av {
 /**
  * @struct SyncContext
  * @brief 播放器全局状态同步容器
- * @details 将同步原语物理实体封装于此。通过 std::shared_ptr 在全管线（Player/Demuxer/Decoder）间共享。
- * 依靠智能指针引用计数机制，确保底层线程在访问同步原语时，物理内存始终存活，彻底杜绝野指针崩溃。
+ * @details 将同步原语物理实体封装于此,通过 std::shared_ptr 在全局（Player/Demuxer/Decoder）间共享
  */
 struct SyncContext {
     /// 全局播放状态原子实体
@@ -31,6 +30,13 @@ struct SyncContext {
     /// 跳转瞬态标志位实体
     std::atomic<bool> is_seeking_{false};
 
+    /// 跳转精确时间 (单位：微秒) - 变更为 int64_t
+    std::atomic<int64_t> target_time_us_{0};
+
+    // true: 跳转前正在播放，完成后需要自动恢复
+    // false: 跳转前处于暂停，完成后保持挂起
+    std::atomic<bool> resume_play_after_seek_{false};
+
     /**
      * @brief 构造函数
      */
@@ -41,11 +47,6 @@ struct SyncContext {
      */
     SyncContext(const SyncContext&) = delete;
     SyncContext& operator=(const SyncContext&) = delete;
-
-    /**
-     * @brief 实体化后，只要对象存在，内存即合法，此校验始终为 true
-     */
-    bool IsValid() const { return true; }
 };
 
 } // namespace av

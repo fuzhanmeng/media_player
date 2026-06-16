@@ -25,7 +25,7 @@ class IAudioDecoder {
 public:
     /**
      * @brief 解码器输出事件监听器接口
-     * @details 采用观察者模式，将解码后的原始音频帧异步推送给上层调度器 (如 FileReader)
+     * @details 采用观察者模式，将解码后的原始音频帧异步推送给上层调度器 (FileReader)
      */
     class Listener {
     public:
@@ -96,17 +96,31 @@ public:
     virtual void Start(std::shared_ptr<SyncContext> sync_ctx) = 0;
 
     /**
-     * @brief 停止解码线程并释放相关 I/O 与内存资源
-     * @details 立即下发中断信令，唤醒并 Join 解码线程，清空所有未处理的数据包与已解码帧
+     * @brief 阶段一：下发异步终止信令 -- 非阻塞
      */
-    virtual void Stop() = 0;
+    virtual void RequestStop() = 0;
 
     /**
-     * @brief 冲刷 (Flush) 解码器内部缓存
+     * @brief 阶段二：同步等待回收线程 -- 阻塞
+     */
+    virtual void WaitForStop() = 0;
+
+    /**
+     * @brief Flush解码器内部缓存
      * @details 清空输入/输出队列与解码器底层的参考帧缓冲区，重置解码状态机
      * 主要配合时间轴跳转 (Seek) 使用，防止残留的脏数据导致杂音或音画不同步
      */
     virtual void Flush() = 0;
+
+    /**
+     * @brief 清空队列，唤醒阻塞
+     */
+    virtual void AbortAndClearQueue() = 0;
+
+    /**
+     * @brief 启动队列
+     */
+    virtual void StartQueue() = 0;
 };
 
 } // namespace av

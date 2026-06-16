@@ -1,9 +1,8 @@
 /**
  * @file ivideo_sink.h
  * @brief 视频渲染输出端标准抽象接口
- * @details 定义了媒体管线向表现层投递数据帧的统一契约。
- * 通过本接口，核心业务逻辑模块 (Player) 与 UI 渲染实现实现了彻底的解耦。
- * 业务模块无需感知具体的渲染实现细节，仅需将 VideoFrame 投递至 Sink。
+ * @details 通过本接口，核心业务逻辑模块 (Player) 与 UI 渲染实现实现了彻底的解耦
+ * 业务模块无需感知具体的渲染实现细节，仅需将 VideoFrame 投递至 Sink
  */
 
 #pragma once
@@ -16,8 +15,7 @@ struct VideoFrame;
 
 /**
  * @class IVideoSink
- * @brief 视频数据接收端接口 (Rendering Sink)
- * @note 属于表现层（Presentation Layer）的锚点接口
+ * @brief 视频数据接收端接口
  */
 class IVideoSink {
 public:
