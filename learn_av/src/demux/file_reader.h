@@ -7,13 +7,12 @@
 #pragma once
 
 #include <memory>
-#include <mutex>
 #include <string>
 
-#include "interface/iaudio_decoder.h"
+#include "decode/interface/iaudio_decoder.h"
 #include "interface/idemuxer.h"
 #include "interface/ifile_reader.h"
-#include "interface/ivideo_decoder.h"
+#include "decode/interface/ivideo_decoder.h"
 
 namespace av {
 struct SyncContext;
@@ -75,7 +74,7 @@ public:
     /**
      * @brief 查询媒体总时长
      */
-    double GetDuration() const override;
+    int64_t GetDuration() const override;
 
     /**
      * @brief 获取图像物理宽度
@@ -86,6 +85,16 @@ public:
      * @brief 获取图像物理高度
      */
     int GetVideoHeight() const override;
+
+    /**
+     * @brief 是否含有音频轨道
+     */
+    bool HasAduio() const override;
+
+    /**
+     * @brief 是否含有视频轨道
+     */
+    bool HasVideo() const override;
 
 private:
     // ================= IDemuxer::Listener =================
@@ -130,21 +139,11 @@ private:
      */
     void OnNotifyAudioFrame(std::shared_ptr<Frame> frame) override;
 
-    /**
-     * @brief 响应音频解码器：音频缓存全部排空 (Audio EOF)
-     */
-    void OnNotifyAudioEOF() override;
-
     // ================= IVideoDecoder::Listener  =================
     /**
      * @brief 响应视频解码器：输出纯净 YUV/RGB 帧，向上透传给 Player
      */
     void OnNotifyVideoFrame(std::shared_ptr<av::VideoFrame> frame) override;
-
-    /**
-     * @brief 响应视频解码器：视频缓存全部排空 (Video EOF)
-     */
-    void OnNotifyVideoEOF() override;
 
 private:
     // 向上层抛数据的通讯管道
@@ -161,12 +160,6 @@ private:
     int video_width_{0};
     int video_height_{0};
     double duration_{0.0};
-
-    // EOF 跟踪状态机：精确控制什么时候才算真正播放完毕
-    std::mutex eof_mutex_;
-    bool demuxer_eof_received_{false};
-    bool audio_eof_received_{false};
-    bool video_eof_received_{false};
 };
 
 } // namespace av

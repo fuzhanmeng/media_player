@@ -17,9 +17,21 @@ namespace av {
 
 class SDLAudioSpeaker : public IAudioSpeaker {
 public:
+    /**
+     * @brief 构造函数
+     */
     SDLAudioSpeaker();
-    ~SDLAudioSpeaker() override;
 
+    /**
+     * @brief 析构函数
+     */
+    ~SDLAudioSpeaker();
+
+    /**
+     * @brief 注册监听回调
+     */
+    void SetListener(Listener* listener) override;
+    
     /**
      * @brief 初始化扬声器硬件
      * @param sample_rate 目标采样率 (例如 44100)
@@ -81,6 +93,11 @@ public:
      */
     double GetAudioClock() const override;
 
+    /**
+     * @brief 重置时钟（用于跳转时进度条更新）
+     */
+    void ResetAlock() override;
+
 private:
     /**
      * @brief SDL 硬件底层静态回调函数
@@ -112,6 +129,8 @@ private:
 
     // 设计原则：内部计算全部使用整数，对外提供浮点接口
     std::atomic<int64_t> audio_clock_us_{-1};
+
+    Listener* listener_{nullptr};
 };
 
 } // namespace av

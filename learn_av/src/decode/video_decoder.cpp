@@ -48,10 +48,7 @@ VideoDecoder::~VideoDecoder() {
 /**
  * @brief 解码器创建
  */
-std::unique_ptr<IVideoDecoder> IVideoDecoder::Create() {
-    LOG_INFO("VideoDecoder Create...");
-    return std::make_unique<VideoDecoder>();
-}
+std::unique_ptr<IVideoDecoder> IVideoDecoder::Create() { return std::make_unique<VideoDecoder>(); }
 
 /**
  * @brief 设置下游监听器
@@ -160,25 +157,29 @@ void VideoDecoder::SendEOF() {
  * @param sync_ctx 注入全局状态同步上下文
  */
 void VideoDecoder::Start(std::shared_ptr<SyncContext> sync_ctx) {
-    LOG_INFO("========== VideoDecoder::Start ==========");
-    // 1. 判断要不要启动新的解码线程 (看物理 OS 线程是否存在)
-    if (decode_thread_.joinable()) {
+    // 1. 防止线程重入
+    if (!is_abort_requested_.load()) {
         LOG_WARN("Video Decoder thread is already running.");
         return;
     }
 
-    // 2. 清空历史脏包，启动队列
+    // 2. 回收上次可能遗留的线程句柄
+    if (decode_thread_.joinable()) {
+        decode_thread_.join();
+    }
+
+    // 3. 设置线程标志
+    is_abort_requested_.store(false);
+
+    // 4. 清空&&启动队列
     packet_queue_.Clear();
     packet_queue_.Start();
 
-    // 3. 保存全局同步状态
+    // 5. 保存全局同步状态
     sync_ctx_ = std::move(sync_ctx);
 
-    // 4. 业务生命周期状态复位
-    is_abort_requested_.store(false);
-
-    // 5. 启动真正的解码线程
-    decode_thread_ = std::thread(&VideoDecoder::DecodeLoop, this);
+    // 6. 启动真正的解码线程
+    decode_thread_ = std::thread(&VideoDecoder::ThreadLoop, this);
 
     LOG_INFO("Video Decoder OS thread start successfully...");
 }
@@ -192,18 +193,16 @@ void VideoDecoder::RequestStop() {
         return;
     }
 
-    // 2. 下发中断带外信令
+    // 2. 下发终止信令
     is_abort_requested_.store(true);
 
-    // 3. 通知其他模块视频解码线程停止，唤醒可能挂起的条件变量
+    // 3. 唤醒阻塞在 state_cv_ 上的线程（阶段A）
     if (sync_ctx_) {
         sync_ctx_->state_cv_.notify_all();
     }
 
-    // 4. 强行中断可能阻塞在数据队列 Push/Pop 操作上的线程
+    // 4. 唤醒阻塞在 packet_queue_.Pop() 上的线程（阶段B）
     packet_queue_.Abort();
-
-    LOG_INFO("========== VideoDecoder::RequestStop ==========");
 }
 
 /**
@@ -214,18 +213,11 @@ void VideoDecoder::WaitForStop() {
     if (decode_thread_.joinable()) {
         decode_thread_.join();
     }
-
-    // 2. 状态复位与残余数据清理
-    packet_queue_.Clear();
-    is_abort_requested_.store(false);
-    sync_ctx_.reset();
-
-    LOG_INFO("========== VideoDecoder::WaitForStop ==========");
 }
 
 /**
  * @brief 执行物理层面的解码器内部状态冲刷
- * @note 仅允许在解码工作线程 (DecodeLoop) 内部捕获到 kFlush 信令包时调用
+ * @note 仅允许在解码工作线程 (ThreadLoop) 内部捕获到 kFlush 信令包时调用
  */
 void VideoDecoder::Flush() {
     std::lock_guard<std::mutex> lock(codec_mutex_);
@@ -257,7 +249,6 @@ void VideoDecoder::Close() {
         av_codec_ctx_ = nullptr;
     }
     packet_queue_.Clear();
-    LOG_INFO("========== VideoDecoder::Close ==========");
 }
 
 /**
@@ -265,8 +256,10 @@ void VideoDecoder::Close() {
  * @details 负责从 Demuxer 接收压缩比特流，驱动底层硬件/软件解码引擎，
  * 并在无锁环境下执行内存剥离对齐与下游路由投递。
  */
-void VideoDecoder::DecodeLoop() {
-    LOG_INFO("VideoDecoder DecodeLoop started...");
+void VideoDecoder::ThreadLoop() {
+    if (!sync_ctx_) {
+        return;
+    }
 
     // [阶段 0]: 申请一个 AVFrame 临时变量作为输出容器
     AVFrame* av_frame = av_frame_alloc();
@@ -278,17 +271,14 @@ void VideoDecoder::DecodeLoop() {
     // 主事件循环：生命周期校验
     while (!is_abort_requested_.load()) {
         // [阶段 A]: 线程调度与管线挂起控制
+        //   1. 收到终止请求（is_abort_）
+        //   2. 发生跳转（is_seeking_），需要处理 Flush 包
+        //   3. 处于播放状态（kPlaying）
         {
             std::unique_lock<std::mutex> lock(sync_ctx_->state_mutex_);
-
-            // 1. 线程停止
-            // 2. 发生了跳转
-            // 3. 处于播放状态
-            // 4. 全局Stop
             sync_ctx_->state_cv_.wait(lock, [this]() {
                 return is_abort_requested_.load() || sync_ctx_->is_seeking_.load() ||
-                    sync_ctx_->state_.load() == PlaybackState::kPlaying ||
-                    sync_ctx_->state_.load() == PlaybackState::kStopped;
+                    sync_ctx_->state_.load() == PlaybackState::kPlaying;
             });
         }
 
@@ -300,11 +290,9 @@ void VideoDecoder::DecodeLoop() {
         // [阶段 B]: 阻塞式提取视频
         std::shared_ptr<Packet> packet;
         if (!packet_queue_.Pop(packet)) {
-            if (is_abort_requested_.load() || sync_ctx_->state_.load() == PlaybackState::kStopped) {
+            if (is_abort_requested_.load()) {
                 break;
             }
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
         }
 
@@ -355,7 +343,15 @@ void VideoDecoder::DecodeLoop() {
                 // 解码管线彻底排空
                 if (listener_) {
                     LOG_INFO("Video decoding reached physical EOF.");
-                    listener_->OnNotifyVideoEOF();
+
+                    // 创建一个空帧
+                    auto eof_frame = std::make_shared<VideoFrame>(0, 0);
+                    eof_frame->AddFlag(AVFrameFlag::kEOF);
+
+                    // 传给音画同步模块
+                    if (listener_) {
+                        listener_->OnNotifyVideoFrame(std::move(eof_frame));
+                    }
                 }
                 break;
             } else if (ret < 0) {
@@ -377,7 +373,7 @@ void VideoDecoder::DecodeLoop() {
     // [阶段 0 的闭环]: 销毁物理内存载体，防范堆内存泄漏
     av_frame_free(&av_frame);
 
-    LOG_INFO("VideoDecoder DecodeLoop exited safely.");
+    LOG_INFO("VideoDecoder ThreadLoop exited safely.");
 }
 
 /**

@@ -12,6 +12,22 @@ namespace av {
 
 class IAudioSpeaker {
 public:
+
+    /**
+     * @brief 扬声器监听回调
+     */
+    class Listener {
+        public: 
+
+        virtual ~Listener() = default;
+
+        /**
+         * @brief 宣告音频彻底播放完毕
+         * @details 当扬声器从队列中取出带有 kEOF 标志的空帧时触发
+         */
+        virtual void OnAudioCompleted() = 0;
+    };
+
     /**
      * @brief 创建音频播放类实例
      */
@@ -21,6 +37,12 @@ public:
      * @brief 析构函数
      */
     virtual ~IAudioSpeaker() = default;
+
+    /**
+     * @brief 注册事件监听器
+     * @param listener 实现了 Listener 接口的上层对象 (通常是 Player)
+     */
+    virtual void SetListener(Listener* listener) = 0;
 
     /**
      * @brief 初始化扬声器硬件
@@ -61,7 +83,6 @@ public:
      */
     virtual void Abort() = 0;
 
-
     /**
      * @brief 清空队列，唤醒阻塞
      */
@@ -71,7 +92,6 @@ public:
      * @brief 启动队列
      */
     virtual void StartQueue() = 0;
-
 
     /**
      * @brief 获取当前精准的音频播放时钟（微秒）
@@ -84,6 +104,11 @@ public:
      * @note 用于UI显示
      */
     virtual double GetAudioClock() const = 0;
+
+    /**
+     * @brief 重置时钟（用于跳转时进度条更新）
+     */
+    virtual void ResetAlock() = 0;
 };
 
 } // namespace av

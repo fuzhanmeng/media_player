@@ -8,7 +8,7 @@ namespace av {
 enum AVFrameFlag {
     kNone = 0,
     kFlush = 1 << 0, // 遇到这个标志，表示发生了 Seek 跳转，下游需要清空历史缓存
-    kEOS = 1 << 1, // 数据流结束
+    kEOF = 1 << 1, // 数据流结束
 };
 
 // 位或：组合多个标志，如 kFlush | kEOS

@@ -37,11 +37,6 @@ public:
          * @param frame 包含 YUV/RGBA 连续内存与物理参数的智能指针
          */
         virtual void OnNotifyVideoFrame(std::shared_ptr<VideoFrame> frame) = 0;
-
-        /**
-         * @brief 视频流彻底解码结束的回调
-         */
-        virtual void OnNotifyVideoEOF() = 0;
     };
 
     /**

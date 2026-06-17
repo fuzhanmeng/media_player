@@ -67,7 +67,19 @@ public:
      * @brief 获取当前媒体容器的全局总时长
      * @return 总时长（单位：秒）
      */
-    double GetDuration() const override;
+    int64_t GetDuration() const override;
+
+    /**
+     * @brief 探测当前媒体是否包含视频流
+     * @return 存在视频流返回 true，否则返回 false
+     */
+    bool HasVideo() const override;
+
+    /**
+     * @brief 探测当前媒体是否包含音频流
+     * @return 存在音频流返回 true，否则返回 false
+     */
+    bool HasAudio() const override;
 
 private:
     /**
@@ -111,7 +123,7 @@ private:
 
     // 线程与并发控制原语
     std::thread demuxer_thread_;
-    std::atomic<bool> is_abort_requested_{false}; ///< 线程生命周期终结信令
+    std::atomic<bool> is_abort_requested_{true}; ///< 线程生命周期终结信令
 
     // 保存来自Player的的同步上下文
     std::shared_ptr<SyncContext> sync_ctx_;

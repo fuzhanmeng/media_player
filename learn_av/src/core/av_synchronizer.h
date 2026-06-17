@@ -65,7 +65,7 @@ public:
      * @brief 刷新跳转后的队列
      */
     void Flush() override;
-    
+
     /**
      * @brief 清空队列，唤醒阻塞
      */
@@ -81,6 +81,13 @@ public:
      * @param video_frame 上游解码器产出的纯净视频帧 DTO
      */
     void PushVideoFrame(std::shared_ptr<VideoFrame> video_frame) override;
+
+    /**
+     * @brief 通知音画同步器：音频流已播放完毕
+     * @details 由 Player::OnAudioCompleted 调用
+     *          AVSync 内部据此区分"SDL 过渡期"和"音频永久停止"两种情况
+     */
+    void NotifyAudioFinished() override;
 
 private:
     /**
@@ -109,13 +116,19 @@ private:
     std::thread sync_thread_;
 
     /// 线程物理死亡标志位
-    std::atomic<bool> is_abort_{false};
+    std::atomic<bool> is_abort_{true};
 
     /// 强制渲染单帧，解决暂停态拖动无画面的问题
     std::atomic<bool> force_render_{false};
 
     /// 同步阈值：25ms = 25000 微秒
     const int64_t kSyncThresholdUs = 25000;
+
+    /// 替代 ThreadLoop 内的 static 变量，这样每次 Start() 时可以重置
+    std::chrono::steady_clock::time_point last_render_log_time_;
+
+    // 音频是否已永久停止 - SDL 收到 EOF 后由外部设置
+    std::atomic<bool> audio_finished_{false};
 };
 
 } // namespace av

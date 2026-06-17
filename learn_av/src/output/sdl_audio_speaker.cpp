@@ -22,6 +22,11 @@ namespace av {
 std::unique_ptr<IAudioSpeaker> IAudioSpeaker::Create() { return std::make_unique<SDLAudioSpeaker>(); }
 
 /**
+ * @brief 设置下游监听器
+ */
+void SDLAudioSpeaker::SetListener(Listener* listener) { listener_ = listener; }
+
+/**
  * @brief 构造函数
  */
 SDLAudioSpeaker::SDLAudioSpeaker() {}
@@ -135,7 +140,7 @@ void SDLAudioSpeaker::PushAudioFrame(std::shared_ptr<Frame> audio_frame) {
         return;
     }
 
-    // 拦截带内 Flush 信令
+    // 1. 如果是 Flush 信令
     if (audio_frame->HasFlag(av::AVFrameFlag::kFlush)) {
         LOG_DEBUG("SDLAudioSpeaker intercepted IN-BAND Flush signal. Executing hardware reset.");
 
@@ -167,10 +172,19 @@ void SDLAudioSpeaker::PushAudioFrame(std::shared_ptr<Frame> audio_frame) {
         return;
     }
 
+    // 2. 如果是 EOF 信令
+    if (audio_frame->HasFlag(AVFrameFlag::kEOF)) {
+        audio_queue_.Push(std::move(audio_frame));
+        return;
+    }
+
+    // 3. 如果 音频帧帧无效
     if (audio_frame->IsEmpty()) {
         LOG_WARN("SDLAudioSpeaker received empty audio frame");
         return;
     }
+
+    // 4. 入队
     audio_queue_.Push(std::move(audio_frame));
 }
 
@@ -227,6 +241,17 @@ double SDLAudioSpeaker::GetAudioClock() const {
 }
 
 /**
+ * @brief 重置时钟（用于跳转时进度条更新）
+ */
+void SDLAudioSpeaker::ResetAlock() {
+    std::lock_guard<std::mutex> lock(sync_mutex_);
+    audio_clock_us_.store(-1);
+
+    current_frame_ = nullptr;
+    current_frame_offset_ = 0;
+}
+
+/**
  * @brief SDL 硬件底层回调函数
  * @note 运行在 SDL 独立的后台高级优先级线程中
  */
@@ -274,6 +299,21 @@ void SDLAudioSpeaker::FillAudioData(Uint8* stream, int len) {
             current_frame_offset_ = 0;
         }
 
+        // 处理 EOF
+        if (current_frame_->HasFlag(AVFrameFlag::kEOF)) {
+            LOG_INFO("SDL Receive EOF");
+
+            if (listener_) {
+                listener_->OnAudioCompleted();
+            }
+
+            audio_clock_us_.store(-1);
+            current_frame_ = nullptr;
+
+            SDL_PauseAudioDevice(audio_device_id_, -1);
+            return;
+        }
+
         // 更新全局音频时钟
         if (current_frame_ && current_frame_->IsValid()) {
             // 1. 获取这一帧的起始时间 - 微秒
@@ -292,7 +332,7 @@ void SDLAudioSpeaker::FillAudioData(Uint8* stream, int len) {
 
             // 5. 当前精准音频时钟 = 帧起始时间 + (帧总时长 * 已消耗占比)
             int64_t current_exact_clock_us =
-                base_pts_us + static_cast<int64_t>(frame_duration_us) * static_cast<int64_t>(consumed_ratio);
+                base_pts_us + static_cast<int64_t>(static_cast<double>(frame_duration_us) * consumed_ratio);
 
             // 6. 更新给全局，供视频线程读取
             audio_clock_us_.store(current_exact_clock_us);

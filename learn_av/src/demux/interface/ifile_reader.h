@@ -33,24 +33,20 @@ public:
         virtual void OnFileReaderNotifyVideoFrame(std::shared_ptr<VideoFrame> video_frame) = 0;
 
         /**
-         * @brief Audio 读到了末尾
-         */
-        virtual void OnFileReaderNotifyAudioFinished() = 0;
-
-        /**
-         * @brief Video 读到了末尾
-         */
-        virtual void OnFileReaderNotifyVideoFinished() = 0;
-
-        /**
-         * @brief 通知上层重置所有相关数据队列的状态标志
+         * @brief 通知上层Player，重置所有相关数据队列的状态标志
          */
         virtual void OnFileReaderSeekResetQueues() = 0;
 
         /**
-         * @brief 通知上层底层 Seek 操作已完成，申请恢复播放状态
+         * @brief 通知上层Player，底层 Seek 操作已完成，申请恢复播放状态
          */
         virtual void OnFileReaderSeekCompleteResumePlay() = 0;
+
+        /**
+         * @file ifile_reader.h
+         * @brief 通知上层Player，传递获取到的采样率/声道数传递
+         */
+        virtual void OnFileReaderAudioInfo(int sample_rate, int channels) = 0;
     };
 
     /**
@@ -107,7 +103,7 @@ public:
     /**
      * @brief 查询媒体总时长
      */
-    virtual double GetDuration() const = 0;
+    virtual int64_t GetDuration() const = 0;
 
     /**
      * @brief 获取图像宽度
@@ -118,5 +114,15 @@ public:
      * @brief 获取图像高度
      */
     virtual int GetVideoHeight() const = 0;
+
+    /**
+     * @brief 是否含有音频轨道
+     */
+    virtual bool HasAduio() const = 0;
+
+    /**
+     * @brief 是否含有视频轨道
+     */
+    virtual bool HasVideo() const = 0;
 };
 } // namespace av

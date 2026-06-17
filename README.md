@@ -161,54 +161,59 @@ ai-media-player/
 │   │   ├── iplayer.h        # 播放器核心接口
 │   │   └── logger.h         # 日志系统接口
 │   └── src/                 # 音视频全链路核心源码
-│       ├── core/            # 核心协调层
-│       │   ├── player.cpp   # 播放器核心实现（状态机管理）
-│       │   ├── player.h
-│       │   ├── av_synchronizer.cpp # 音画同步器（解决音视频不同步问题）
-│       │   ├── av_synchronizer.h
-│       │   ├── audio_pipeline.cpp # 音频处理管线（音量调节、均衡器等）
-│       │   ├── audio_pipeline.h
-│       │   ├── video_pipeline.cpp # 视频处理管线（缩放、格式转换等）
-│       │   └── video_pipeline.h
-│       ├── reader/          # 媒体输入读取模块
-│       │   ├── file_reader.cpp # 文件读取器（解复用+解码器组合封装）
-│       │   ├── file_reader.h
-│       │   ├── demuxer.cpp  # 解复用器（分离音视频数据包）
-│       │   ├── demuxer.h
-│       │   ├── audio_decoder.cpp # 音频解码器
-│       │   ├── audio_decoder.h
-│       │   ├── video_decoder.cpp # 视频解码器
-│       │   └── video_decoder.h
-│       ├── writer/          # 媒体输出写入模块（录制功能，可先空着）
-│       │   ├── file_writer.cpp
-│       │   └── file_writer.h
-│       ├── define/          # 数据结构定义（纯数据，无任何逻辑）
-│       │   ├── av_error.h   # 错误码定义
-│       │   ├── av_packet.h  # 压缩数据包结构（FFmpeg AVPacket封装）
-│       │   ├── av_frame.h   # 原始帧基类
-│       │   ├── audio_samples.h # 音频样本结构（PCM数据）
-│       │   └── video_frame.h # 视频帧结构（YUV/RGB数据）
-│       ├── interface/       # 模块间内部接口（不对外暴露）
-│       │   ├── ifile_reader.h
-│       │   ├── ifile_writer.h
-│       │   ├── idemuxer.h
-│       │   ├── idemuxer_listener.h
-│       │   ├── iaudio_decoder.h
-│       │   ├── ivideo_decoder.h
-│       │   ├── iaudio_pipeline.h
-│       │   ├── ivideo_pipeline.h
-│       │   ├── iaudio_speaker.h
-│       │   └── ivideo_display_view.h
-│       ├── utils/           # 通用工具类（无业务逻辑）
-│       │   ├── logger.cpp
-│       │   ├── thread_safe_queue.h # 线程安全队列（跨线程数据传递核心）
-│       │   ├── sync_notifier.cpp # 跨线程同步通知器
-│       │   ├── sync_notifier.h
-│       │   ├── task_pool.cpp # 通用任务池（GL资源销毁专用）
-│       │   └── task_pool.h
-│       └── output/          # 输出设备抽象层
-│           ├── audio_speaker.cpp # 音频扬声器（SDL/ALSA实现）
-│           └── audio_speaker.h
+│           ├── core
+│           │   ├── av_synchronizer.cpp   # 音画同步器（解决音视频不同步问题）
+│           │   ├── av_synchronizer.h
+│           │   ├── player.cpp            # 播放器核心实现（状态机管理）
+│           │   └── player.h
+│           ├── decode                    # 音视频编码
+│           │   ├── audio_decoder.cpp
+│           │   ├── audio_decoder.h
+│           │   ├── interface             # 纯虚接口
+│           │   │   ├── iaudio_decoder.h
+│           │   │   └── ivideo_decoder.h
+│           │   ├── video_decoder.cpp
+│           │   └── video_decoder.h
+│           ├── define                    # 数据结构定义
+│           │   ├── av_error.h
+│           │   ├── av_frame.h
+│           │   ├── av_packet.h
+│           │   └── stream_info.h
+│           ├── demux                     # 解复用
+│           │   ├── demuxer.cpp
+│           │   ├── demuxer.h
+│           │   ├── file_reader.cpp
+│           │   ├── file_reader.h
+│           │   └── interface
+│           │       ├── idemuxer.h
+│           │       └── ifile_reader.h
+│           ├── encode                    # 音视频编码
+│           │   ├── audio_encoder.cpp
+│           │   ├── audio_encoder.h
+│           │   ├── interface
+│           │   │   ├── iaudio_encoder.h
+│           │   │   └── ivideo_encoder.h
+│           │   ├── video_encoder.cpp
+│           │   └── video_encoder.h
+│           ├── interface                 # 音画同步/音频播放纯虚接口
+│           │   ├── iaudio_speaker.h
+│           │   └── iav_synchronizer.h
+│           ├── mux                       # 复用
+│           │   ├── interface
+│           │   │   └── imuxer.h
+│           │   ├── muxer.cpp
+│           │   └── muxer.h
+│           ├── output                    # 音频输出
+│           │   ├── sdl_audio_speaker.cpp
+│           │   └── sdl_audio_speaker.h
+│           ├── utils                     # 通用工具类
+│           │   ├── logger.cpp
+│           │   └── thread_safe_queue.h
+│           └── writer                    
+│               ├── file_writer.cpp 
+│               ├── file_writer.h
+│               └── interface
+│                   └── ifile_writer.h    
 ├── qt/                      # 界面交互层（仅负责UI，无任何音视频处理逻辑）
 │   ├── main.cpp             # 程序全局入口
 │   ├── main_window.cpp      # 主窗口协调器

@@ -11,8 +11,6 @@
 #include <QPushButton> // 按钮
 #include <QSlider> // 滑块部件
 
-#include "logger.h"
-
 /**
  * @brief 构造函数实现
  * @param parent 父级窗口指针
@@ -23,8 +21,6 @@ ControllerWidget::ControllerWidget(QWidget* parent) : QWidget(parent) {
 
     // 2. 调用专门的 UI 组装函数
     SetupUI();
-
-    LOG_INFO("ControllerWidget initialized.");
 }
 
 /**
@@ -84,13 +80,21 @@ void ControllerWidget::SetPlayState(bool is_playing) {
 
 /**
  * @brief 设置时间文本显示
+ * @param current_sec 当前时间（单位：秒）
+ * @param total_sec   总时长（单位：秒）
  */
-void ControllerWidget::SetTimeDisplay(float current_time, float total_time) {
+void ControllerWidget::SetTimeDisplay(int64_t current_sec, int64_t total_sec) {
+    // 保护性归零，防止出现负数时间
+    if (current_sec < 0)
+        current_sec = 0;
+    if (total_sec < 0)
+        total_sec = 0;
+
     // 将秒数转换为 分:秒 格式
-    int cur_m = static_cast<int>(current_time) / 60;
-    int cur_s = static_cast<int>(current_time) % 60;
-    int tot_m = static_cast<int>(total_time) / 60;
-    int tot_s = static_cast<int>(total_time) % 60;
+    int cur_m = static_cast<int>(current_sec / 60);
+    int cur_s = static_cast<int>(current_sec % 60);
+    int tot_m = static_cast<int>(total_sec / 60);
+    int tot_s = static_cast<int>(total_sec % 60);
 
     // 格式化为 00:00 / 00:00 的字符串
     QString timeStr = QString::asprintf("%02d:%02d / %02d:%02d", cur_m, cur_s, tot_m, tot_s);
@@ -105,16 +109,21 @@ void ControllerWidget::SetSliderProgress(float progress) {
     if (!m_sliderProgress)
         return;
 
+    // 防御底层抢夺鼠标控制权
+    // 如果用户当前正在按住滑块进行拖拽，必须完全无视底层发来的进度更新，让鼠标拥有 100% 的控制权
+    if (m_sliderProgress->isSliderDown()) {
+        return; 
+    }
+
     // 计算实际应该设置的值 (0 ~ 1000)
     int value = static_cast<int>(progress * 1000.0f);
 
-    // 如果直接 setValue，会触发 QSlider 自己的 valueChanged 信号，这可能导致死循环或者误触发 Seek 事件 因此，在被动更新
-    // UI 时，必须暂时堵住屏蔽信号
+    // 如果直接 setValue，会触发 QSlider 自己的 valueChanged 信号，这可能导致死循环或者误触发 Seek 事件
+    // 因此，在被动更新 UI 时，必须暂时堵住屏蔽信号
     m_sliderProgress->blockSignals(true); // 信号屏蔽
-    m_sliderProgress->setValue(value); // 修改数值
+    m_sliderProgress->setValue(value);    // 修改数值
     m_sliderProgress->blockSignals(false); // 解除屏蔽
 }
-
 // ================= 内部响应 UI 物理点击的槽函数 =================
 
 /**
@@ -132,11 +141,9 @@ void ControllerWidget::onPlayPauseButtonClicked() {
     // 根据当前记录的状态，决定执行哪个操作
     if (m_isPlaying) {
         // 当前在播放，用户点击意味着他想暂停
-        LOG_INFO("=================== Pause ===================");
         emit sigPauseClicked();
     } else {
         // 当前在暂停，用户点击意味着他想播放
-        LOG_INFO("=================== Play ===================");
         emit sigPlayClicked();
     }
 }

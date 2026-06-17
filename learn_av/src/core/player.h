@@ -5,13 +5,15 @@
  */
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "interface/iav_synchronizer.h"
-#include "interface/ifile_reader.h"
+#include "demux/interface/ifile_reader.h"
 #include "iplayer.h"
 #include "output/sdl_audio_speaker.h"
 #include "playback_state.h"
@@ -28,7 +30,7 @@ class VideoFrame;
  * @inherit IPlayer 面向 UI 层的标准播放控制契约
  * @inherit IFileReader::Listener 底层音视频纯净帧数据的唯一合法接收通道
  */
-class Player : public IPlayer, public IFileReader::Listener, public IAVSynchronizer::Listener {
+class Player : public IPlayer, public IFileReader::Listener, public IAVSynchronizer::Listener, public IAudioSpeaker::Listener {
 public:
     explicit Player(std::shared_ptr<IGLContext> gl_context);
     ~Player() override;
@@ -74,18 +76,18 @@ public:
 
     /**
      * @brief 触发媒体物理时间轴跳转 (Seek)
-     * @param target_time_sec 目标绝对时间（单位：秒）
+     * @param target_time_us 目标绝对时间（单位：微秒）
      * @note Pause -> Flush -> Seek -> 状态恢复 的多线程安全时序
      */
-    void SeekTo(double target_time_sec) override;
+    void SeekTo(int64_t target_time_us) override;
 
     // ================= 状态查询与事件订阅 =================
 
     /**
      * @brief 获取当前媒体全局总时长
-     * @return 总时长（单位：秒）。若是直播流或未就绪，返回 0.0
+     * @return 总时长（单位：微秒），若是直播流或未就绪，返回 0
      */
-    double GetDuration() const override;
+    int64_t GetDuration() const override;
 
     /**
      * @brief 获取图像物理宽度
@@ -108,8 +110,6 @@ public:
     void SetListener(IPlayer::Listener* listener) override;
 
 private:
-    // ================= IFileReader::Listener 数据上行接口实现 =================
-
     /**
      * @brief 接收底层解码输出的纯净 PCM 音频帧
      * @param audio_frame 包含采样率、声道数等物理参数的音频数据 DTO
@@ -128,26 +128,30 @@ private:
     void OnSyncNotifyVideoFrame(std::shared_ptr<VideoFrame> video_frame) override;
 
     /**
-     * @brief 音频物理管线彻底枯竭 (Audio EOF)
-     * @details 底层音频解码器内部残留帧已全部排空
+     * @brief 音画同步收到了EOF包
      */
-    void OnFileReaderNotifyAudioFinished() override;
+    void OnSyncCompleted() override;
 
     /**
-     * @brief 视频物理管线彻底枯竭 (Video EOF)
-     * @details 底层视频解码器内部残留帧已全部排空
+     * @file player.h
+     * @brief Description
      */
-    void OnFileReaderNotifyVideoFinished() override;
+    void OnAudioCompleted() override;
 
     /**
-     * @brief 通知上层重置所有相关数据队列的状态标志
+     * @brief 重置所有相关数据队列的状态标志
      */
     void OnFileReaderSeekResetQueues() override;
 
     /**
-     * @brief 通知上层底层 Seek 操作已完成，申请恢复播放状态
+     * @brief 底层 Seek 操作已完成，申请恢复播放状态
      */
     void OnFileReaderSeekCompleteResumePlay() override;
+
+    /**
+     * @brief 接收获取到的采样率和声道数，启动SDL音频播放功能
+     */
+    void OnFileReaderAudioInfo(int sample_rate, int channels) override;
 
     // ================= 内部控制逻辑 =================
 
@@ -158,6 +162,15 @@ private:
      */
     void ChangeState(PlaybackState new_state);
 
+    /**
+     * @brief 心跳循环函数（用于进度条回调显示）
+     */
+    void ProgressLoop();
+
+    /**
+     * @brief 检查音频和视频是否EOF
+     */
+    void CheckAndNotifyPlaybackCompleted();
 private:
     // ================= 核心基础设施 =================
 
@@ -189,6 +202,20 @@ private:
 
     /// 音画同步实例
     std::unique_ptr<IAVSynchronizer> av_sync_{nullptr};
+
+    // 心跳循环线程（用于进度条回调显示）
+    std::thread progress_thread_;
+    std::atomic<bool> is_progress_thread_running_{false};
+
+    // 记录文件是否包含对应轨道
+    std::atomic<bool> has_video_{false};
+    std::atomic<bool> has_audio_{false};
+
+    // 记录对应轨道是否已经播放到了 EOF
+    std::atomic<bool> video_finished_{false};
+    std::atomic<bool> audio_finished_{false};
+
+
 };
 
 } // namespace av
