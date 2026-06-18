@@ -161,7 +161,7 @@ int FileReader::GetVideoHeight() const { return video_height_; }
 /**
  * @brief 是否含有音频轨道
  */
-bool FileReader::HasAduio() const { return demuxer_ ? demuxer_->HasAudio() : false; }
+bool FileReader::HasAudio() const { return demuxer_ ? demuxer_->HasAudio() : false; }
 
 /**
  * @brief 是否含有视频轨道

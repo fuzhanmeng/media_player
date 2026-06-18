@@ -174,8 +174,8 @@ private:
 private:
     // ================= 核心基础设施 =================
 
-    /// 面向 UI 层的事件监听器 (采用裸指针，严格防止循环依赖)
-    IPlayer::Listener* listener_{nullptr};
+    /// 面向 UI 层的事件监听器 (采用原子裸指针，严格防止循环依赖；原子化以消除 UI 销毁与后台线程回调的数据竞争)
+    std::atomic<IPlayer::Listener*> listener_{nullptr};
 
     /// 硬件 OpenGL 上下文句柄 (用于后续初始化 VideoPipeline 渲染管线)
     std::shared_ptr<IGLContext> gl_context_{nullptr};

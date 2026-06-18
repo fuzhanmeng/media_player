@@ -102,10 +102,19 @@ private:
     void ProcessSeek();
 
     /**
-     * @brief 执行底层裸包提取与跨模块派发
-     * @return true 代表循环继续；false 代表触发 EOF 或严重物理读取异常
+     * @brief 单次读包结果
      */
-    bool ReadAndSendPacket();
+    enum class ReadResult {
+        kOk,        ///< 成功读取并派发一个 Packet（或被下游 Abort 丢弃），循环继续
+        kEof,       ///< 物理到达文件末尾，进入 EOF 挂起
+        kTransient, ///< 可恢复的临时读取错误，短暂退避后重试，不应误判为 EOF
+    };
+
+    /**
+     * @brief 执行底层裸包提取与跨模块派发
+     * @return ReadResult 读取结果状态码
+     */
+    ReadResult ReadAndSendPacket();
 
 private:
     // 下游总线监听器

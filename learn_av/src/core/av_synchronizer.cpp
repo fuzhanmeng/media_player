@@ -87,6 +87,10 @@ void AVSynchronizer::Start() {
     force_render_.store(false);
     audio_finished_.store(false);
 
+    // 视频主时钟复位（无音频轨道时使用）
+    video_clock_us_.store(-1);
+    reset_video_clock_.store(true);
+
     // 每次启动时重置日志节流时间，防止跨 Play 周期的 static 变量问题
     last_render_log_time_ = std::chrono::steady_clock::now();
 
@@ -171,6 +175,10 @@ void AVSynchronizer::PushVideoFrame(std::shared_ptr<VideoFrame> video_frame) {
         // 2. 确何在暂停态 Seek 后，新到达的第一帧能够立刻渲染上屏
         force_render_.store(true);
 
+        // 2.1 视频主时钟基准失效，需要在下一帧重新建立（无音频轨道场景）
+        reset_video_clock_.store(true);
+        video_clock_us_.store(-1);
+
         // 3. 信令已达，解除全局的 Seek 锁定期，允许后续画面正常进入同步环节
         if (sync_ctx_) {
             sync_ctx_->state_cv_.notify_all(); // 唤醒沉睡的工作线程
@@ -205,6 +213,16 @@ void AVSynchronizer::NotifyAudioFinished() {
     audio_finished_.store(true);
     sync_ctx_->state_cv_.notify_all();
 }
+
+/**
+ * @brief 告知同步器当前媒体是否含有音频轨道
+ */
+void AVSynchronizer::SetHasAudio(bool has_audio) { has_audio_.store(has_audio); }
+
+/**
+ * @brief 获取视频主时钟（最近渲染帧 PTS，微秒）
+ */
+int64_t AVSynchronizer::GetVideoClockUs() const { return video_clock_us_.load(); }
 
 /**
  * @brief 音画同步核心工作线程
@@ -287,6 +305,7 @@ void AVSynchronizer::ThreadLoop() {
 
         if (sync_ctx_->state_.load() == PlaybackState::kPaused && force_render_.load()) {
             LOG_INFO("Seek Completed: Force rendering new frame at {:.3f} sec", video_frame->GetTimestampSec());
+            video_clock_us_.store(video_frame->GetTimestampUs());
             {
                 std::unique_lock<std::mutex> lock(listener_mutex_);
                 if (listener_) {
@@ -297,13 +316,50 @@ void AVSynchronizer::ThreadLoop() {
             continue;
         }
 
-        // 阶段5：纯视频播放（无音频轨道）
-        // audio_speaker_ 为空说明文件没有音频流，不需要同步，直接渲染
+        // 阶段5：视频主时钟定时渲染（无音频轨道）
+        // audio_speaker_ 为空，或当前媒体没有音频流（has_audio_=false）时，
+        // 不能再以音频时钟为基准（音频时钟恒为 -1 会导致画面以解码速度狂飙），
+        // 改用系统墙钟 + 视频 PTS 自驱定时，保证正常速率播放，并维护 video_clock_us_ 供进度条读取。
 
-        if (!audio_speaker_) {
-            std::unique_lock<std::mutex> lock(listener_mutex_);
-            if (listener_) {
-                listener_->OnSyncNotifyVideoFrame(std::move(video_frame));
+        if (!audio_speaker_ || !has_audio_.load()) {
+            int64_t video_pts_us = video_frame->GetTimestampUs();
+
+            // 建立/重置基准：首帧（或 Start/Seek 后）记录"首帧 PTS"与"当前墙钟"
+            if (reset_video_clock_.exchange(false)) {
+                video_master_first_pts_us_ = video_pts_us;
+                video_master_start_time_ = std::chrono::steady_clock::now();
+            }
+
+            // 目标墙钟 = 基准墙钟 + (当前帧 PTS - 首帧 PTS)
+            auto target_time =
+                video_master_start_time_ + std::chrono::microseconds(video_pts_us - video_master_first_pts_us_);
+
+            // 可被 暂停/跳转/停止 立即中断的等待，直到到达该帧的呈现时刻
+            while (!is_abort_.load() && !sync_ctx_->is_seeking_.load() &&
+                   sync_ctx_->state_.load() == PlaybackState::kPlaying) {
+                auto now = std::chrono::steady_clock::now();
+                if (now >= target_time) {
+                    break;
+                }
+                std::unique_lock<std::mutex> lock(sync_ctx_->state_mutex_);
+                sync_ctx_->state_cv_.wait_for(lock, target_time - now, [this]() {
+                    return is_abort_.load() || sync_ctx_->is_seeking_.load() ||
+                        sync_ctx_->state_.load() != PlaybackState::kPlaying;
+                });
+            }
+
+            // 被 Seek/暂停 打断则丢弃本帧，回外层重新调度
+            if (is_abort_.load() || sync_ctx_->is_seeking_.load() ||
+                sync_ctx_->state_.load() != PlaybackState::kPlaying) {
+                continue;
+            }
+
+            video_clock_us_.store(video_pts_us);
+            {
+                std::unique_lock<std::mutex> lock(listener_mutex_);
+                if (listener_) {
+                    listener_->OnSyncNotifyVideoFrame(std::move(video_frame));
+                }
             }
             continue;
         }
@@ -392,6 +448,7 @@ void AVSynchronizer::ThreadLoop() {
 
             // 策略C：时间差在 ±25ms 容忍窗口内，立即渲染
             {
+                video_clock_us_.store(video_pts_us);
                 std::unique_lock<std::mutex> lock(listener_mutex_);
                 if (listener_) {
                     listener_->OnSyncNotifyVideoFrame(std::move(video_frame));

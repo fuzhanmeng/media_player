@@ -89,7 +89,7 @@ public:
     /**
      * @brief 是否含有音频轨道
      */
-    bool HasAduio() const override;
+    bool HasAudio() const override;
 
     /**
      * @brief 是否含有视频轨道

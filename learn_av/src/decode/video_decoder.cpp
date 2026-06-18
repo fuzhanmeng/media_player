@@ -26,6 +26,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/frame.h>
+#include <libswscale/swscale.h>
 }
 
 namespace av {
@@ -170,6 +171,7 @@ void VideoDecoder::Start(std::shared_ptr<SyncContext> sync_ctx) {
 
     // 3. 设置线程标志
     is_abort_requested_.store(false);
+    awaiting_flush_.store(false);
 
     // 4. 清空&&启动队列
     packet_queue_.Clear();
@@ -230,8 +232,13 @@ void VideoDecoder::Flush() {
 
 /**
  * @brief 清空队列，唤醒阻塞
+ * @details Seek 触发：置位丢帧门闩，直到处理完随后的 kFlush 包才恢复放行，
+ *          杜绝"is_seeking_ 已清零但 Flush 包尚未抵达"窗口内的旧帧漏帧
  */
-void VideoDecoder::AbortAndClearQueue() { packet_queue_.AbortAndClear(); }
+void VideoDecoder::AbortAndClearQueue() {
+    awaiting_flush_.store(true);
+    packet_queue_.AbortAndClear();
+}
 
 /**
  * @brief 启动队列
@@ -247,6 +254,13 @@ void VideoDecoder::Close() {
     if (av_codec_ctx_) {
         avcodec_free_context(&av_codec_ctx_);
         av_codec_ctx_ = nullptr;
+    }
+    if (sws_ctx_) {
+        sws_freeContext(sws_ctx_);
+        sws_ctx_ = nullptr;
+        sws_src_w_ = 0;
+        sws_src_h_ = 0;
+        sws_src_fmt_ = -1;
     }
     packet_queue_.Clear();
 }
@@ -304,6 +318,9 @@ void VideoDecoder::ThreadLoop() {
         if (packet->HasFlag(av::AVFrameFlag::kFlush)) {
             LOG_DEBUG("Video Decoder Received In-band Flush packet, executing codec synchronization.");
             Flush();
+
+            // Flush 包已抵达：跳转后的新数据从此开始，解除丢帧门闩
+            awaiting_flush_.store(false);
 
             // 向下游发送带Flush标志的空帧
             auto video_frame = std::make_shared<VideoFrame>(0, 0);
@@ -379,6 +396,8 @@ void VideoDecoder::ThreadLoop() {
 /**
  * @brief 处理解码出的裸帧，打包 YUV 分量数据并分发给 OpenGL 渲染器
  * @param frame FFmpeg 原生裸帧指针 (存在内存 Padding)
+ * @details 若源像素格式非 YUV420P（如硬解 NV12 / YUV422P / YUV444P），先经 SwsContext 统一转换，
+ *          再执行内存对齐剥离，杜绝下游 OpenGL 因平面布局不符而花屏或越界崩溃。
  */
 void VideoDecoder::ProcessAndPack(AVFrame* frame) {
     // 1. 校验 frame
@@ -387,63 +406,111 @@ void VideoDecoder::ProcessAndPack(AVFrame* frame) {
         return;
     }
 
-    // 2. 实例化 DTO (Data Transfer Object)，内部预分配完全紧凑的内存
-    auto video_frame = std::make_shared<av::VideoFrame>(frame->width, frame->height);
-
-    // 3. 内存对齐剥离算法 (Memory Alignment Stripping)
-    // 结合 ptrdiff_t 强制转换，杜绝 32 位整数溢出风险
-
-    // 1. 拷贝 Luma (Y 分量)
-    for (int i = 0; i < frame->height; ++i) {
-        // 目标结构：完全紧凑，步长严格等于 width
-        ptrdiff_t dst_offset = static_cast<ptrdiff_t>(i) * frame->width;
-        // 源数据：存在对齐填充 Padding，步长为 linesize[0]
-        ptrdiff_t src_offset = static_cast<ptrdiff_t>(i) * frame->linesize[0];
-
-        memcpy(video_frame->data_[0] + dst_offset, frame->data[0] + src_offset, frame->width);
+    // 2. 像素格式归一化：非 YUV420P 一律转换为 YUV420P
+    AVFrame* yuv = frame; // 实际用于剥离的源帧
+    AVFrame* converted = nullptr; // 转换产物，需在函数末尾释放
+    if (frame->format != AV_PIX_FMT_YUV420P) {
+        converted = ConvertToYUV420P(frame);
+        if (!converted) {
+            LOG_ERROR("Pixel format conversion to YUV420P failed (src fmt={}).", frame->format);
+            return;
+        }
+        yuv = converted;
     }
 
-    // 2. 拷贝 Chroma (U & V 分量)
-    int chroma_width = frame->width / 2;
-    int chroma_height = frame->height / 2;
+    const int width = yuv->width;
+    const int height = yuv->height;
+
+    // 3. 实例化 DTO，内部预分配完全紧凑的内存
+    auto video_frame = std::make_shared<av::VideoFrame>(width, height);
+
+    // 4. 内存对齐剥离算法：源步长 linesize 含 Padding，目标步长完全紧凑
+    //    色度尺寸统一采用向上取整 (width+1)/2，与 VideoFrame 内部分配保持一致，兼容奇数分辨率
+
+    // 4.1 拷贝 Luma (Y 分量)
+    for (int i = 0; i < height; ++i) {
+        ptrdiff_t dst_offset = static_cast<ptrdiff_t>(i) * width;
+        ptrdiff_t src_offset = static_cast<ptrdiff_t>(i) * yuv->linesize[0];
+        memcpy(video_frame->data_[0] + dst_offset, yuv->data[0] + src_offset, width);
+    }
+
+    // 4.2 拷贝 Chroma (U & V 分量)，步长与高度均向上取整
+    const int chroma_width = (width + 1) / 2;
+    const int chroma_height = (height + 1) / 2;
 
     for (int i = 0; i < chroma_height; ++i) {
-        // 目标结构：完全紧凑，步长为 width / 2 (chroma_width)
         ptrdiff_t dst_offset = static_cast<ptrdiff_t>(i) * chroma_width;
+        ptrdiff_t src_u_offset = static_cast<ptrdiff_t>(i) * yuv->linesize[1];
+        ptrdiff_t src_v_offset = static_cast<ptrdiff_t>(i) * yuv->linesize[2];
 
-        // 源数据 U：步长为 linesize[1]
-        ptrdiff_t src_u_offset = static_cast<ptrdiff_t>(i) * frame->linesize[1];
-        // 源数据 V：步长为 linesize[2]
-        ptrdiff_t src_v_offset = static_cast<ptrdiff_t>(i) * frame->linesize[2];
-
-        memcpy(video_frame->data_[1] + dst_offset, frame->data[1] + src_u_offset, chroma_width);
-        memcpy(video_frame->data_[2] + dst_offset, frame->data[2] + src_v_offset, chroma_width);
+        memcpy(video_frame->data_[1] + dst_offset, yuv->data[1] + src_u_offset, chroma_width);
+        memcpy(video_frame->data_[2] + dst_offset, yuv->data[2] + src_v_offset, chroma_width);
     }
 
-    // 4. 显示时间戳 (PTS) 的换算
-    // AV_NOPTS_VALUE 表示无显示时间戳值，需回退使用 best_effort_timestamp
+    // 5. 转换产物已拷贝完毕，立即释放，避免堆内存泄漏
+    if (converted) {
+        av_frame_free(&converted);
+    }
+
+    // 6. 显示时间戳 (PTS) 换算（始终取自原始帧）
     int64_t actual_pts = (frame->pts == AV_NOPTS_VALUE) ? frame->best_effort_timestamp : frame->pts;
-
-    int64_t time_us = 0;
-
     if (actual_pts != AV_NOPTS_VALUE) {
         AVRational us_q = {1, 1000000};
-
-        // 将时钟滴答数转换为绝对时间 (秒)
-        time_us = av_rescale_q(actual_pts, time_base_, us_q);
+        int64_t time_us = av_rescale_q(actual_pts, time_base_, us_q);
         video_frame->SetTimestamp(time_us);
     }
 
-    if (sync_ctx_ && sync_ctx_->is_seeking_.load()) {
-        // 正处于跳转状态
-        LOG_DEBUG("Discarding pre-seek audio frame, timestamp: {} us", video_frame->GetTimestampUs());
+    // 7. 跳转期间丢弃旧帧：is_seeking_ 锁定期 或 尚未处理 Flush 包(awaiting_flush_) 均丢弃
+    if ((sync_ctx_ && sync_ctx_->is_seeking_.load()) || awaiting_flush_.load()) {
+        LOG_DEBUG("Discarding pre-seek video frame, timestamp: {} us", video_frame->GetTimestampUs());
         return;
     }
 
-    // 5. 将封装完毕的 YUV420P 帧传到下游监听器
+    // 8. 将封装完毕的 YUV420P 帧传到下游监听器
     if (listener_) {
         listener_->OnNotifyVideoFrame(std::move(video_frame));
     }
+}
+
+/**
+ * @brief 将任意像素格式的裸帧统一转换为 YUV420P
+ */
+AVFrame* VideoDecoder::ConvertToYUV420P(AVFrame* src) {
+    // 1. 惰性创建 / 按源参数变化重建 SwsContext
+    if (!sws_ctx_ || sws_src_w_ != src->width || sws_src_h_ != src->height || sws_src_fmt_ != src->format) {
+        if (sws_ctx_) {
+            sws_freeContext(sws_ctx_);
+            sws_ctx_ = nullptr;
+        }
+        sws_ctx_ = sws_getContext(src->width, src->height, static_cast<AVPixelFormat>(src->format), src->width,
+                                  src->height, AV_PIX_FMT_YUV420P, SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (!sws_ctx_) {
+            LOG_ERROR("sws_getContext failed for src fmt={}", src->format);
+            return nullptr;
+        }
+        sws_src_w_ = src->width;
+        sws_src_h_ = src->height;
+        sws_src_fmt_ = src->format;
+        LOG_INFO("SwsContext created: convert pix_fmt {} -> YUV420P ({}x{})", src->format, src->width, src->height);
+    }
+
+    // 2. 分配目标 YUV420P 帧
+    AVFrame* dst = av_frame_alloc();
+    if (!dst) {
+        return nullptr;
+    }
+    dst->width = src->width;
+    dst->height = src->height;
+    dst->format = AV_PIX_FMT_YUV420P;
+    if (av_frame_get_buffer(dst, 0) < 0) {
+        LOG_ERROR("av_frame_get_buffer failed for converted YUV420P frame.");
+        av_frame_free(&dst);
+        return nullptr;
+    }
+
+    // 3. 执行像素格式转换
+    sws_scale(sws_ctx_, src->data, src->linesize, 0, src->height, dst->data, dst->linesize);
+    return dst;
 }
 
 } // namespace av

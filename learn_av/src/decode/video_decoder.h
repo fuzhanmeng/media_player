@@ -18,6 +18,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/pixfmt.h>
 #include <libavutil/rational.h>
+#include <libswscale/swscale.h>
 }
 
 namespace av {
@@ -107,14 +108,32 @@ private:
      */
     void ProcessAndPack(AVFrame* frame);
 
+    /**
+     * @brief 将任意像素格式的裸帧统一转换为 YUV420P
+     * @param src 解码器产出的原始帧（可能是 NV12 / YUV422P / YUV444P 等）
+     * @return 新分配的 YUV420P 帧（调用方负责 av_frame_free），失败返回 nullptr
+     * @details 内部惰性创建并按源参数缓存 SwsContext
+     */
+    AVFrame* ConvertToYUV420P(AVFrame* src);
+
 private:
     // 1. FFmpeg 核心引擎与底层资源
     std::mutex codec_mutex_; ///< 保护解码器上下文的多线程并发访问
     AVCodecContext* av_codec_ctx_{nullptr}; ///< FFmpeg 视频解码器物理上下文
 
+    // 1.1 像素格式转换上下文（仅当源格式非 YUV420P 时惰性创建）
+    SwsContext* sws_ctx_{nullptr};
+    int sws_src_w_{0};
+    int sws_src_h_{0};
+    int sws_src_fmt_{-1}; ///< 缓存的源像素格式 (AVPixelFormat)，用于检测参数变化
+
     // 2. 线程与并发状态控制
     std::thread decode_thread_; ///< 独立的视频解码后台 OS 线程
     std::atomic<bool> is_abort_requested_{true}; ///< 物理线程终止信令，true=线程应退出
+
+    // 2.1 Seek 期间丢帧门闩：置位后丢弃所有帧，直到处理完 kFlush 包才复位
+    // 解决"is_seeking_ 已清零但 Flush 包尚未处理"这一时间窗内旧帧漏帧问题
+    std::atomic<bool> awaiting_flush_{false};
 
     // 3. 数据流转通道
     ThreadSafeQueue<std::shared_ptr<Packet>> packet_queue_{60}; ///< 阻塞式背压队列，缓存约 1~2 秒视频包

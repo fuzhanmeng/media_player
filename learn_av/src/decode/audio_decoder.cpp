@@ -186,6 +186,7 @@ void AudioDecoder::Start(std::shared_ptr<SyncContext> sync_ctx) {
 
     // 3. 设置线程标志
     is_abort_requested_.store(false);
+    awaiting_flush_.store(false);
 
     // 4. 清空&&启动队列
     packet_queue_.Clear();
@@ -245,8 +246,12 @@ void AudioDecoder::Flush() {
 
 /**
  * @brief 清空队列，唤醒阻塞
+ * @details Seek 触发：置位丢帧门闩，直到处理完随后的 kFlush 包才恢复放行
  */
-void AudioDecoder::AbortAndClearQueue() { packet_queue_.AbortAndClear(); }
+void AudioDecoder::AbortAndClearQueue() {
+    awaiting_flush_.store(true);
+    packet_queue_.AbortAndClear();
+}
 
 /**
  * @brief 启动队列
@@ -338,6 +343,9 @@ void AudioDecoder::ThreadLoop() {
         if (packet->HasFlag(av::AVFrameFlag::kFlush)) {
             LOG_DEBUG("Audio Decoder Received In-band Flush packet, executing codec synchronization.");
             Flush();
+
+            // Flush 包已抵达：跳转后的新数据从此开始，解除丢帧门闩
+            awaiting_flush_.store(false);
 
             auto audio_frame = std::make_shared<Frame>(nullptr);
             audio_frame->AddFlag(av::AVFrameFlag::kFlush);
@@ -461,7 +469,8 @@ void AudioDecoder::ProcessAndResample(AVFrame* av_frame) {
     }
 
     // 跳转过程中丢弃所有旧帧，不发送给下游
-    if (sync_ctx_ && sync_ctx_->is_seeking_.load()) {
+    // is_seeking_ 锁定期 或 尚未处理 Flush 包(awaiting_flush_) 均丢弃
+    if ((sync_ctx_ && sync_ctx_->is_seeking_.load()) || awaiting_flush_.load()) {
         return;
     }
 

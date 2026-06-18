@@ -155,7 +155,12 @@ bool Player::Open(const std::string& url) {
     video_finished_.store(false);
 
     has_video_.store(file_reader_->HasVideo());
-    has_audio_.store(file_reader_->HasAduio());
+    has_audio_.store(file_reader_->HasAudio());
+
+    // 将"是否含音频轨道"同步给音画同步器：无音频时切换为视频主时钟定时渲染
+    if (av_sync_) {
+        av_sync_->SetHasAudio(has_audio_.load());
+    }
     return ret;
 }
 
@@ -173,6 +178,10 @@ void Player::Play() {
     if (sync_ctx_->state_.compare_exchange_strong(expected_opened, PlaybackState::kPlaying)) {
         LOG_INFO("====== State transition: kOpened -> kPlaying. Initializing worker threads ======");
 
+        // 0. 复位 EOF 标志，避免上一轮播放残留导致提前判定播放完成
+        audio_finished_.store(false);
+        video_finished_.store(false);
+
         // 1. 先启动消费者
         if (av_sync_) {
             av_sync_->Start();
@@ -187,8 +196,8 @@ void Player::Play() {
             file_reader_->Start(sync_ctx_);
         }
 
-        if (listener_) {
-            listener_->OnPlaybackStateChanged(PlaybackState::kPlaying);
+        if (auto* l = listener_.load()) {
+            l->OnPlaybackStateChanged(PlaybackState::kPlaying);
         }
         return;
     }
@@ -205,8 +214,8 @@ void Player::Play() {
         // 唤醒其他线程
         sync_ctx_->state_cv_.notify_all();
 
-        if (listener_) {
-            listener_->OnPlaybackStateChanged(PlaybackState::kPlaying);
+        if (auto* l = listener_.load()) {
+            l->OnPlaybackStateChanged(PlaybackState::kPlaying);
         }
         return;
     }
@@ -215,6 +224,10 @@ void Player::Play() {
     PlaybackState expected_stopped = PlaybackState::kStopped;
     if (sync_ctx_->state_.compare_exchange_strong(expected_stopped, PlaybackState::kPlaying)) {
         LOG_INFO("====== State transition: kStopped -> kPlaying. Re-initializing worker threads ======");
+
+        // 0. 复位 EOF 标志，避免上一轮播放残留导致提前判定播放完成
+        audio_finished_.store(false);
+        video_finished_.store(false);
 
         // 1. 先启动消费者
         if (av_sync_) {
@@ -230,8 +243,8 @@ void Player::Play() {
             file_reader_->Start(sync_ctx_);
         }
 
-        if (listener_) {
-            listener_->OnPlaybackStateChanged(PlaybackState::kPlaying);
+        if (auto* l = listener_.load()) {
+            l->OnPlaybackStateChanged(PlaybackState::kPlaying);
         }
         return;
     }
@@ -266,8 +279,8 @@ void Player::Pause() {
         sync_ctx_->state_cv_.notify_all();
 
         // 业务回调：通知 UI 层状态变更
-        if (listener_) {
-            listener_->OnPlaybackStateChanged(PlaybackState::kPaused);
+        if (auto* l = listener_.load()) {
+            l->OnPlaybackStateChanged(PlaybackState::kPaused);
         }
     } else {
         LOG_DEBUG("Pause() invoked but state is not kPlaying.");
@@ -397,7 +410,7 @@ PlaybackState Player::GetState() const {
     return sync_ctx_->state_.load();
 }
 
-void Player::SetListener(IPlayer::Listener* listener) { listener_ = listener; }
+void Player::SetListener(IPlayer::Listener* listener) { listener_.store(listener); }
 
 // ================= IFileReader::Listener 数据上行接口实现 =================
 
@@ -560,8 +573,8 @@ void Player::ChangeState(PlaybackState new_state) {
     if (old_state != new_state) {
         LOG_INFO("State transition: {} -> {}", StateToString(old_state), StateToString(new_state));
 
-        if (listener_) {
-            listener_->OnPlaybackStateChanged(new_state);
+        if (auto* l = listener_.load()) {
+            l->OnPlaybackStateChanged(new_state);
         }
     }
 }
@@ -574,10 +587,17 @@ void Player::ProgressLoop() {
 
     while (is_progress_thread_running_.load()) {
         if (sync_ctx_ && sync_ctx_->state_.load() == PlaybackState::kPlaying) {
-            // 1. 获取当前时间（微妙）
-            int64_t current_time_us = 0;
-            if (audio_speaker_) {
-                current_time_us = audio_speaker_->GetAudioClockUs();
+            // 1. 获取当前时间（微秒）
+            //    有音频轨道：以音频主时钟为准；无音频轨道：退化为 AVSync 维护的视频主时钟
+            int64_t current_time_us = -1;
+            if (has_audio_.load()) {
+                if (audio_speaker_) {
+                    current_time_us = audio_speaker_->GetAudioClockUs();
+                }
+            } else {
+                if (av_sync_) {
+                    current_time_us = av_sync_->GetVideoClockUs();
+                }
             }
 
             // 时钟未就绪时跳过本次更新，继续循环等待
@@ -599,8 +619,8 @@ void Player::ProgressLoop() {
             }
 
             // 4. 触发回调
-            if (listener_) {
-                listener_->OnPlaybackProgress(progress, current_time_us, total_time_us);
+            if (auto* l = listener_.load()) {
+                l->OnPlaybackProgress(progress, current_time_us, total_time_us);
             }
         }
         std::this_thread::sleep_for(kUpdateInterval);
@@ -626,8 +646,8 @@ void Player::CheckAndNotifyPlaybackCompleted() {
             LOG_INFO("Playback TRULY Completed. Notifying UI...");
 
             // 4. 唯一合法的 UI 通知触发点
-            if (listener_) {
-                listener_->OnPlaybackCompleted();
+            if (auto* l = listener_.load()) {
+                l->OnPlaybackCompleted();
             }
         }
     }

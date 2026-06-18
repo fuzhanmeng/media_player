@@ -321,8 +321,12 @@ void Demuxer::ThreadLoop() {
 
         // [优先级 P2]: 提取流数据包并派发给下游解码器
         try {
-            if (!ReadAndSendPacket()) {
+            ReadResult result = ReadAndSendPacket();
+            if (result == ReadResult::kEof) {
                 is_eof_.store(true);
+            } else if (result == ReadResult::kTransient) {
+                // 可恢复的临时错误：短暂退避后重试，绝不置 is_eof_ 以免误判为文件结束
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
         } catch (const std::exception& e) {
             LOG_ERROR("Exception occurred demuxing: {}", e.what());
@@ -338,21 +342,24 @@ void Demuxer::ThreadLoop() {
  * @note 必须在 I/O 线程上下文中执行，防止与 av_read_frame 发生跨线程并发冲突
  */
 void Demuxer::ProcessSeek() {
-    std::unique_lock<std::mutex> lock(avformat_mutex_);
-
-    if (!avformat_ctx_) {
-        is_seek_requested_.store(false);
-        return;
-    }
-
     int64_t target_timestamp = target_seek_time_.load();
+    int seek_ret = 0;
 
-    // 1. 调用 FFmpeg 底层 API 执行容器级别的物理寻址
-    if (av_seek_frame(avformat_ctx_, -1, target_timestamp, AVSEEK_FLAG_BACKWARD) >= 0) {
+    // 1. 仅在调用 FFmpeg 物理寻址期间持有 avformat_mutex_，避免在锁内回调下游造成锁粒度过大
+    {
+        std::unique_lock<std::mutex> lock(avformat_mutex_);
+        if (!avformat_ctx_) {
+            is_seek_requested_.store(false);
+            return;
+        }
+        seek_ret = av_seek_frame(avformat_ctx_, -1, target_timestamp, AVSEEK_FLAG_BACKWARD);
+    } // 锁在此释放
+
+    if (seek_ret >= 0) {
         LOG_INFO("Demuxer seek succeeded. Target: {} us", target_timestamp);
         is_eof_.store(false);
 
-        // 2. 通知下游解除队列阻塞状态，准备接收新位置的数据
+        // 2. 通知下游解除队列阻塞状态，准备接收新位置的数据（已脱离 avformat_mutex_）
         if (listener_) {
             listener_->OnSeekResetQueues();
         }
@@ -387,14 +394,14 @@ void Demuxer::ProcessSeek() {
 
 /**
  * @brief 执行底层裸包提取与跨模块派发
- * @return true 循环继续; false 触发 EOF 或物理读取异常
+ * @return ReadResult 读取结果状态码
  */
-bool Demuxer::ReadAndSendPacket() {
+Demuxer::ReadResult Demuxer::ReadAndSendPacket() {
     auto packet = std::make_shared<Packet>();
     int ret = 0;
 
     if (!avformat_ctx_) {
-        return false;
+        return ReadResult::kEof;
     }
 
     {
@@ -410,7 +417,7 @@ bool Demuxer::ReadAndSendPacket() {
                 bool push_success = listener_->OnNotifyVideoPacket(std::move(packet));
                 if (!push_success) {
                     LOG_INFO("Video packet push aborted by downstream. Exiting block context.");
-                    return true; // 抛弃当前 packet，直接进入下一次循环探测指令
+                    return ReadResult::kOk; // 抛弃当前 packet，直接进入下一次循环探测指令
                 }
             } catch (const std::exception& e) {
                 LOG_ERROR("Video packet routing exception: {}", e.what());
@@ -422,13 +429,13 @@ bool Demuxer::ReadAndSendPacket() {
                 bool push_success = listener_->OnNotifyAudioPacket(std::move(packet));
                 if (!push_success) {
                     LOG_INFO("Audio packet push aborted by downstream. Exiting block context.");
-                    return true; // 抛弃当前 packet，直接进入下一次循环探测指令
+                    return ReadResult::kOk; // 抛弃当前 packet，直接进入下一次循环探测指令
                 }
             } catch (const std::exception& e) {
                 LOG_ERROR("Audio packet routing exception: {}", e.what());
             }
         }
-        return true;
+        return ReadResult::kOk;
     }
     // ================= 文件末尾 =================
     else if (ret == AVERROR_EOF) {
@@ -436,14 +443,25 @@ bool Demuxer::ReadAndSendPacket() {
         if (listener_) {
             listener_->OnNotifyDemuxerEOF();
         }
-        return false;
+        return ReadResult::kEof;
     }
     // ================= 物理读取异常 =================
     else {
         std::array<char, AV_ERROR_MAX_STRING_SIZE> error_buf{0};
         av_strerror(ret, error_buf.data(), error_buf.size());
-        LOG_ERROR("FFmpeg physical read failed: {}", error_buf.data());
-        return false;
+
+        // EAGAIN 等可恢复错误：退避重试，不当作文件结束
+        if (ret == AVERROR(EAGAIN)) {
+            LOG_DEBUG("FFmpeg read returned EAGAIN (transient), will retry: {}", error_buf.data());
+            return ReadResult::kTransient;
+        }
+
+        // 其余错误（含网络中断等）视为不可恢复，按 EOF 收尾，触发下游排空
+        LOG_ERROR("FFmpeg physical read failed (treated as EOF): {}", error_buf.data());
+        if (listener_) {
+            listener_->OnNotifyDemuxerEOF();
+        }
+        return ReadResult::kEof;
     }
 }
 } // namespace av

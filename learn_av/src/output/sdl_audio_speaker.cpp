@@ -270,7 +270,8 @@ void SDLAudioSpeaker::SDLAudioCallback(void* userdata, Uint8* stream, int len) {
  * @param len 本次硬件回调请求填充的字节总长度
  */
 void SDLAudioSpeaker::FillAudioData(Uint8* stream, int len) {
-    std::lock_guard<std::mutex> lock(sync_mutex_);
+    // 使用 unique_lock 以便在回调业务层前可主动 unlock，避免持锁执行上层逻辑
+    std::unique_lock<std::mutex> lock(sync_mutex_);
 
     // 1. 初始化静音：如果后面拿不到数据，声卡播的就是静音
     SDL_memset(stream, 0, len);
@@ -303,14 +304,18 @@ void SDLAudioSpeaker::FillAudioData(Uint8* stream, int len) {
         if (current_frame_->HasFlag(AVFrameFlag::kEOF)) {
             LOG_INFO("SDL Receive EOF");
 
-            if (listener_) {
-                listener_->OnAudioCompleted();
-            }
-
             audio_clock_us_.store(-1);
             current_frame_ = nullptr;
 
-            SDL_PauseAudioDevice(audio_device_id_, -1);
+            // 暂停设备（1 = 暂停），停止后续硬件回调
+            SDL_PauseAudioDevice(audio_device_id_, 1);
+
+            // 在临界区之外回调业务层，避免在持有 sync_mutex_ 时执行任意上层逻辑
+            // （OnAudioCompleted 会 notify_all 并可能 emit 至 UI，若未来回环触及 speaker 即死锁）
+            lock.unlock();
+            if (listener_) {
+                listener_->OnAudioCompleted();
+            }
             return;
         }
 

@@ -118,7 +118,7 @@ public:
     /**
      * @brief 是否含有音频轨道
      */
-    virtual bool HasAduio() const = 0;
+    virtual bool HasAudio() const = 0;
 
     /**
      * @brief 是否含有视频轨道
