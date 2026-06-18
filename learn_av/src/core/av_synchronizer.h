@@ -12,8 +12,8 @@
 #include <mutex>
 #include <thread>
 
-#include "interface/iaudio_speaker.h"
-#include "interface/iav_synchronizer.h"
+#include "output/interface/iaudio_speaker.h"
+#include "core/interface/iav_synchronizer.h"
 #include "playback_sync.h"
 #include "utils/thread_safe_queue.h"
 #include "video_frame.h"

@@ -19,7 +19,7 @@
 #include <thread>
 
 #include "av_core_def.h"
-#include "interface/iaudio_speaker.h"
+#include "output/interface/iaudio_speaker.h"
 #include "logger.h"
 #include "output/sdl_audio_speaker.h"
 #include "playback_sync.h"

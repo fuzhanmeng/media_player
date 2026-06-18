@@ -11,8 +11,8 @@
 #include <string>
 
 #include "define/av_frame.h"
-#include "interface/iaudio_speaker.h"
-#include "interface/iav_synchronizer.h"
+#include "output/interface/iaudio_speaker.h"
+#include "core/interface/iav_synchronizer.h"
 #include "demux/interface/ifile_reader.h"
 #include "iplayer.h"
 #include "ivideo_sink.h"
