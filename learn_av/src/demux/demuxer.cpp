@@ -74,8 +74,8 @@ bool Demuxer::Open(const std::string& url) {
     audio_stream_index_ = -1;
     video_stream_index_ = -1;
 
-    // 5. 开始遍历物理轨道，分离音频/视频轨道，抽取关键参数构造纯净 DTO (Data Transfer Object)
-    for (int i = 0; i < avformat_ctx_->nb_streams; ++i) {
+    // 5. 遍历物理轨道，分离音视频轨，抽取关键参数构造 StreamInfo DTO
+    for (int i = 0; i < static_cast<int>(avformat_ctx_->nb_streams); ++i) {
         AVStream* stream = avformat_ctx_->streams[i];
 
         // video
@@ -89,6 +89,11 @@ bool Demuxer::Open(const std::string& url) {
 
                 info.width_ = stream->codecpar->width; ///< 视频宽度
                 info.height_ = stream->codecpar->height; ///< 视频高度
+
+                // 推断帧率（优先容器声明的平均/真实帧率），供录制编码器设置 time_base
+                AVRational frame_rate = av_guess_frame_rate(avformat_ctx_, stream, nullptr);
+                info.fps_num_ = frame_rate.num;
+                info.fps_den_ = frame_rate.den;
 
                 info.timebase_num_ = stream->time_base.num; ///< 时间基分子
                 info.timebase_den_ = stream->time_base.den; ///< 时间基分母
@@ -115,8 +120,8 @@ bool Demuxer::Open(const std::string& url) {
                 info.channels_ = stream->codecpar->channels; ///< 通道数
                 info.sample_rate_ = stream->codecpar->sample_rate; ///< 采样率
 
-                info.timebase_den_ = stream->time_base.den; ///< 时间基分子
-                info.timebase_num_ = stream->time_base.num; ///< 时间基分母
+                info.timebase_den_ = stream->time_base.den; ///< 时间基分母
+                info.timebase_num_ = stream->time_base.num; ///< 时间基分子
 
                 // 提取解码器私有配置数据
                 if (stream->codecpar->extradata_size > 0) {
@@ -164,7 +169,7 @@ void Demuxer::Start(std::shared_ptr<SyncContext> sync_ctx) {
 
 /**
  * @brief 清空解复用器内部状态并向下游分别发送独立的 Flush 信令
- * @note 主要用于Seek操作后清除旧数据，防止花屏与爆音
+ * @note 用于 Seek 后清除旧数据，避免画面残影与音频杂音
  */
 void Demuxer::Flush() {
     // 1. 音频
@@ -229,17 +234,17 @@ void Demuxer::SeekTo(int64_t target_time_us) {
 
 /**
  * @brief 获取当前媒体容器的全局总时长
- * @return 总时长（单位：秒）
+ * @return 总时长（单位：微秒，AV_TIME_BASE 时基）；未知/直播返回 0
  */
 int64_t Demuxer::GetDuration() const {
     std::lock_guard<std::mutex> lock(avformat_mutex_);
 
-    // AV_NOPTS_VALUE 时长未知（无限制/直播/格式不支持文件损坏/正在下载）
+    // AV_NOPTS_VALUE 表示时长未知（直播/未就绪/容器不含时长信息）
     if (!avformat_ctx_ || avformat_ctx_->duration == AV_NOPTS_VALUE) {
-        return 0.0;
+        return 0;
     }
 
-    // 将 FFmpeg 内部时基 (AV_TIME_BASE, 微秒) 换算为标准绝对秒数
+    // avformat_ctx_->duration 已是 AV_TIME_BASE（微秒）单位，直接返回
     return avformat_ctx_->duration;
 }
 
@@ -410,6 +415,10 @@ Demuxer::ReadResult Demuxer::ReadAndSendPacket() {
     }
 
     if (ret >= 0) {
+        // listener_ 为空则丢弃当前包（理论上 Start 前已注册，此处为防御）
+        if (!listener_) {
+            return ReadResult::kOk;
+        }
         // ================= 发送视频包 =================
         if (packet->GetRawPacket()->stream_index == video_stream_index_) {
             try {

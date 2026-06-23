@@ -15,8 +15,10 @@
 #include "core/interface/iav_synchronizer.h"
 #include "demux/interface/ifile_reader.h"
 #include "iplayer.h"
+#include "mux/interface/ifile_writer.h"
 #include "output/sdl_audio_speaker.h"
 #include "playback_state.h"
+#include "mux/interface/fileWriterParameters.h"
 
 namespace av {
 
@@ -30,7 +32,10 @@ class VideoFrame;
  * @inherit IPlayer 面向 UI 层的标准播放控制契约
  * @inherit IFileReader::Listener 底层音视频纯净帧数据的唯一合法接收通道
  */
-class Player : public IPlayer, public IFileReader::Listener, public IAVSynchronizer::Listener, public IAudioSpeaker::Listener {
+class Player : public IPlayer,
+               public IFileReader::Listener,
+               public IAVSynchronizer::Listener,
+               public IAudioSpeaker::Listener {
 public:
     explicit Player(std::shared_ptr<IGLContext> gl_context);
     ~Player() override;
@@ -111,6 +116,18 @@ public:
 
 private:
     /**
+     * @brief 开始录制，初始化编码器与复用器，启动编码线程
+     * @param path 输出 MP4 文件路径
+     */
+    void StartRecord(const std::string& path) override;
+
+    /**
+     * @brief 停止录制：排空编码队列、Flush 编码器、写 MP4 文件尾并关闭文件
+     */
+    void StopRecord() override;
+
+private:
+    /**
      * @brief 接收底层解码输出的纯净 PCM 音频帧
      * @param audio_frame 包含采样率、声道数等物理参数的音频数据 DTO
      */
@@ -133,8 +150,7 @@ private:
     void OnSyncCompleted() override;
 
     /**
-     * @file player.h
-     * @brief Description
+     * @brief 扬声器宣告彻底播放完毕，触发全局播放结束判定
      */
     void OnAudioCompleted() override;
 
@@ -171,6 +187,7 @@ private:
      * @brief 检查音频和视频是否EOF
      */
     void CheckAndNotifyPlaybackCompleted();
+
 private:
     // ================= 核心基础设施 =================
 
@@ -215,7 +232,10 @@ private:
     std::atomic<bool> video_finished_{false};
     std::atomic<bool> audio_finished_{false};
 
-
+    // 录制相关
+    std::unique_ptr<IFileWriter> file_writer_{nullptr};
+    std::atomic<bool> is_recording_{false};
+    FileWriterParameters paramters_;
 };
 
 } // namespace av

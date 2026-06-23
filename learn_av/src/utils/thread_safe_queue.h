@@ -29,19 +29,41 @@ public:
     bool Push(T item) {
         std::unique_lock<std::mutex> lock(mutex_);
 
-        // 如果队列满了，生产者线程在这里死等，直到消费者拿走数据或被 Abort 打断
+        // 队列满时生产者阻塞等待，直到消费者取走数据或队列被 Abort
         not_full_cv_.wait(lock, [this]() { return queue_.size() < max_capacity_ || is_abort_; });
 
-        // 如果是被打断唤醒的，直接丢弃数据并返回 false
+        // 被 Abort 唤醒时丢弃数据并返回 false
         if (is_abort_) {
             return false;
         }
 
         queue_.push(std::move(item));
 
-        // 唤醒一个正在等待数据的消费者
+        // 唤醒一个等待数据的消费者
         not_empty_cv_.notify_one();
         return true;
+    }
+
+    /**
+     * @brief 塞入一个元素 - 非阻塞
+     */
+    bool TryPush(T item) {
+        // 加锁防竞争
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        // 如果队列已经被标记终止，或者满了，立刻放弃入队
+        if (is_abort_ || queue_.size() >= max_capacity_) {
+            return false;
+        }
+
+        // 执行入队操作
+        queue_.push(std::move(item));
+
+        // 唤醒消费者
+        not_empty_cv_.notify_all();
+
+        return true;
+
     }
 
     /**
@@ -51,7 +73,7 @@ public:
     bool Pop(T& item) {
         std::unique_lock<std::mutex> lock(mutex_);
 
-        // 如果队列为空，消费者死等，直到生产者塞入数据或被 Abort 打断
+        // 队列空时消费者阻塞等待，直到生产者入队数据或队列被 Abort
         not_empty_cv_.wait(lock, [this]() { return !queue_.empty() || is_abort_; });
 
         if (is_abort_ && queue_.empty()) {
@@ -61,7 +83,7 @@ public:
         item = std::move(queue_.front());
         queue_.pop();
 
-        // 拿走了一个元素，队列有空位了，立刻唤醒正在挂起等待的生产者！
+        // 取走一个元素后队列有空位，唤醒等待入队的生产者
         not_full_cv_.notify_one();
 
         return true;
@@ -75,9 +97,8 @@ public:
         // 此处仅需普通互斥锁即可，不需要 condition_variable 的 wait
         std::lock_guard<std::mutex> lock(mutex_);
 
-        // 如果队列为空，或者已经被标记终止，立刻放弃提取
+        // 队列为空或已被 Abort 时立即返回，不阻塞
         if (queue_.empty() || is_abort_) {
-            // LOG_INFO("the queue is empty"); // 建议在极高频的回调中注释掉这行，防止日志刷屏拖垮性能
             return false;
         }
 
@@ -114,14 +135,14 @@ public:
     }
 
     /**
-     * @brief 行打断阻塞并瞬间清空所有脏数据 (Seek 跳转专用)
-     * @details 原子化操作：封锁队列 -> 清空历史数据 -> 唤醒所有卡住的线程
+     * @brief 打断阻塞并立即清空队列中的残留数据（Seek 专用）
+     * @details 原子操作：标记 Abort -> 清空历史数据 -> 唤醒所有阻塞线程
      */
     void AbortAndClear() {
         std::lock_guard<std::mutex> lock(mutex_);
         is_abort_ = true;
         std::queue<T> empty_queue;
-        std::swap(empty_queue, queue_); // 清空脏数据
+        std::swap(empty_queue, queue_); // 清空残留数据
         not_empty_cv_.notify_all();
         not_full_cv_.notify_all();
     }

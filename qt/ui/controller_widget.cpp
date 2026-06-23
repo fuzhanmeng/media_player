@@ -30,6 +30,7 @@ void ControllerWidget::SetupUI() {
     // 1. 创建 UI 控件
     m_buttonImport = new QPushButton(tr("导入"), this);
     m_buttonPlay = new QPushButton(tr("Play"), this);
+    m_buttonRecord = new QPushButton(tr("录制"), this);
     m_labelTime = new QLabel(("00:00 / 00:00"), this);
 
     // 创建水平方向的进度条
@@ -39,6 +40,7 @@ void ControllerWidget::SetupUI() {
 
     // 2. 固定播放按钮的宽度，防止中英文切换或文本改变时按钮忽大忽小
     m_buttonPlay->setFixedWidth(80);
+    m_buttonRecord->setFixedWidth(90);
 
     // 3. 初始化布局管理器(水平排列)
     auto* layout = new QHBoxLayout(this);
@@ -48,14 +50,16 @@ void ControllerWidget::SetupUI() {
     // 4. 组装 UI 控件
     layout->addWidget(m_buttonImport);
     layout->addWidget(m_buttonPlay);
-    layout->addWidget(m_sliderProgress); // 将进度条放在播放按钮和时间中间
+    layout->addWidget(m_sliderProgress);
     layout->addWidget(m_labelTime);
+    layout->addWidget(m_buttonRecord);
 
     setLayout(layout);
 
     // 5. 连接 用户点击 物理信号到我们自己的槽函数
     connect(m_buttonImport, &QPushButton::clicked, this, &ControllerWidget::onImportButtonClicked);
     connect(m_buttonPlay, &QPushButton::clicked, this, &ControllerWidget::onPlayPauseButtonClicked);
+    connect(m_buttonRecord, &QPushButton::clicked, this, &ControllerWidget::onRecordButtonClicked);
 
     // 连接进度条的拖拽松开信号
     connect(m_sliderProgress, &QSlider::sliderReleased, this, &ControllerWidget::onSliderReleased);
@@ -159,4 +163,25 @@ void ControllerWidget::onSliderReleased() {
     float target_progress = static_cast<float>(current_val) / 1000.0f;
 
     emit sigSeekRequested(target_progress);
+}
+
+/**
+ * @brief 设置录制按钮的 UI 状态
+ */
+void ControllerWidget::SetRecordState(bool is_recording) {
+    m_isRecording = is_recording;
+    if (m_isRecording) {
+        m_buttonRecord->setText(tr("停止录制"));
+    } else {
+        m_buttonRecord->setText(tr("录制"));
+    }
+}
+
+/**
+ * @brief 录制按钮点击槽函数
+ */
+void ControllerWidget::onRecordButtonClicked() {
+    m_isRecording = !m_isRecording;
+    SetRecordState(m_isRecording);
+    emit sigRecordToggled(m_isRecording);
 }

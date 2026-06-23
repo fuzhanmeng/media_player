@@ -1,8 +1,8 @@
 /**
  * @file audio_decoder.cpp
- * @brief 音频解码与重采样模块核心实现
- * @details 基于 C++11 多线程模型构建，负责压缩位流 (Bitstream) 的提取、
- * 基于 FFmpeg 的硬件/软件解码调度，以及无锁上下文中跨采样率/声道数的重采样 (Resampling)
+ * @brief 音频解码与重采样模块实现
+ * @details 独立解码线程：从队列取压缩 AVPacket，经 avcodec_send_packet/avcodec_receive_frame 解码，
+ *          再用 SwrContext 重采样为目标采样率/声道/采样格式，封装为 Frame 推送下游
  */
 #include "audio_decoder.h"
 
@@ -403,7 +403,8 @@ void AudioDecoder::ThreadLoop() {
 }
 
 /**
- * @brief 执行音频重采样与所有权移交
+ * @brief 重采样并将解码帧封装为 Frame 推送下游
+ * @param av_frame 已解码的原始 PCM 帧（输入格式由解码器决定）
  */
 void AudioDecoder::ProcessAndResample(AVFrame* av_frame) {
     if (!av_frame || !swr_ctx_) {
@@ -411,19 +412,26 @@ void AudioDecoder::ProcessAndResample(AVFrame* av_frame) {
         return;
     }
 
-    // 1. 评估重采样延时，预估目标内存容量
-    int64_t delay = swr_get_delay(swr_ctx_, av_frame->sample_rate);
-    int64_t out_nb_samples =
-        av_rescale_rnd(delay + av_frame->nb_samples, out_sample_rate_, av_frame->sample_rate, AV_ROUND_UP);
+    // 输入采样率：优先取帧自带值，缺省时回退到解码器上下文，避免后续 av_rescale_rnd 除零
+    int in_sample_rate = av_frame->sample_rate > 0 ? av_frame->sample_rate : av_codec_ctx_->sample_rate;
+    if (in_sample_rate <= 0) {
+        LOG_ERROR("ProcessAndResample: invalid input sample_rate.");
+        return;
+    }
 
-    // 2. 分配目标物理帧 (Target Physical Frame)
+    // 1. 计算含重采样延迟在内的目标采样数上限
+    int64_t delay = swr_get_delay(swr_ctx_, in_sample_rate);
+    int64_t out_nb_samples =
+        av_rescale_rnd(delay + av_frame->nb_samples, out_sample_rate_, in_sample_rate, AV_ROUND_UP);
+
+    // 2. 分配目标帧
     AVFrame* resampled_frame = av_frame_alloc();
     if (!resampled_frame) {
         LOG_ERROR("Failed to allocate resampled AVFrame.");
         return;
     }
 
-    // 注入目标声卡拓扑结构签名
+    // 设置目标输出参数
     resampled_frame->sample_rate = out_sample_rate_;
     resampled_frame->format = out_sample_fmt_;
     resampled_frame->channels = out_channels_;
@@ -436,7 +444,7 @@ void AudioDecoder::ProcessAndResample(AVFrame* av_frame) {
         return;
     }
 
-    // 3. 驱动重采样引擎执行转换
+    // 3. 执行重采样转换
     int actual_out_samples = swr_convert(swr_ctx_, resampled_frame->data, resampled_frame->nb_samples,
                                          (const uint8_t**)av_frame->data, av_frame->nb_samples);
 
@@ -448,28 +456,21 @@ void AudioDecoder::ProcessAndResample(AVFrame* av_frame) {
         return;
     }
 
-    // 4. 校正实际样本数并继承呈现时间戳 (PTS)
+    // 4. 修正实际采样数并继承 PTS
     resampled_frame->nb_samples = actual_out_samples;
     resampled_frame->pts = av_frame->pts;
 
-    // 5. 跨系统边界所有权移交：将 C 指针移交至 RAII 智能资产容器，交由下游接管生命周期
+    // 5. 移交所有权给 Frame（RAII，下游接管生命周期）
     auto final_frame = std::make_shared<av::Frame>(resampled_frame);
 
-    // 6. 设置当前音频帧的物理时间，即将PTS转换为秒
-    // 如果这一帧携带了有效的显示时间戳，我才去计算它的秒数
-    // AV_NOPTS_VALUE 的全称是 "No Presentation Time Stamp Value"（没有显示时间戳值）
+    // 6. 将流时间基的 PTS 换算为微秒时间戳（AV_NOPTS_VALUE 表示无有效 PTS）
     if (final_frame->GetPts() != AV_NOPTS_VALUE) {
         AVRational us_q = {1, 1000000};
-
-        // 使用 FFmpeg 底层的全整数无损换算，直接将当前流时基(time_base_)转换为微秒时基(us_q)
-        int64_t pts_sec = av_rescale_q(final_frame->GetPts(), time_base_, us_q);
-
-        // 注入微秒时间戳
-        final_frame->SetTimestamp(pts_sec);
+        int64_t pts_us = av_rescale_q(final_frame->GetPts(), time_base_, us_q);
+        final_frame->SetTimestamp(pts_us);
     }
 
-    // 跳转过程中丢弃所有旧帧，不发送给下游
-    // is_seeking_ 锁定期 或 尚未处理 Flush 包(awaiting_flush_) 均丢弃
+    // 7. Seek 期间丢弃旧帧：is_seeking_ 锁定期或尚未处理 Flush 包（awaiting_flush_）均丢弃
     if ((sync_ctx_ && sync_ctx_->is_seeking_.load()) || awaiting_flush_.load()) {
         return;
     }

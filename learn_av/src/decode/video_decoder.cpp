@@ -1,8 +1,8 @@
 /**
  * @file video_decoder.cpp
- * @brief 视频解码类的核心实现
- * @details 负责从 Demuxer 接收压缩比特流，驱动底层硬/软件解码引擎，
- * 提取 YUV420P 裸数据并封装至 DTO 中，交由下游 GPU 管线进行色彩空间转换与渲染
+ * @brief 视频解码模块实现
+ * @details 独立解码线程：从队列取压缩 AVPacket，经 avcodec_send_packet/avcodec_receive_frame 解码，
+ *          非 YUV420P 像素格式经 SwsContext 转换，拷贝为紧凑步长的 VideoFrame 推送下游渲染
  */
 #include "video_decoder.h"
 
@@ -138,6 +138,7 @@ void VideoDecoder::PushPacket(std::shared_ptr<Packet> packet) {
     if (packet->HasFlag(av::AVFrameFlag::kFlush)) {
         packet_queue_.Clear();
     }
+    
     // 隐式背压：队列容量满载时将阻塞 Demuxer 线程
     packet_queue_.Push(std::move(packet));
 }
@@ -266,9 +267,8 @@ void VideoDecoder::Close() {
 }
 
 /**
- * @brief 视频解码核心调度循环 (Video Decoding Event Loop)
- * @details 负责从 Demuxer 接收压缩比特流，驱动底层硬件/软件解码引擎，
- * 并在无锁环境下执行内存剥离对齐与下游路由投递。
+ * @brief 视频解码核心调度循环
+ * @details 从队列取压缩包、驱动解码引擎、拷贝为紧凑 VideoFrame 并投递下游。
  */
 void VideoDecoder::ThreadLoop() {
     if (!sync_ctx_) {
@@ -357,18 +357,12 @@ void VideoDecoder::ThreadLoop() {
                 // 内部参考帧不足，需继续供给 AVPacket 才能输出画面
                 break;
             } else if (ret == AVERROR_EOF) {
-                // 解码管线彻底排空
+                // 解码管线彻底排空，向下游发送 EOF 空帧
                 if (listener_) {
                     LOG_INFO("Video decoding reached physical EOF.");
-
-                    // 创建一个空帧
                     auto eof_frame = std::make_shared<VideoFrame>(0, 0);
                     eof_frame->AddFlag(AVFrameFlag::kEOF);
-
-                    // 传给音画同步模块
-                    if (listener_) {
-                        listener_->OnNotifyVideoFrame(std::move(eof_frame));
-                    }
+                    listener_->OnNotifyVideoFrame(std::move(eof_frame));
                 }
                 break;
             } else if (ret < 0) {
@@ -394,10 +388,10 @@ void VideoDecoder::ThreadLoop() {
 }
 
 /**
- * @brief 处理解码出的裸帧，打包 YUV 分量数据并分发给 OpenGL 渲染器
- * @param frame FFmpeg 原生裸帧指针 (存在内存 Padding)
- * @details 若源像素格式非 YUV420P（如硬解 NV12 / YUV422P / YUV444P），先经 SwsContext 统一转换，
- *          再执行内存对齐剥离，杜绝下游 OpenGL 因平面布局不符而花屏或越界崩溃。
+ * @brief 将解码裸帧拷贝为紧凑步长的 YUV420P VideoFrame 并分发下游
+ * @param frame FFmpeg 原生裸帧（各平面含对齐 Padding，步长为 linesize）
+ * @details 非 YUV420P（如 NV12/YUV422P/YUV444P）先经 SwsContext 转换；
+ *          再按行拷贝去除 Padding，色度尺寸向上取整 (w+1)/2 兼容奇数分辨率
  */
 void VideoDecoder::ProcessAndPack(AVFrame* frame) {
     // 1. 校验 frame

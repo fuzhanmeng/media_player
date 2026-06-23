@@ -60,11 +60,13 @@ signals:
     /**
      * @brief 播放进度更新信号
      * @param progress 当前进度百分比 [0.0, 1.0]
-     * @param current_time 当前播放时间（秒）
-     * @param total_time 视频总时长（秒）
-     * @details 供外部控制面板绑定，用于驱动进度条 (QSlider) 和时间文本更新
+     * @param current_us 当前播放时间（单位：微秒）
+     * @param total_us 媒体总时长（单位：微秒）
+     * @details 供外部控制面板绑定，驱动进度条 (QSlider) 与时间文本更新。
+     *          时间参数须用 int64_t：跨线程 queued connection 按声明签名匹配，
+     *          若声明为 float，微秒值会被截断丢精度（约 16.7 秒后失真）
      */
-    void sigPlaybackProgress(float progress, float current_time, float total_time);
+    void sigPlaybackProgress(float progress, int64_t current_us, int64_t total_us);
 
     /**
      * @brief 播放流物理结束信号

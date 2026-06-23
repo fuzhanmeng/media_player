@@ -167,21 +167,25 @@ void AVSynchronizer::PushVideoFrame(std::shared_ptr<VideoFrame> video_frame) {
 
     // 2. 处理带内 Flush 信令
     if (video_frame->HasFlag(av::AVFrameFlag::kFlush)) {
-        LOG_DEBUG("AV_Sync receive IN-BAND Flush signal");
+        LOG_DEBUG("AV_Sync receive in-band Flush signal");
 
         // 1. 清空视频队列
         video_queue_.Clear();
 
-        // 2. 确何在暂停态 Seek 后，新到达的第一帧能够立刻渲染上屏
+        // 2. 确保暂停态 Seek 后，新到达的第一帧能立刻渲染显示
         force_render_.store(true);
 
-        // 2.1 视频主时钟基准失效，需要在下一帧重新建立（无音频轨道场景）
+        // 2.1 视频主时钟基准失效，需在下一帧重建（无音频轨道场景）
         reset_video_clock_.store(true);
         video_clock_us_.store(-1);
 
-        // 3. 信令已达，解除全局的 Seek 锁定期，允许后续画面正常进入同步环节
+        // 2.2 复位音频结束标志：Seek（尤其从 EOF 位置回跳）后音频会重新播放，
+        //     若残留 audio_finished_=true，会令同步逻辑在过渡期误判音频已永久停止
+        audio_finished_.store(false);
+
+        // 3. 信令已达，唤醒挂起的工作线程，允许后续画面进入同步环节
         if (sync_ctx_) {
-            sync_ctx_->state_cv_.notify_all(); // 唤醒沉睡的工作线程
+            sync_ctx_->state_cv_.notify_all();
         }
 
         return;
@@ -211,7 +215,9 @@ void AVSynchronizer::PushVideoFrame(std::shared_ptr<VideoFrame> video_frame) {
  */
 void AVSynchronizer::NotifyAudioFinished() {
     audio_finished_.store(true);
-    sync_ctx_->state_cv_.notify_all();
+    if (sync_ctx_) {
+        sync_ctx_->state_cv_.notify_all();
+    }
 }
 
 /**
@@ -318,7 +324,7 @@ void AVSynchronizer::ThreadLoop() {
 
         // 阶段5：视频主时钟定时渲染（无音频轨道）
         // audio_speaker_ 为空，或当前媒体没有音频流（has_audio_=false）时，
-        // 不能再以音频时钟为基准（音频时钟恒为 -1 会导致画面以解码速度狂飙），
+        // 不能再以音频时钟为基准（音频时钟恒为 -1 会导致画面以解码速度失控播放），
         // 改用系统墙钟 + 视频 PTS 自驱定时，保证正常速率播放，并维护 video_clock_us_ 供进度条读取。
 
         if (!audio_speaker_ || !has_audio_.load()) {

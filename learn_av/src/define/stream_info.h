@@ -16,6 +16,8 @@ struct StreamInfo {
     // 视频参数
     int width_{0}; ///< 视频宽度
     int height_{0}; ///< 视频高度
+    int fps_num_{0}; ///< 帧率分子（由 av_guess_frame_rate 推断）
+    int fps_den_{0}; ///< 帧率分母
 
     // 音频参数
     int sample_rate_{0}; ///< 采样率
