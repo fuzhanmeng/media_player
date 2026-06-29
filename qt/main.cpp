@@ -11,6 +11,7 @@
 
 #include "logger.h"
 #include "main_window.h"
+#include "playback_state.h"
 
 // 全局标志，用于优雅退出
 static std::atomic<bool> g_should_exit = false;
@@ -117,6 +118,10 @@ int main(int argc, char *argv[]) {
 
         // 5. 创建应用程序对象
         QApplication a(argc, argv);
+
+        // 注册自定义枚举为 Qt 元类型：状态变更信号可能从后台线程（如 Seek 完成后由解复用线程触发）
+        // 发出，跨线程 queued connection 要求参数类型已注册，否则事件被静默丢弃
+        qRegisterMetaType<av::PlaybackState>("av::PlaybackState");
 
         // 新增命令行参数解析
         QCommandLineParser parser;

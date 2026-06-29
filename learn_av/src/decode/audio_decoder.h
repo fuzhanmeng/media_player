@@ -135,6 +135,10 @@ private:
     std::thread decode_thread_;
     std::atomic<bool> is_abort_requested_{true}; ///< 物理线程终止信令，true=线程应退出
 
+    // 5.1 Seek 期间丢帧门闩：置位后丢弃所有帧，直到处理完 kFlush 包才复位
+    // 解决"is_seeking_ 已清零但 Flush 包尚未处理"这一时间窗内旧帧漏帧问题
+    std::atomic<bool> awaiting_flush_{false};
+
     // 6. 全局状态同步上下文 (The Source of Truth)
     std::shared_ptr<SyncContext> sync_ctx_{nullptr};
 };

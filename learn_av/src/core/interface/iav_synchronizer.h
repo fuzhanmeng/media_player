@@ -98,6 +98,20 @@ public:
      *          AVSync 内部据此区分"SDL 过渡期"和"音频永久停止"两种情况
      */
     virtual void NotifyAudioFinished() = 0;
+
+    /**
+     * @brief 告知同步器当前媒体是否含有音频轨道
+     * @param has_audio true: 走音频主时钟同步；false: 退化为视频主时钟(系统时钟)定时渲染
+     * @details 无音频时若仍以音频时钟为基准，画面会以解码速度狂飙，故必须切换为视频主时钟
+     */
+    virtual void SetHasAudio(bool has_audio) = 0;
+
+    /**
+     * @brief 获取视频主时钟（最近一帧已渲染的 PTS，单位：微秒）
+     * @return 时钟值，未就绪时返回 -1
+     * @note 仅在无音频轨道时用于驱动 UI 进度条
+     */
+    virtual int64_t GetVideoClockUs() const = 0;
 };
 
 } // namespace av

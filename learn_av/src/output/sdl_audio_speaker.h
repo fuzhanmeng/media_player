@@ -10,7 +10,7 @@
 #include <mutex>
 
 #include "define/av_frame.h"
-#include "interface/iaudio_speaker.h"
+#include "output/interface/iaudio_speaker.h"
 #include "utils/thread_safe_queue.h"
 
 namespace av {
@@ -126,6 +126,12 @@ private:
 
     std::mutex sync_mutex_;
     std::atomic<bool> is_playing_{false};
+
+    /// EOF 通知幂等门闩：保证 OnAudioCompleted 仅触发一次，Open/Flush/ResetAlock 时复位
+    std::atomic<bool> eof_fired_{false};
+
+    /// 欠载日志计数器（实例私有，避免 static 跨实例数据竞争）
+    int underrun_log_count_{0};
 
     // 设计原则：内部计算全部使用整数，对外提供浮点接口
     std::atomic<int64_t> audio_clock_us_{-1};

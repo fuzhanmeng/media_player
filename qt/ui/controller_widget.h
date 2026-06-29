@@ -50,6 +50,12 @@ public:
      */
     void SetSliderProgress(float progress);
 
+    /**
+     * @brief 设置录制按钮的 UI 状态
+     * @param is_recording true: 按钮显示"停止录制", false: 按钮显示"录制"
+     */
+    void SetRecordState(bool is_recording);
+
     // ================= 向 MainWindow 汇报用户意图的信号 =================
 signals:
     /**
@@ -74,6 +80,12 @@ signals:
      */
     void sigSeekRequested(float target_progress);
 
+    /**
+     * @brief 用户点击了录制按钮
+     * @param should_start true 表示请求开始录制，false 表示请求停止录制
+     */
+    void sigRecordToggled(bool should_start);
+
 private slots:
     // ================= 内部响应 UI 物理点击的槽函数 =================
 
@@ -90,8 +102,12 @@ private slots:
     /**
      * @brief 进度条拖拽松开事件
      */
-
     void onSliderReleased();
+
+    /**
+     * @brief 录制按钮点击
+     */
+    void onRecordButtonClicked();
 
 private:
     /**
@@ -103,9 +119,10 @@ private:
     // UI 控件指针 (不需要智能指针，Qt 的对象树系统会自动回收 parent 相同的组件)
     QPushButton* m_buttonImport{nullptr};
     QPushButton* m_buttonPlay{nullptr};
+    QPushButton* m_buttonRecord{nullptr};
     QLabel* m_labelTime{nullptr};
-    QSlider* m_sliderProgress{nullptr}; // 播放进度条
+    QSlider* m_sliderProgress{nullptr};
 
-    // 内部状态记录：当前按钮是处于播放还是暂停状态
     bool m_isPlaying{false};
+    bool m_isRecording{false};
 };

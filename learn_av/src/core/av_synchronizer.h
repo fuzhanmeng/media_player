@@ -7,12 +7,13 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <thread>
 
-#include "interface/iaudio_speaker.h"
-#include "interface/iav_synchronizer.h"
+#include "output/interface/iaudio_speaker.h"
+#include "core/interface/iav_synchronizer.h"
 #include "playback_sync.h"
 #include "utils/thread_safe_queue.h"
 #include "video_frame.h"
@@ -89,6 +90,16 @@ public:
      */
     void NotifyAudioFinished() override;
 
+    /**
+     * @brief 告知同步器当前媒体是否含有音频轨道
+     */
+    void SetHasAudio(bool has_audio) override;
+
+    /**
+     * @brief 获取视频主时钟（最近渲染帧 PTS，微秒），无音频时供 UI 进度条使用
+     */
+    int64_t GetVideoClockUs() const override;
+
 private:
     /**
      * @brief 内部核心工作线程
@@ -129,6 +140,20 @@ private:
 
     // 音频是否已永久停止 - SDL 收到 EOF 后由外部设置
     std::atomic<bool> audio_finished_{false};
+
+    // 当前媒体是否含有音频轨道。false 时退化为视频主时钟定时渲染
+    std::atomic<bool> has_audio_{true};
+
+    // ===== 视频主时钟（无音频轨道时启用）=====
+    // 最近一帧已渲染的 PTS（微秒），供 UI 进度条读取；-1 表示未就绪
+    std::atomic<int64_t> video_clock_us_{-1};
+
+    // 视频主时钟需要重新建立基准（Start / Seek-Flush 后置位）
+    std::atomic<bool> reset_video_clock_{true};
+
+    // 视频主时钟基准：首帧 PTS 与对应的物理墙钟时间（仅 ThreadLoop 内访问）
+    int64_t video_master_first_pts_us_{0};
+    std::chrono::steady_clock::time_point video_master_start_time_;
 };
 
 } // namespace av

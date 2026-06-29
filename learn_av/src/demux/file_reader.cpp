@@ -4,8 +4,8 @@
  */
 #include "file_reader.h"
 
+#include <cmath>
 #include <memory>
-#include <mutex>
 #include <string>
 
 #include "logger.h"
@@ -159,9 +159,14 @@ int FileReader::GetVideoWidth() const { return video_width_; }
 int FileReader::GetVideoHeight() const { return video_height_; }
 
 /**
+ * @brief 获取视频帧率（四舍五入整数），未知时返回兜底值 25
+ */
+int FileReader::GetVideoFps() const { return video_fps_ > 0 ? video_fps_ : 25; }
+
+/**
  * @brief 是否含有音频轨道
  */
-bool FileReader::HasAduio() const { return demuxer_ ? demuxer_->HasAudio() : false; }
+bool FileReader::HasAudio() const { return demuxer_ ? demuxer_->HasAudio() : false; }
 
 /**
  * @brief 是否含有视频轨道
@@ -175,6 +180,13 @@ bool FileReader::HasVideo() const { return demuxer_ ? demuxer_->HasVideo() : fal
 void FileReader::OnNotifyVideoStream(const StreamInfo& info) {
     video_width_ = info.width_;
     video_height_ = info.height_;
+
+    // 由帧率分数换算为四舍五入整数帧率，供录制使用；分母非法时置 0（GetVideoFps 走兜底）
+    if (info.fps_den_ > 0 && info.fps_num_ > 0) {
+        video_fps_ = static_cast<int>(std::lround(static_cast<double>(info.fps_num_) / info.fps_den_));
+    } else {
+        video_fps_ = 0;
+    }
 
     if (video_decoder_) {
         // 发送流参数至视频解码器进行初始化

@@ -87,9 +87,14 @@ public:
     int GetVideoHeight() const override;
 
     /**
+     * @brief 获取视频帧率（四舍五入为整数），无有效帧率时返回兜底值 25
+     */
+    int GetVideoFps() const override;
+
+    /**
      * @brief 是否含有音频轨道
      */
-    bool HasAduio() const override;
+    bool HasAudio() const override;
 
     /**
      * @brief 是否含有视频轨道
@@ -159,6 +164,7 @@ private:
     // 媒体元数据缓存
     int video_width_{0};
     int video_height_{0};
+    int video_fps_{0}; ///< 视频帧率（四舍五入整数），0 表示未知
     double duration_{0.0};
 };
 

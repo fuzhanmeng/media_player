@@ -91,6 +91,12 @@ private slots:
     void onUserSeekRequested(float target_progress);
 
     /**
+     * @brief 响应录制按钮切换
+     * @param should_start true 表示开始录制，false 表示停止录制
+     */
+    void onUserRecordToggled(bool should_start);
+
+    /**
      * @brief 响应视频渲染区域的鼠标点击
      * @details 实现点击画面即可切换播放/暂停的便捷功能
      */
@@ -143,5 +149,8 @@ private:
     ControllerWidget* m_controllerWidget{nullptr};
 
     /// 记录当前播放的文件路径
-    QString m_currentFilePath;  
+    QString m_currentFilePath;
+
+    /// 是否正在录制
+    bool m_isRecording{false};
 };

@@ -115,7 +115,7 @@ public:
 
     /**
      * @brief 获取当前媒体全局总时长
-     * @return 总时长（单位：秒）若是直播流或未就绪，返回 0.0
+     * @return 总时长（单位：微秒，AV_TIME_BASE 时基）；直播流或未就绪返回 0
      */
     virtual int64_t GetDuration() const = 0;
 
@@ -130,6 +130,17 @@ public:
      * @note 仅在 Open 成功解析流信息后有效
      */
     virtual int GetVideoHeight() const = 0;
+
+    /**
+     * @brief 开始录制，将播放管线中的 PCM/YUV 编码并封装为 MP4 文件
+     * @param path 输出文件路径（由 UI 层在录制开始时提供）
+     */
+    virtual void StartRecord(const std::string& path) = 0;
+
+    /**
+     * @brief 停止录制：排空编码队列、Flush 编码器、写 MP4 索引表并关闭文件
+     */
+    virtual void StopRecord() = 0;
 
     /**
      * @brief 查询当前播放器状态机的原子状态

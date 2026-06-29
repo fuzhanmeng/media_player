@@ -10,13 +10,13 @@
 #include <memory>
 #include <string>
 
+#include "core/interface/iav_synchronizer.h"
 #include "define/av_frame.h"
-#include "interface/iaudio_speaker.h"
-#include "interface/iav_synchronizer.h"
 #include "demux/interface/ifile_reader.h"
 #include "iplayer.h"
 #include "ivideo_sink.h"
 #include "logger.h"
+#include "output/interface/iaudio_speaker.h"
 #include "playback_state.h"
 #include "playback_sync.h"
 #include "video_frame.h"
@@ -81,6 +81,12 @@ Player::Player(std::shared_ptr<IGLContext> gl_context)
         is_progress_thread_running_.store(true);
         progress_thread_ = std::thread(&Player::ProgressLoop, this);
     }
+
+    // 6. 创建录制实例
+    file_writer_ = std::unique_ptr<IFileWriter> (IFileWriter::Create());
+    if (!file_writer_) {
+        LOG_ERROR("Create file writer failed");
+    }
 }
 
 /**
@@ -100,7 +106,7 @@ Player::~Player() {
  * @brief 绑定视频渲染槽
  * @param sink 实现了 IVideoSink 接口的视频帧接收器
  */
-void Player::Player::AttachDisplayView(IVideoSink* sink) {
+void Player::AttachDisplayView(IVideoSink* sink) {
     std::lock_guard<std::mutex> lock(sinks_mutex_);
 
     // 检查是否已经绑定，防止重复添加导致同一帧被渲染两次
@@ -117,8 +123,8 @@ void Player::Player::AttachDisplayView(IVideoSink* sink) {
  * @brief 解绑视频渲染槽
  * @param sink 要解绑的视频帧接收器
  */
-void Player::Player::DetachDisplayView(IVideoSink* sink) {
-    std::lock_guard<std::mutex> lcok(sinks_mutex_);
+void Player::DetachDisplayView(IVideoSink* sink) {
+    std::lock_guard<std::mutex> lock(sinks_mutex_);
 
     // find 要解绑的 sink
     auto it = std::find(video_sinks_.begin(), video_sinks_.end(), sink);
@@ -155,7 +161,12 @@ bool Player::Open(const std::string& url) {
     video_finished_.store(false);
 
     has_video_.store(file_reader_->HasVideo());
-    has_audio_.store(file_reader_->HasAduio());
+    has_audio_.store(file_reader_->HasAudio());
+
+    // 将"是否含音频轨道"同步给音画同步器：无音频时切换为视频主时钟定时渲染
+    if (av_sync_) {
+        av_sync_->SetHasAudio(has_audio_.load());
+    }
     return ret;
 }
 
@@ -173,6 +184,10 @@ void Player::Play() {
     if (sync_ctx_->state_.compare_exchange_strong(expected_opened, PlaybackState::kPlaying)) {
         LOG_INFO("====== State transition: kOpened -> kPlaying. Initializing worker threads ======");
 
+        // 0. 复位 EOF 标志，避免上一轮播放残留导致提前判定播放完成
+        audio_finished_.store(false);
+        video_finished_.store(false);
+
         // 1. 先启动消费者
         if (av_sync_) {
             av_sync_->Start();
@@ -187,8 +202,8 @@ void Player::Play() {
             file_reader_->Start(sync_ctx_);
         }
 
-        if (listener_) {
-            listener_->OnPlaybackStateChanged(PlaybackState::kPlaying);
+        if (auto* l = listener_.load()) {
+            l->OnPlaybackStateChanged(PlaybackState::kPlaying);
         }
         return;
     }
@@ -205,8 +220,8 @@ void Player::Play() {
         // 唤醒其他线程
         sync_ctx_->state_cv_.notify_all();
 
-        if (listener_) {
-            listener_->OnPlaybackStateChanged(PlaybackState::kPlaying);
+        if (auto* l = listener_.load()) {
+            l->OnPlaybackStateChanged(PlaybackState::kPlaying);
         }
         return;
     }
@@ -215,6 +230,10 @@ void Player::Play() {
     PlaybackState expected_stopped = PlaybackState::kStopped;
     if (sync_ctx_->state_.compare_exchange_strong(expected_stopped, PlaybackState::kPlaying)) {
         LOG_INFO("====== State transition: kStopped -> kPlaying. Re-initializing worker threads ======");
+
+        // 0. 复位 EOF 标志，避免上一轮播放残留导致提前判定播放完成
+        audio_finished_.store(false);
+        video_finished_.store(false);
 
         // 1. 先启动消费者
         if (av_sync_) {
@@ -230,8 +249,8 @@ void Player::Play() {
             file_reader_->Start(sync_ctx_);
         }
 
-        if (listener_) {
-            listener_->OnPlaybackStateChanged(PlaybackState::kPlaying);
+        if (auto* l = listener_.load()) {
+            l->OnPlaybackStateChanged(PlaybackState::kPlaying);
         }
         return;
     }
@@ -266,8 +285,8 @@ void Player::Pause() {
         sync_ctx_->state_cv_.notify_all();
 
         // 业务回调：通知 UI 层状态变更
-        if (listener_) {
-            listener_->OnPlaybackStateChanged(PlaybackState::kPaused);
+        if (auto* l = listener_.load()) {
+            l->OnPlaybackStateChanged(PlaybackState::kPaused);
         }
     } else {
         LOG_DEBUG("Pause() invoked but state is not kPlaying.");
@@ -280,9 +299,9 @@ void Player::Pause() {
 void Player::Stop() {
     LOG_INFO("========== Play Stop ==========");
 
-    // 1. 获取当前状态，如果已经停止
+    // 获取当前状态，若处于 kIdle（从未播放）或 kStopped（已停止）则无需重复执行
     PlaybackState current_state = sync_ctx_->state_.load();
-    if (current_state == PlaybackState::kIdle) {
+    if (current_state == PlaybackState::kIdle || current_state == PlaybackState::kStopped) {
         return;
     }
 
@@ -369,7 +388,7 @@ void Player::SeekTo(int64_t target_time_us) {
 
 /**
  * @brief 获取当前媒体全局总时长
- * @return 总时长（单位：秒）。若是直播流或未就绪，返回 0.0
+ * @return 总时长（单位：微秒）。若是直播流或未就绪，返回 0
  */
 int64_t Player::GetDuration() const {
     // if  file_reader_ != nullptr, return file_reader_->GetDuration()
@@ -397,7 +416,48 @@ PlaybackState Player::GetState() const {
     return sync_ctx_->state_.load();
 }
 
-void Player::SetListener(IPlayer::Listener* listener) { listener_ = listener; }
+void Player::SetListener(IPlayer::Listener* listener) { listener_.store(listener); }
+
+/**
+ * @brief 开启录制：初始化编码器与复用器并启动编码线程
+ * @param path 输出 MP4 文件路径
+ */
+void Player::StartRecord(const std::string& path) {
+    // 防重入：已在录制时忽略，避免重复 Init 泄漏编码器上下文并启动多余线程
+    if (is_recording_.load()) {
+        LOG_WARN("StartRecord ignored: recording already in progress");
+        return;
+    }
+
+    if (!file_writer_ || !file_reader_) {
+        LOG_ERROR("StartRecord failed: file_writer_ or file_reader_ not ready");
+        return;
+    }
+
+    // 录制分辨率与帧率取自当前媒体源；采样率/声道已在 OnFileReaderAudioInfo 写入 paramters_
+    paramters_.width_ = file_reader_->GetVideoWidth();
+    paramters_.height_ = file_reader_->GetVideoHeight();
+    paramters_.fps_ = file_reader_->GetVideoFps(); // 透传源真实帧率，保证录制视频时间轴速度正确
+
+    // Init 成功（编码器/复用器就绪且编码线程已启动）后才置录制标志
+    if (!file_writer_->Init(path, paramters_)) {
+        LOG_ERROR("FileWriter Init failed, recording not started");
+        return;
+    }
+
+    is_recording_.store(true);
+}
+
+/**
+ * @brief 停止录制
+ */
+void Player::StopRecord() {
+    is_recording_.store(false);
+
+    if (file_writer_) {
+        file_writer_->Stop();
+    }
+}
 
 // ================= IFileReader::Listener 数据上行接口实现 =================
 
@@ -426,7 +486,12 @@ void Player::OnFileReaderNotifyAudioFrame(std::shared_ptr<Frame> audio_frame) {
 
     // 4. 将音频帧直接投递至物理扬声器的线程安全队列中
     if (audio_speaker_) {
-        audio_speaker_->PushAudioFrame(std::move(audio_frame));
+        audio_speaker_->PushAudioFrame(audio_frame);
+    }
+
+    // 5. 将音频帧给到音频编码
+    if (file_writer_ && is_recording_.load()) {
+        file_writer_->PushAudioFrame(audio_frame);
     }
 }
 
@@ -440,7 +505,7 @@ void Player::OnFileReaderNotifyVideoFrame(std::shared_ptr<VideoFrame> video_fram
         return;
     }
 
-    // 2. 判断是不是Flush/EOF 包
+    // 2. 判断是否为控制帧（Flush/EOF），控制帧直接透传至同步器，不做有效性校验
     if (video_frame->HasFlag(AVFrameFlag::kFlush) || video_frame->HasFlag(AVFrameFlag::kEOF)) {
         if (av_sync_) {
             av_sync_->PushVideoFrame(std::move(video_frame));
@@ -448,14 +513,19 @@ void Player::OnFileReaderNotifyVideoFrame(std::shared_ptr<VideoFrame> video_fram
         }
     }
 
-    // 4. 常规数据的合法性校验
+    // 3. 常规数据帧有效性校验
     if (!video_frame->IsValid()) {
         return;
     }
 
-    // 5. 将视频送入音画同步模块
+    // 4. 将视频帧投递至音画同步模块
     if (av_sync_) {
-        av_sync_->PushVideoFrame(std::move(video_frame));
+        av_sync_->PushVideoFrame(video_frame);
+    }
+
+    // 5. 将YUV420P 传给视频编码模块
+    if (file_writer_ && is_recording_.load()) {
+        file_writer_->PushVideoFrame(video_frame);
     }
 }
 
@@ -536,8 +606,9 @@ void Player::OnFileReaderSeekCompleteResumePlay() {
  * @brief 接收获取到的采样率和声道数，启动SDL音频播放功能
  */
 void Player::OnFileReaderAudioInfo(int sample_rate, int channels) {
-    LOG_INFO("Player received audio format from pipeline: {}Hz, {} channels. Opening sound card...", sample_rate,
-             channels);
+
+    paramters_.sample_rate_ = sample_rate;
+    paramters_.channels_ = channels;
 
     if (audio_speaker_) {
         bool ret = audio_speaker_->Open(sample_rate, channels);
@@ -560,8 +631,8 @@ void Player::ChangeState(PlaybackState new_state) {
     if (old_state != new_state) {
         LOG_INFO("State transition: {} -> {}", StateToString(old_state), StateToString(new_state));
 
-        if (listener_) {
-            listener_->OnPlaybackStateChanged(new_state);
+        if (auto* l = listener_.load()) {
+            l->OnPlaybackStateChanged(new_state);
         }
     }
 }
@@ -574,10 +645,17 @@ void Player::ProgressLoop() {
 
     while (is_progress_thread_running_.load()) {
         if (sync_ctx_ && sync_ctx_->state_.load() == PlaybackState::kPlaying) {
-            // 1. 获取当前时间（微妙）
-            int64_t current_time_us = 0;
-            if (audio_speaker_) {
-                current_time_us = audio_speaker_->GetAudioClockUs();
+            // 1. 获取当前时间（微秒）
+            //    有音频轨道：以音频主时钟为准；无音频轨道：退化为 AVSync 维护的视频主时钟
+            int64_t current_time_us = -1;
+            if (has_audio_.load()) {
+                if (audio_speaker_) {
+                    current_time_us = audio_speaker_->GetAudioClockUs();
+                }
+            } else {
+                if (av_sync_) {
+                    current_time_us = av_sync_->GetVideoClockUs();
+                }
             }
 
             // 时钟未就绪时跳过本次更新，继续循环等待
@@ -586,7 +664,7 @@ void Player::ProgressLoop() {
                 continue;
             }
 
-            // 2. 获取总时长（微妙）
+            // 2. 获取总时长（微秒）
             int64_t total_time_us = file_reader_ ? file_reader_->GetDuration() : 0;
 
             // 3. 计算百分比
@@ -599,8 +677,8 @@ void Player::ProgressLoop() {
             }
 
             // 4. 触发回调
-            if (listener_) {
-                listener_->OnPlaybackProgress(progress, current_time_us, total_time_us);
+            if (auto* l = listener_.load()) {
+                l->OnPlaybackProgress(progress, current_time_us, total_time_us);
             }
         }
         std::this_thread::sleep_for(kUpdateInterval);
@@ -626,10 +704,10 @@ void Player::CheckAndNotifyPlaybackCompleted() {
             LOG_INFO("Playback TRULY Completed. Notifying UI...");
 
             // 4. 唯一合法的 UI 通知触发点
-            if (listener_) {
-                listener_->OnPlaybackCompleted();
+            if (auto* l = listener_.load()) {
+                l->OnPlaybackCompleted();
             }
         }
     }
 }
-}; // namespace av
+} // namespace av

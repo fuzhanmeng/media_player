@@ -6,9 +6,12 @@
 #include "main_window.h"
 
 #include <QCloseEvent>
+#include <QDateTime>
+#include <QDir>
 #include <QFileDialog>
 #include <QMessageBox>
 #include <QOpenGLContext>
+#include <QStandardPaths>
 #include <QVBoxLayout>
 
 #include "igl_context.h"
@@ -77,6 +80,7 @@ void MainWindow::SetupConnections() {
     connect(m_controllerWidget, &ControllerWidget::sigPlayClicked, this, &MainWindow::onUserPlayRequested);
     connect(m_controllerWidget, &ControllerWidget::sigPauseClicked, this, &MainWindow::onUserPauseRequested);
     connect(m_controllerWidget, &ControllerWidget::sigSeekRequested, this, &MainWindow::onUserSeekRequested);
+    connect(m_controllerWidget, &ControllerWidget::sigRecordToggled, this, &MainWindow::onUserRecordToggled);
 
     // 捕获画面点击以切换播放/暂停
     connect(m_playerWidget, &PlayerWidget::sigVideoClicked, this, &MainWindow::onVideoAreaClicked);
@@ -129,6 +133,14 @@ bool MainWindow::OpenMedia(const QString& url) {
  */
 void MainWindow::CloseMedia() {
     LOG_INFO("CloseMedia requested, resetting client pipeline state.");
+
+    // 若正在录制，先停止录制再停止播放
+    if (m_isRecording && m_player) {
+        m_player->StopRecord();
+        m_isRecording = false;
+        m_controllerWidget->SetRecordState(false);
+    }
+
     if (m_player) {
         m_player->Stop();
     }
@@ -203,6 +215,47 @@ void MainWindow::onUserSeekRequested(float target_progress) {
 }
 
 /**
+ * @brief 响应录制按钮切换
+ * @param should_start true 开始录制，false 停止录制
+ */
+void MainWindow::onUserRecordToggled(bool should_start) {
+    if (!m_player) return;
+
+    if (should_start) {
+        // 防重入：已在录制则忽略
+        if (m_isRecording) {
+            return;
+        }
+        // 仅在播放中才允许开始录制
+        if (m_player->GetState() != av::PlaybackState::kPlaying) {
+            m_controllerWidget->SetRecordState(false);
+            return;
+        }
+
+        // 生成输出路径：优先写入系统视频目录，其次回退到临时目录
+        QString dir = QStandardPaths::writableLocation(QStandardPaths::MoviesLocation);
+        if (dir.isEmpty()) {
+            dir = QDir::tempPath();
+        }
+        QDir().mkpath(dir);
+        QString path = dir + "/recording_" +
+                       QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss") + ".mp4";
+
+        LOG_INFO("StartRecord: {}", path.toStdString());
+        m_player->StartRecord(path.toStdString());
+        m_isRecording = true;
+    } else {
+        // 防重入：未在录制则忽略
+        if (!m_isRecording) {
+            return;
+        }
+        LOG_INFO("StopRecord");
+        m_player->StopRecord();
+        m_isRecording = false;
+    }
+}
+
+/**
  * @brief 响应视频渲染区域的鼠标点击
  * @details 判断当前引擎状态，智能切换播放与暂停
  */
@@ -238,10 +291,17 @@ void MainWindow::onEngineStateChanged(av::PlaybackState state) {
  * @details 物理流排空后，强制 UI 回归未播放状态并重置所有进度数据
  */
 void MainWindow::onEnginePlaybackCompleted() {
-    // 1. 重置 UI
+    // 播放自然结束时若正在录制，同步停止录制
+    if (m_isRecording && m_player) {
+        m_player->StopRecord();
+        m_isRecording = false;
+        m_controllerWidget->SetRecordState(false);
+    }
+
+    // 重置 UI
     m_controllerWidget->SetPlayState(false);
     m_controllerWidget->SetSliderProgress(0.0f);
-    m_controllerWidget->SetTimeDisplay(0LL, 0LL);    
+    m_controllerWidget->SetTimeDisplay(0LL, 0LL);
 }
 
 /**

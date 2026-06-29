@@ -107,7 +107,11 @@ OpenGLView::OpenGLView(QWidget* parent) : QOpenGLWidget(parent) {
  * @details 负责销毁显存中的纹理、顶点缓冲等物理资源，防止显存泄漏
  */
 OpenGLView::~OpenGLView() {
-    // 释放 OpenGL 显存资源时，必须确保当前线程持有 OpenGL Context
+    // 仅在 OpenGL 上下文有效时清理显存资源（窗口从未显示时 context 可能为空）
+    if (!context()) {
+        return;
+    }
+    // 释放显存资源前须确保当前线程持有 OpenGL Context
     makeCurrent();
 
     // 释放 3 个 YUV 纹理资源
@@ -262,9 +266,9 @@ void OpenGLView::paintGL() {
         m_textureInitialized = false;
     }
 
-    // UV 分量是 YUV420P 格式，宽高各为 Y 的一半
-    const int uv_width = frame->width_ / 2;
-    const int uv_height = frame->height_ / 2;
+    // UV 分量为 YUV420P，宽高各为 Y 的一半，向上取整 (w+1)/2 与解码层紧凑分配保持一致，兼容奇数分辨率
+    const int uv_width = (frame->width_ + 1) / 2;
+    const int uv_height = (frame->height_ + 1) / 2;
 
     // ==================== 上传 Y 分量 ====================
     // 激活 0 号纹理单元，对应 Shader 里的 texY

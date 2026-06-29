@@ -116,9 +116,14 @@ public:
     virtual int GetVideoHeight() const = 0;
 
     /**
+     * @brief 获取视频帧率（四舍五入为整数），无有效帧率时返回兜底值
+     */
+    virtual int GetVideoFps() const = 0;
+
+    /**
      * @brief 是否含有音频轨道
      */
-    virtual bool HasAduio() const = 0;
+    virtual bool HasAudio() const = 0;
 
     /**
      * @brief 是否含有视频轨道
