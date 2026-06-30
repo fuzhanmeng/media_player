@@ -1,330 +1,393 @@
 # ai-media-player
-AI 驱动的跨平台音视频播放器，基于 FFmpeg + Qt + OpenGL 实现完整媒体处理链路，已完成稳定的基础音视频播放全流程开发
+音视频播放器，基于 FFmpeg + Qt + OpenGL 实现完整媒体处理链路
 
 ---
 
 ## 项目简介
 本项目是一款功能完整的 C++ 音视频播放器，遵循标准媒体处理流程，已实现**文件读取、解封装、解码、音画同步、基础音视频效果处理、渲染播放**全链路能力
-项目采用模块化架构设计，各模块职责清晰、高度解耦，预留 AI 音视频增强、录制封装等扩展接口，可用于音视频开发学习、播放器原理研究及二次开发
+项目采用**基于独立线程 + 阻塞队列的节点图（DAG）** 架构设计，各模块以 Node 形式独立运行、强类型连接，预留 AI 音视频增强、硬件加速、自写流媒体协议、QoS 等扩展接口
 
 ---
 
-## 核心功能模块
-### 1. 文件解封装模块
-- **输入**：多路复用的音视频文件（支持 MP4、MKV 等主流格式）
-- **核心能力**：基于 FFmpeg 提取独立音视频流，解析文件头与元数据，分离音视频流时序信息
-- **输出**：解复用后的 AAC/MP3 音频流、H.264/H.265 视频流
+## 架构设计
 
-### 2. 音频解码模块
-- **输入**：文件解封装模块输出的压缩音频流
-- **核心能力**：FFmpeg 硬解/软解 AAC/MP3 为未压缩 PCM 格式，完整保留帧时间戳保障音画同步
-- **输出**：PCM 格式音频数据，传递至音画同步模块
+项目采用 **强类型固定拓扑的节点图（DAG）** 架构。每个功能模块抽象为独立线程 + 输入队列的 Node，节点之间通过强类型连接器（Link）串联，控制信令通过共享的 SyncContext 总线广播。该架构面向"自写流媒体协议 / 容器解析、硬件加速零拷贝、码率控制、色彩空间转换、QoS"等扩展方向预留位置
 
-### 3. 视频解码模块
-- **输入**：文件解封装模块输出的压缩视频流
-- **核心能力**：FFmpeg 解码 H.264/H.265 为 YUV 原始帧，转换为 RGBA 格式适配 OpenGL 渲染，完整保留帧时间戳
-- **输出**：RGBA 格式视频帧，传递至音画同步模块
+### 1. 源码目录结构
 
-### 4. 音画同步模块
-- **输入**：音频解码模块的 PCM 数据、视频解码模块的 RGBA 帧
-- **核心能力**：基于 PTS 时间戳对齐音视频播放顺序，实现毫秒级精准音画同步
-- **输出**：同步后的音视频帧，分别传递至音/视频处理链模块
-
-### 5. 音频处理链模块
-- **输入**：音画同步模块输出的 PCM 音频帧
-- **核心能力**：提供混音、均衡、音量调节等基础音频效果，预留 AI 降噪、人声增强等智能处理扩展接口
-- **输出**：处理后音频帧 → 音频播放模块（实时播放）
-
-### 6. 视频处理链模块
-- **输入**：音画同步模块输出的 RGBA 视频帧
-- **核心能力**：基于 OpenGL 加载纹理，支持黑白滤镜、画面翻转等基础特效，预留 AI 画质增强、人脸识别等扩展接口
-- **输出**：处理后视频帧 → 视频渲染模块（实时渲染）
-
-### 7. 音频播放模块
-- **输入**：音频处理链模块输出的 PCM 音频帧
-- **核心能力**：通过 Qt 音频接口将 PCM 数据输出至系统音频设备，实现低延迟实时播放
-- **输出**：音频数据直接输出至播放设备，无后续链路传递
-
-### 8. 视频渲染模块
-- **输入**：视频处理链模块输出的 RGBA 视频帧
-- **核心能力**：基于 OpenGL 将视频帧作为纹理加载，渲染至 Qt 控件，实现高帧率实时画面输出
-- **输出**：视频画面直接渲染至屏幕，无后续链路传递
-
-### 9. 音频编码模块（预留接口）
-- 预留录制场景下的音频编码能力接口，可扩展实现 PCM 转 AAC 压缩编码
-
-### 10. 视频编码模块（预留接口）
-- 预留录制场景下的视频编码能力接口，可扩展实现 RGBA 转 H.264 压缩编码
-
-### 11. 文件封装模块（预留接口）
-- 预留录制场景下的音视频封装能力接口，可扩展实现 MP4 文件封装输出
-
----
-
-## 项目架构与数据流
-```mermaid
-graph LR
-    A[文件解封装] -->|AAC/MP3| B[音频解码]
-    A -->|H.264/H.265| C[视频解码]
-    B -->|PCM| D[音画同步]
-    C -->|RGBA| D
-    D -->|PCM| E[音频处理链]
-    D -->|RGBA| F[视频处理链]
-    E -->|PCM| G[音频播放]
-    F -->|RGBA| I[视频渲染]
 ```
+ai-media-player/
+├── CMakeLists.txt
+├── learn_av/                              # 核心引擎静态库
+│   ├── include/                           # 对外暴露的公共 API
+│   │   ├── iplayer.h                      # Facade 接口
+│   │   ├── ivideo_sink.h                  # UI 注入点
+│   │   ├── playback_state.h
+│   │   ├── logger.h
+│   │   └── av_types/                      # 公共数据类型
+│   │       ├── byte_chunk.h               # 原始字节流（Source 输出）
+│   │       ├── packet.h                   # 压缩包 (含 codec_id/pts_us/frame_kind)
+│   │       ├── video_frame.h              # sum type: Software/Hardware variant
+│   │       ├── audio_frame.h              # PCM 帧
+│   │       └── stream_info.h              # VideoStreamInfo / AudioStreamInfo
+│   │
+│   └── src/
+│       ├── core/                          # DAG 框架
+│       │   ├── inode.h                    # 节点基类模板 INode<InT, OutT>
+│       │   ├── link.h                     # 强类型连接器（队列封装）
+│       │   ├── pipeline.h/.cpp            # 容器：Build/Start/Stop
+│       │   ├── fsm.h/.cpp                 # 显式状态机
+│       │   ├── sync_context.h             # 控制总线
+│       │   ├── clock.h                    # 时钟接口 IClockSource
+│       │   └── player_facade.h/.cpp       # 对 UI 的门面
+│       │
+│       ├── source/                        # 数据源层
+│       │   ├── isource_node.h
+│       │   ├── file_source_node.h/.cpp
+│       │   ├── http_source_node.h/.cpp
+│       │   ├── hls_source_node.h/.cpp
+│       │   └── rtp_source_node.h/.cpp
+│       │
+│       ├── demux/                         # 解封装节点群
+│       │   ├── ffmpeg_demuxer_node.h/.cpp # 用 libavformat（兜底）
+│       │   ├── flv_demuxer_node.h/.cpp    # 自写 FLV 解析
+│       │   └── mp4_demuxer_node.h/.cpp    # 自写 MP4 解析
+│       │
+│       ├── decode/
+│       │   ├── video_decoder_node.h/.cpp  # 支持 sw / hw 双模式
+│       │   ├── audio_decoder_node.h/.cpp
+│       │   └── hw_device_ctx.h/.cpp       # 硬件上下文
+│       │
+│       ├── network/                       # QoS 层
+│       │   ├── jitter_buffer_node.h/.cpp
+│       │   ├── fec_decoder_node.h/.cpp
+│       │   └── rtp_depacketizer_node.h/.cpp
+│       │
+│       ├── filter/                        # 滤镜与分支
+│       │   ├── tee_node.h                 # 帧多播（录制分支）
+│       │   └── color_convert_node.h/.cpp  # 软件色彩转换（编码前用）
+│       │
+│       ├── sync/
+│       │   └── av_sync_node.h/.cpp
+│       │
+│       ├── encode/
+│       │   ├── video_encoder_node.h/.cpp  # 支持 CBR/CRF/CQP
+│       │   ├── audio_encoder_node.h/.cpp
+│       │   └── rate_control_config.h
+│       │
+│       ├── mux/
+│       │   └── mp4_muxer_node.h/.cpp
+│       │
+│       ├── output/
+│       │   ├── sdl_audio_speaker_node.h/.cpp
+│       │   └── video_sink_node.h/.cpp     # 把帧推给外部 IVideoSink
+│       │
+│       └── utils/
+│           ├── thread_safe_queue.h
+│           └── logger.cpp
+│
+└── qt/                                    # UI 层
+    ├── main.cpp
+    ├── main_window.h/.cpp
+    └── ui/
+        ├── player_widget.h/.cpp           # 持 IPlayer（Facade）
+        ├── opengl_view.h/.cpp             # 双路径渲染 + Shader 升级
+        ├── controller_widget.h/.cpp
+        └── render/
+            ├── sw_texture_uploader.h/.cpp # 软件 YUV 上传
+            ├── hw_texture_importer.h/.cpp # 硬件零拷贝（EGLImage/IOSurface）
+            └── color_shader.h             # BT.601/709/2020 + HDR Tone Mapping
+```
+### 2. 类继承与组合树
+
+```
+IPlayer (Facade)
+└── PlayerFacade
+    ├── FSM (状态机)
+    ├── SyncContext (控制总线)
+    └── Pipeline
+        └── std::vector<unique_ptr<INodeBase>>
+            ├── ISourceNode<void, ByteChunk>
+            │   ├── FileSourceNode
+            │   ├── HttpSourceNode
+            │   └── RtpSourceNode
+            ├── IDemuxerNode<ByteChunk, Packet>          (多输出: video/audio)
+            │   ├── FfmpegDemuxerNode
+            │   ├── FlvDemuxerNode
+            │   └── Mp4DemuxerNode
+            ├── INode<Packet, Frame>
+            │   ├── VideoDecoderNode (sw/hw)
+            │   └── AudioDecoderNode
+            ├── TeeNode<T>                                (多输出)
+            ├── AVSyncNode (依赖 IClockSource)
+            ├── INode<Frame, Packet>
+            │   ├── VideoEncoderNode
+            │   └── AudioEncoderNode
+            ├── Mp4MuxerNode<Packet, void>               (多输入)
+            └── ISinkNode<Frame, void>
+                ├── VideoSinkNode (→ OpenGLView)
+                └── SdlAudioSpeakerNode (兼 IClockSource)
+```
+
+### 3. 主播放管线（含录制分支）
+
+```
+                     ┌─────────────┐
+                     │ FileSource  │  线程: SourceThread
+                     │  (or Http/  │  输出: shared_ptr<ByteChunk>
+                     │   Rtp)      │  动作: 文件/网络读字节
+                     └──────┬──────┘
+                            │ byte stream
+                            ▼
+                     ┌─────────────┐
+                     │JitterBuffer │  仅网络源接入（阶段 8）
+                     │ + FEC       │  按 RTP seq 排序、丢包恢复
+                     └──────┬──────┘
+                            │
+                            ▼
+                  ┌──────────────────┐
+                  │ Demuxer 节点     │  线程: DemuxerThread
+                  │ (ffmpeg/flv/mp4) │  输入: ByteChunk
+                  │                  │  输出: Packet (video / audio 两路)
+                  └────┬─────────┬───┘
+                       │ video   │ audio
+              Packet(H264/HEVC)  Packet(AAC)
+                       ▼         ▼
+              ┌──────────────┐ ┌──────────────┐
+              │VideoDecoder  │ │AudioDecoder  │  线程: 各自独立
+              │(sw or hw)    │ │              │
+              └──────┬───────┘ └──────┬───────┘
+        VideoFrame   │                │   AudioFrame (PCM S16)
+        (sw or hw    │                │
+         variant)    ▼                ▼
+              ┌──────────────┐ ┌──────────────┐
+              │  VideoTee    │ │  AudioTee    │  线程: 上游线程驱动
+              │ (多播 + 录制 │ │              │  shared_ptr 引用计数
+              │  开关)       │ │              │  零拷贝转发
+              └──┬───────┬───┘ └──┬───────┬───┘
+                 │主路径 │录制    │主路径 │录制
+                 ▼       ▼       ▼       ▼
+          ┌──────────┐ ┌──────────────┐  ┌──────────┐ ┌──────────────┐
+          │ AVSync   │ │VideoEncoder  │  │SdlSpeaker│ │AudioEncoder  │
+          │(查audio_ │ │(CBR/CRF/CQP) │  │(主时钟)  │ │(AAC)         │
+          │ clock)   │ │              │  │          │ │              │
+          └────┬─────┘ └──────┬───────┘  └──────────┘ └──────┬───────┘
+               │ VideoFrame   │ Packet(H264)                  │ Packet(AAC)
+               │ (synced)     └──────────┬───────────────────┘
+               ▼                         ▼
+        ┌──────────────┐          ┌──────────────┐
+        │ VideoSink    │          │  Mp4Muxer    │  线程: MuxerThread
+        │ (sw upload / │          │              │  动作: 交错写盘
+        │  hw EGLImage)│          └──────────────┘
+        └──────┬───────┘
+               │ OpenGL textures
+               ▼
+        ┌──────────────┐
+        │ OpenGLView   │  线程: Qt 主线程（paintGL）
+        │ + ColorShader│  动作: BT.x 矩阵 + Tone Mapping
+        │ + Tone Map   │
+        └──────────────┘
+```
+
+### 4. 每个节点的详细规格
+
+| 节点 | 输入类型 | 输出类型 | 主要动作 | 线程 |
+|------|---------|---------|---------|-----|
+| **FileSourceNode** | – | `ByteChunk` | `fread`/mmap 分块读 | 自有 |
+| **HttpSourceNode** | – | `ByteChunk` | libcurl 流式 GET | 自有 |
+| **RtpSourceNode** | – | `RtpPacket` | UDP recv | 自有 |
+| **JitterBufferNode** | `RtpPacket` | `RtpPacket` | seq 排序、抖动平滑 | 自有 |
+| **FecDecoderNode** | `RtpPacket` | `RtpPacket` | XOR 恢复丢包 | 自有 |
+| **FfmpegDemuxerNode** | `ByteChunk`（或自带 url） | `Packet`×2 | libavformat 分包 | 自有 |
+| **FlvDemuxerNode** | `ByteChunk` | `Packet`×2 | 手撕 FLV Tag 字节 | 自有 |
+| **Mp4DemuxerNode** | `ByteChunk` | `Packet`×2 | moov/mdat 原子解析 | 自有 |
+| **VideoDecoderNode** | `Packet` | `VideoFrame` | sw: avcodec / hw: 显存帧 | 自有 |
+| **AudioDecoderNode** | `Packet` | `AudioFrame` | avcodec + swr 重采样 | 自有 |
+| **TeeNode<T>** | `T` | `T`×N | `shared_ptr` 复制多播 | 上游驱动 |
+| **AVSyncNode** | `VideoFrame` | `VideoFrame` | 查时钟、丢/睡/送 | 自有 |
+| **VideoEncoderNode** | `VideoFrame` | `Packet` | x264 + 码率控制 | 自有 |
+| **AudioEncoderNode** | `AudioFrame` | `Packet` | AAC FLTP 编码 | 自有 |
+| **Mp4MuxerNode** | `Packet`×2 | – | `av_interleaved_write_frame` | 自有 |
+| **VideoSinkNode** | `VideoFrame` | – | 调 `IVideoSink::OnReceive` | 上游驱动 |
+| **SdlAudioSpeakerNode** | `AudioFrame` | – | SDL 回调拉数据 | SDL 回调线程 |
+
+### 5. 数据类型流转链
+
+```
+原始字节            ByteChunk { uint8_t* data, size_t size, int64_t recv_time_us }
+   │
+   ▼ Demux 拆容器、分流
+压缩包              Packet { AVPacket*, codec_id, pts_us, dts_us, frame_kind, flags, stream }
+   │
+   ▼ Decode 解压
+未压缩帧            VideoFrame { storage, pix_fmt, color_space, color_trc, ... }
+                                 ├─ Software variant: data[3], linesize[3], buffer_
+                                 └─ Hardware variant: hw_frames_ctx, hw_handle, hw_type
+                    AudioFrame { AVFrame*, pts_us, sample_rate, channels }
+   │
+   ├──→ 编码分支：重新变回 Packet（含 H264/AAC）
+   │
+   └──→ 渲染分支：VideoFrame → GL Texture / Audio → PCM bytes → 硬件
+```
+
+要点：
+
+- **`ByteChunk`**：原始字节流，仅在 Source → Demuxer 之间存在；承担"如何拿到字节"与"如何解析容器"的解耦
+- **`Packet`**：保留 `AVPacket*` 内核（便于下游 libavcodec），同时携带业务级元信息（`codec_id` / `pts_us` / `dts_us` / `frame_kind` / `flags` / `stream`），让自写 demuxer 与 libavformat 输出格式一致
+- **`VideoFrame`** 设计为 sum type：`Software` 携带紧凑 YUV buffer，`Hardware` 携带 `AVBufferRef*` + 平台句柄（DMA-BUF / IOSurface / D3D Surface），让零拷贝路径与软件路径共用同一条管线
+- **`AudioFrame`** 保持轻包装，所有重采样/通道布局在 AudioDecoderNode 内消化
+
+### 6. 控制信令流
+
+控制信令独立于数据通道传播，避免与数据帧时序竞争。
+
+```
+UI (Qt 主线程)
+  │ Play / Pause / Stop / Seek
+  ▼
+PlayerFacade
+  │
+  ▼
+FSM.Dispatch(event)
+  │ 修改 SyncContext.state_
+  │ notify_all(state_cv_)
+  ▼
+所有节点的 ThreadLoop 同时被唤醒
+  └─ 各自读 SyncContext 决定: 继续 / 挂起 / 退出 / Flush
+```
+
+带内信令（Flush / EOF）仍然以"flag Packet / Frame"形式沿数据通道顺序传播，保证与数据流时序一致：
+
+- **Flush**：Seek 时由 Demuxer 在新位置数据之前注入一个 `kFlush` flag 的空 Packet；每个下游节点遇到时清空自身内部状态再继续
+- **EOF**：Demuxer 读到 EOF 时注入 `kEOF` flag；末端节点（AVSync / Speaker）收到后回调 Pipeline 完成
 
 ---
 
 ## 技术栈
+
 | 技术领域 | 选型方案 |
 |----------|----------|
 | 核心开发语言 | C/C++ 17 |
-| 媒体处理框架 | FFmpeg 6.x |
+| 媒体处理框架 | FFmpeg 6.x（libavcodec / libavformat / libavutil / libswscale / libswresample） |
+| 音频后端 | SDL2 |
 | 界面与跨平台框架 | Qt 6.x |
-| 视频渲染引擎 | OpenGL |
-| 构建工具 | CMake 3.20+ |
+| 视频渲染引擎 | OpenGL 3.3 Core / EGL（硬件零拷贝） |
+| 日志 | spdlog |
+| 构建工具 | CMake 3.23+ |
+| 依赖管理 | Conan 2 |
 | 主开发环境 | Ubuntu 24.04 |
 | 版本控制 | GitLab |
 
 ---
 
 ## 环境搭建
+
 ### 系统要求
 - 推荐系统：Ubuntu 24.04 LTS
 - 兼容系统：Windows 10+、macOS 12+
 - 编译器：GCC 12+ / Clang 18+ / MSVC 2022
-- 构建工具：CMake 3.20 及以上版本
+- 构建工具：CMake 3.23 及以上版本
 
-### 依赖安装（Ubuntu 24.04 一键安装）
+### 依赖安装（Ubuntu 24.04）
 ```bash
 # 更新软件源
 sudo apt update && sudo apt upgrade -y
 
-# 安装 FFmpeg 完整开发库
-sudo apt install -y libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev libavfilter-dev
-
 # 安装 Qt 6 开发套件
-sudo apt install -y qt6-base-dev qt6-multimedia-dev qt6-opengl-dev qt6-tools-dev
+sudo apt install -y qt6-base-dev qt6-multimedia-dev qt6-tools-dev
 
-# 安装 OpenGL 开发环境
-sudo apt install -y libgl1-mesa-dev libglu1-mesa-dev freeglut3-dev
+# 安装 OpenGL / EGL 开发环境（含硬件解码零拷贝所需的 EGL 头）
+sudo apt install -y libgl1-mesa-dev libegl1-mesa-dev libglu1-mesa-dev
 
 # 安装构建工具与编译器
-sudo apt install -y cmake build-essential gdb git
+sudo apt install -y cmake build-essential gdb git pkg-config
 ```
+
+> FFmpeg / spdlog / SDL2 / stb / glm 由 Conan2 管理，无需手动安装系统包
 
 ---
 
 ## 编译与运行
-### 1. 克隆项目
+
 ```bash
+# 1. 克隆项目
 git clone https://git.cpptrain.top/zhanmeng/ai-media-player.git
 cd ai-media-player
-```
 
-### 2. 创建构建目录
-```bash
-mkdir build && cd build
-```
+# 2. 一键构建
+./build.sh
 
-### 3. 生成构建文件
-```bash 
-cmake ..
-```
-
-### 4. 编译项目
-```bash
-# -j 后接CPU核心数，加速编译，如 -j8
-make -j8
-```
-
-### 5. 运行程序
-```bash
-./ai-media-player
+# 3. 运行
+./build/Release/ai_media_player
 ```
 
 ---
 
-## 项目目录结构
-```
-ai-media-player/
-├── 3rdparty/                # 第三方依赖库目录（Git忽略，由Conan管理）
-│   └── ffmpeg/              # FFmpeg音视频处理库（唯一必需的第三方依赖）
-├── cache/                   # 程序运行缓存目录（Git完全忽略）
-│   ├── logs/                # 运行日志文件
-│   └── decode_cache/        # 解码临时缓存
-├── learn_av/                # 音视频核心业务层（纯C++，完全独立于Qt）
-│   ├── include/             # 全局公共头文件（对外暴露的唯一接口）
-│   │   ├── igl_context.h    # OpenGL上下文抽象接口
-│   │   ├── iplayback_listener.h # 播放事件监听器接口
-│   │   ├── iplayer.h        # 播放器核心接口
-│   │   └── logger.h         # 日志系统接口
-│   └── src/                 # 音视频全链路核心源码
-│           ├── core
-│           │   ├── av_synchronizer.cpp   # 音画同步器（解决音视频不同步问题）
-│           │   ├── av_synchronizer.h
-│           │   ├── player.cpp            # 播放器核心实现（状态机管理）
-│           │   └── player.h
-│           ├── decode                    # 音视频编码
-│           │   ├── audio_decoder.cpp
-│           │   ├── audio_decoder.h
-│           │   ├── interface             # 纯虚接口
-│           │   │   ├── iaudio_decoder.h
-│           │   │   └── ivideo_decoder.h
-│           │   ├── video_decoder.cpp
-│           │   └── video_decoder.h
-│           ├── define                    # 数据结构定义
-│           │   ├── av_error.h
-│           │   ├── av_frame.h
-│           │   ├── av_packet.h
-│           │   └── stream_info.h
-│           ├── demux                     # 解复用
-│           │   ├── demuxer.cpp
-│           │   ├── demuxer.h
-│           │   ├── file_reader.cpp
-│           │   ├── file_reader.h
-│           │   └── interface
-│           │       ├── idemuxer.h
-│           │       └── ifile_reader.h
-│           ├── encode                    # 音视频编码
-│           │   ├── audio_encoder.cpp
-│           │   ├── audio_encoder.h
-│           │   ├── interface
-│           │   │   ├── iaudio_encoder.h
-│           │   │   └── ivideo_encoder.h
-│           │   ├── video_encoder.cpp
-│           │   └── video_encoder.h
-│           ├── interface                 # 音画同步/音频播放纯虚接口
-│           │   ├── iaudio_speaker.h
-│           │   └── iav_synchronizer.h
-│           ├── mux                       # 复用
-│           │   ├── interface
-│           │   │   └── imuxer.h
-│           │   ├── muxer.cpp
-│           │   └── muxer.h
-│           ├── output                    # 音频输出
-│           │   ├── sdl_audio_speaker.cpp
-│           │   └── sdl_audio_speaker.h
-│           ├── utils                     # 通用工具类
-│           │   ├── logger.cpp
-│           │   └── thread_safe_queue.h
-│           └── writer                    
-│               ├── file_writer.cpp 
-│               ├── file_writer.h
-│               └── interface
-│                   └── ifile_writer.h    
-├── qt/                      # 界面交互层（仅负责UI，无任何音视频处理逻辑）
-│   ├── main.cpp             # 程序全局入口
-│   ├── main_window.cpp      # 主窗口协调器
-│   ├── main_window.h
-│   └── ui/                  # 细分UI控件
-│       ├── controller_widget.cpp # 播放控制面板（播放/暂停/进度条）
-│       ├── controller_widget.h
-│       ├── opengl_view.cpp  # OpenGL渲染基础类
-│       ├── opengl_view.h
-│       ├── player_widget.cpp # 视频渲染画布
-│       └── player_widget.h
-├── resource/                # 静态资源目录（Git管理）
-│   ├── icons/               # UI图标资源
-│   └── video/               # 测试视频资源
-├── CMakeLists.txt           # 项目全局构建配置
-├── conanfile.txt            # Conan2第三方依赖管理配置
-└── README.md                # 项目说明文档
-```
+## 文档导航
+
+| 文档 | 说明 |
+|-----|------|
+| [README.md](./README.md) | 项目总览与架构设计（本文件） |
+| [DEVELOPMENT_PLAN.md](./DEVELOPMENT_PLAN.md) | 重构 + 演进路线的详细开发计划书 |
 
 ---
 
 ## 开发规范
+
 ### 一、分支管理规范
+
 | 分支类型 | 命名规范 | 用途说明 |
 |----------|----------|----------|
 | 主分支 | `main` | 仅存放稳定、可运行的代码，禁止直接提交，仅接受 MR 合并 |
-| 功能分支 | `feature/<模块名-功能描述>` | 新功能、新模块开发，如 `feature/demux-mkv-support` |
-| 修复分支 | `hotfix/<问题描述>` | 线上紧急bug修复，如 `hotfix/fix-av-sync-drift` |
-| 发布分支 | `release/v<版本号>` | 版本发布前的测试、bug修复，如 `release/v1.0.0` |
-| 文档分支 | `docs/<文档内容>` | 文档更新、补充，如 `docs/update-architecture-doc` |
+| 重构分支 | `refactor/<scope>` | 架构性改造，如 `refactor/dag` |
+| 功能分支 | `feat/<模块名-功能描述>` | 新功能、新模块开发，如 `feat/flv-demuxer` |
+| 修复分支 | `fix/<问题描述>` | bug 修复，如 `fix/av-sync-drift` |
+| 文档分支 | `docs/<文档内容>` | 文档更新 |
 
 ### 二、Commit 提交规范
+
 #### 1. Commit 消息格式
 ```
 <type>(<scope>): <subject>
 
-<BLANK LINE>
-
 <body>
-
-<BLANK LINE>
 
 <footer>
 ```
 
-#### 2. 字段说明
-| 字段 | 说明 | 规则要求 |
-|------|------|----------|
-| `type` | 提交类型 | 必填，用于标识本次提交的核心类型 |
-| `scope` | 影响范围 | 可选，描述本次提交影响的模块/组件，如 demux、av_sync、audio_decode |
-| `subject` | 提交主题 | 必填，简洁描述本次提交的核心内容，不超过50个字符 |
-| `body` | 详细描述 | 可选，详细说明本次提交的目的、实现逻辑、改动点 |
-| `footer` | 页脚 | 可选，用于关闭关联Issue、标注不兼容变更 |
+#### 2. type 可选值
 
-#### 3. type 可选值说明
 | 类型 | 说明 |
 |------|------|
 | `feat` | 新增功能 |
-| `fix` | 修复Bug |
+| `fix` | 修复 Bug |
 | `docs` | 文档更新 |
-| `style` | 代码格式调整，不影响代码逻辑（空格、缩进、命名规范等） |
-| `refactor` | 代码重构，不新增功能、不修复Bug |
-| `test` | 测试用例新增、修改 |
-| `chore` | 构建过程、辅助工具、依赖库的变动 |
+| `style` | 代码格式调整，不影响代码逻辑 |
+| `refactor` | 代码重构 |
+| `test` | 测试用例 |
+| `chore` | 构建过程、依赖库变动 |
 
-#### 4. Commit 示例
+#### 3. Commit 示例
 ```
-feat(demux): 新增 MKV 格式文件解封装支持
+feat(flv-demuxer): 实现 FLV Script Tag 解析
 
-- 新增 MKV 格式解析逻辑，适配 Matroska 容器规范
-- 补充 MKV 流元数据提取能力
-- 兼容多音轨、多字幕轨 MKV 文件
+- 解析 AMF0 元数据，提取 width/height/duration/framerate
+- 兼容 OBS 推流与 B 站下载的 flv 文件
+- 添加 3 个真实样本作为回归测试
 
 Closes #12
 ```
 
-```
-fix(av_sync): 修复进度条拖动后音画不同步问题
-
-- 修复拖动进度条后 PTS 基准值重置异常的问题
-- 优化音视频帧缓存清空逻辑
-- 同步优化播放时钟校准逻辑
-```
-
-### 三、开发流程
-1.  **创建分支**：从 `main` 分支创建 `feature/<feature-name>` 功能分支
-2.  **开发功能**：在功能分支上进行代码开发、自测
-3.  **提交代码**：按照 Commit 提交规范提交代码至远程分支
-4.  **代码审查**：提交 Merge Request (MR) 到 `main` 分支，发起代码审查
-5.  **合并代码**：审查通过后，合并到 `main` 分支，合并完成后删除对应功能分支
-
-### 四、发布流程
-1.  **创建发布分支**：从 `main` 分支创建 `release/<version>` 发布分支
-2.  **测试与修复**：在发布分支上进行集成测试、Bug 修复
-3.  **合并与发版**：测试通过后，合并到 `main` 分支，并打上对应版本号 Tag
-
-### 五、修复流程
-1.  **创建修复分支**：从 `main` 分支创建 `hotfix/<issue-name>` 修复分支
-2.  **修复问题**：在修复分支上完成 Bug 修复、自测
-3.  **提交代码**：按照 Commit 提交规范提交代码至远程分支
-4.  **代码审查**：提交 Merge Request (MR) 到 `main` 分支，发起代码审查
-5.  **合并代码**：审查通过后，合并到 `main` 分支，合并完成后删除对应修复分支
-
 ---
 
 ## 项目已实现功能
-✅ 项目框架搭建、CMake 跨平台构建配置
-✅ 实现文件解封装、音视频解码核心模块
-✅ 实现音画同步、音视频渲染播放全链路
-✅ 基础播放控制（播放/暂停、进度拖动、音量调节）
-✅ 基础音视频效果（音频均衡器、画面滤镜）
+- 项目框架搭建、CMake 跨平台构建配置（Conan2 依赖管理）
+- 文件解封装、音视频解码、音画同步、音视频渲染播放全链路
+- 基础播放控制：播放 / 暂停 / 进度拖动 / Seek
+- 音视频录制：H.264 + AAC 编码、MP4 封装
+- 基础音视频效果：音频均衡、画面滤镜
+
+> 重构进度与未来路线见 [DEVELOPMENT_PLAN.md](./DEVELOPMENT_PLAN.md)
 
 ---
 
@@ -334,4 +397,6 @@ fix(av_sync): 修复进度条拖动后音画不同步问题
 ---
 
 ## 问题反馈
-如有问题、建议或Bug反馈，可通过 GitLab Issue 提交
+如有问题、建议或 Bug 反馈，可通过 GitLab Issue 提交
+
+
