@@ -201,7 +201,7 @@ IPlayer (Facade 接口)
  ┌──────────────────────────────┐
  │ OpenGLView                   │  线程: Qt 主线程（paintGL）
  │  ├─ sw:  三平面 glTexSubImage │  Software variant → CPU 上传
- │  ├─ hw:  EGLImage 零拷贝导入  │  Hardware variant → DMA-BUF 直接成纹理
+ │  ├─ hw:  EGLImage 零拷贝导入   │   Hardware variant → DMA-BUF 直接成纹理
  │  └─ ColorShader: BT.x + HDR  │  矩阵动态切换 + Tone Mapping
  └──────────────────────────────┘
 ```

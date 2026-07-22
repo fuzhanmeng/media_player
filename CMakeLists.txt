@@ -24,4 +24,5 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
 # 把应用层子目录纳入构建
+add_subdirectory(mediacore)
 add_subdirectory(app)

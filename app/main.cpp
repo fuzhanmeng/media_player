@@ -7,6 +7,7 @@
  * @date    2026-07
  */
 
+
 #include <QApplication>
 #include <QWidget>
 
