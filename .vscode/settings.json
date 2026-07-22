@@ -102,5 +102,6 @@
     "testing.automaticallyOpenPeekViewDuringAutoRun": true,
     "terminal.integrated.stickyScroll.enabled": false, // 关闭终端滚动时的置顶吸附效果
     "explorer.confirmDelete": false, // 删除文件时不再弹窗确认（配合版本控制使用很爽）
-    "cmake.sourceDirectory": "${workspaceFolder}" // 明确告诉 CMake 插件你的根目录在哪
+    "cmake.sourceDirectory": "${workspaceFolder}",
+    "python-envs.defaultEnvManager": "ms-python.python:system" // 明确告诉 CMake 插件你的根目录在哪
 }

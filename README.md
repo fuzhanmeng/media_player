@@ -27,7 +27,7 @@
 
 ### 1. 源码目录结构
 
-采用 Google C++ Style 分层：对外公共 API 收敛于 `include/ai_media_player/`（以库名做命名空间目录），实现细节隐藏于 `src/`。
+采用 Google C++ Style 分层：对外公共 API 收敛于 `include/mediacore/`（以静态库名 `mediacore` 做前缀目录，`#include "mediacore/xxx.h"` 防冲突、来源自明），实现细节隐藏于 `src/`。
 
 ```
 ai-media-player/
@@ -35,7 +35,7 @@ ai-media-player/
 ├── build.sh
 ├── conanfile.py
 ├── mediacore/                                 # 核心媒体引擎静态库（libmediacore）
-│   ├── include/ai_media_player/               # 对外暴露的公共 API（PUBLIC 头）
+│   ├── include/mediacore/                     # 对外暴露的公共 API（PUBLIC 头，以库名做前缀目录）
 │   │   ├── iplayer.h                          # Facade 接口（UI 唯一依赖）
 │   │   ├── ivideo_sink.h                      # UI 渲染注入点
 │   │   ├── igl_context.h                      # 共享 GL 上下文接口
@@ -55,7 +55,7 @@ ai-media-player/
 │       │   ├── pipeline.h/.cpp                # 容器：Build / Start / Stop / Seek
 │       │   ├── fsm.h/.cpp                      # 显式状态机（合法跃迁表）
 │       │   ├── sync_context.h                 # 控制总线（atomic epoch + state）
-│       │   ├── clock.h                        # 时钟接口 IClockSource
+│       │   ├── iclock_source.h                # 时钟接口 IClockSource
 │       │   └── player_facade.h/.cpp           # 对 UI 的门面（实现 IPlayer）
 │       │
 │       ├── source/                            # 数据源层
@@ -76,7 +76,7 @@ ai-media-player/
 │       ├── decode/
 │       │   ├── video_decoder_node.h/.cpp      # 软解 / VA-API 硬解双模式
 │       │   ├── audio_decoder_node.h/.cpp      # avcodec + swr 重采样
-│       │   └── hw_device_ctx.h/.cpp           # av_hwdevice_ctx 封装与探测
+│       │   └── hw_device_context.h/.cpp       # av_hwdevice_ctx 封装与探测
 │       │
 │       ├── filter/
 │       │   └── tee_node.h                     # 帧多播（录制分支，shared_ptr 零拷贝转发）
@@ -92,9 +92,11 @@ ai-media-player/
 │       ├── mux/
 │       │   └── mp4_muxer_node.h/.cpp          # av_interleaved_write_frame 交错写盘
 │       │
-│       ├── output/
-│       │   ├── sdl_audio_speaker_node.h/.cpp  # SDL 输出，兼 IClockSource（音频主时钟）
-│       │   └── video_sink_node.h/.cpp         # 把帧推给外部 IVideoSink
+│       ├── sink/                              # 终端输出层（DAG 汇聚点，与 source/ 对称）
+│       │   ├── video_sink_node.h/.cpp         # 把帧推给外部 IVideoSink（OpenGLView）
+│       │   ├── audio_sink_node.h/.cpp         # 消费 PCM，持 IAudioSink 后端，兼 IClockSource（音频主时钟）
+│       │   ├── iaudio_sink.h                  # 音频输出后端抽象（可切 Alsa / Qt / PipeWire）
+│       │   └── alsa_audio_sink.h/.cpp         # IAudioSink 的 ALSA 实现（libasound / snd_pcm_writei）
 │       │
 │       ├── qos/
 │       │   └── qos_monitor.h/.cpp             # 卡顿率/丢帧率/缓存深度/端到端延迟
@@ -144,8 +146,8 @@ IPlayer (Facade 接口)
             │   └── AudioEncoderNode
             ├── Mp4MuxerNode<Packet, void>                    (多输入)
             └── ISinkNode<Frame, void>
-                ├── VideoSinkNode (→ OpenGLView)
-                └── SdlAudioSpeakerNode (兼 IClockSource)
+                ├── VideoSinkNode (→ IVideoSink / OpenGLView)
+                └── AudioSinkNode (持 IAudioSink = AlsaAudioSink，兼 IClockSource)
 ```
 
 ### 3. 主播放管线（含录制分支）
@@ -184,8 +186,8 @@ IPlayer (Facade 接口)
       │主路径 │录制     │主路径 │录制
       ▼       ▼        ▼       ▼
  ┌──────────┐┌──────────────┐┌──────────┐┌──────────────┐
- │ AVSync   ││VideoEncoder  ││SdlSpeaker││AudioEncoder  │
- │(查音频   ││(CBR/CRF/CQP) ││(主时钟)  ││(AAC)         │
+ │ AVSync   ││VideoEncoder  ││AudioSink ││AudioEncoder  │
+ │(查音频   ││(CBR/CRF/CQP) ││(ALSA主钟)││(AAC)         │
  │ 主时钟)  ││              ││          ││              │
  └────┬─────┘└──────┬───────┘└──────────┘└──────┬───────┘
       │ VideoFrame  │ Packet(H264)               │ Packet(AAC)
@@ -223,7 +225,7 @@ IPlayer (Facade 接口)
 | **AudioEncoderNode** | `AudioFrame` | `Packet` | AAC FLTP 编码 | 自有 |
 | **Mp4MuxerNode** | `Packet`×2 | – | `av_interleaved_write_frame` | 自有 |
 | **VideoSinkNode** | `VideoFrame` | – | 调 `IVideoSink::OnReceiveVideoFrame` | 上游驱动 |
-| **SdlAudioSpeakerNode** | `AudioFrame` | – | SDL 回调拉数据，维护音频主时钟 | SDL 回调线程 |
+| **AudioSinkNode** | `AudioFrame` | – | 经 `IAudioSink`(AlsaAudioSink) `snd_pcm_writei` 投递 PCM，维护音频主时钟 | 自有 |
 
 ### 5. 数据类型流转链
 
@@ -246,7 +248,7 @@ IPlayer (Facade 接口)
    └──→ 渲染分支：
         ├─ Software variant → glTexSubImage2D 三平面上传 → GL Texture
         └─ Hardware variant → EGLImage 零拷贝导入 → GL Texture
-        Audio → PCM bytes → SDL 硬件缓冲
+        Audio → PCM bytes → AudioSinkNode → ALSA (snd_pcm_writei) → 声卡
 ```
 
 要点：
@@ -297,7 +299,7 @@ PlayerFacade → FSM.Dispatch(event)  （校验合法跃迁）
 | 零拷贝互操作 | `vaExportSurfaceHandle` → DMA-BUF fd → `eglCreateImageKHR` → `glEGLImageTargetTexture2DOES` | 硬解零拷贝 |
 | 视频渲染引擎 | OpenGL 3.3 Core / EGL | 零拷贝 / GLSL |
 | 色彩管线 | GLSL：BT.601/709/2020 矩阵动态切换 + PQ EOTF 反变换 + Reinhard Tone Mapping | GLSL 色彩 |
-| 音频后端 | SDL2（音频主时钟 IClockSource） | 音画同步 |
+| 音频后端 | ALSA（libasound）原生 PCM 投递；`IAudioSink` 抽象（可切 QtAudioSink / PipeWire）；兼音频主时钟 IClockSource | 音画同步 |
 | 并发模型 | 独立线程 + `std::condition_variable` 有界阻塞队列（背压防 OOM）+ atomic epoch | DAG |
 | 网络拉流 | libcurl（HTTP/Range）、原生 UDP + RTP | QoS |
 | 抗弱网 QoS | Jitter Buffer（seq 重排/空洞检测/自适应深度）+ GOP Cache（秒开 <180ms）+ XOR FEC | QoS |
@@ -330,6 +332,9 @@ sudo apt install -y vainfo libva-dev libva-drm2 libdrm-dev
 # 网络拉流依赖（HTTP）
 sudo apt install -y libcurl4-openssl-dev
 
+# 音频输出（ALSA 原生 PCM 投递）
+sudo apt install -y libasound2-dev
+
 # 构建工具与编译器
 sudo apt install -y cmake build-essential gdb git pkg-config
 
@@ -337,7 +342,7 @@ sudo apt install -y cmake build-essential gdb git pkg-config
 vainfo
 ```
 
-> FFmpeg / spdlog / SDL2 / stb / glm 由 Conan2 管理，无需手动安装系统包。
+> FFmpeg / spdlog / stb / glm 由 Conan2 管理；ALSA 走系统包 `libasound2-dev`（非 Conan）。
 
 ---
 

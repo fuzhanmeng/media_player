@@ -50,7 +50,7 @@
 | **D11** | `FfmpegDemuxerNode`：`avformat_open_input`/`find_stream_info`，独立线程 `av_read_frame`，双输出 | `FfmpegDemuxerNode` | 流探测、`codecpar`、`time_base` 换算微秒、多输出扇出 |
 | **D12** | `VideoFrame` sum type(Software variant，保留 `linesize`) + `AudioFrame` | `VideoFrame`、`AudioFrame` | variant 设计、保留 linesize 免重打包、`shared_ptr` 自定义删除器 |
 | **D13** | `VideoDecoderNode`(软解)：`send_packet`/`receive_frame` → `VideoFrame` | `VideoDecoderNode` | send/receive 状态机、EAGAIN/EOF、B 帧重排、`best_effort_timestamp` |
-| **D14** | `AudioDecoderNode` + swr 重采样；`SdlAudioSpeakerNode` 实现 `IClockSource` | `AudioDecoderNode`、`SdlAudioSpeakerNode`、`IClockSource` | swr 重采样、SDL 回调不可阻塞、音频时钟计算 |
+| **D14** | `AudioDecoderNode` + swr 重采样；定义 `IAudioSink` 接口 + `AlsaAudioSink`（直连 libasound，`snd_pcm_writei` 投递）；`AudioSinkNode` 实现 `IClockSource` | `AudioDecoderNode`、`IAudioSink`、`AlsaAudioSink`、`AudioSinkNode`、`IClockSource` | swr 重采样、ALSA buffer/period 参数、xrun 欠载恢复、阻塞 vs 非阻塞写、`snd_pcm_delay` 推算音频主时钟 |
 | **D15** | `AVSyncNode`(注入 `IClockSource`，丢/等/送) + `VideoSinkNode` 推 UI | `AVSyncNode`、`VideoSinkNode` | 音画同步原理、主时钟选择、diff 计算、精确 sleep |
 | **D16** | `Pipeline`(Build 组图、消费者先启、反向回收) + `PlayerFacade` + `FSM` | `Pipeline`、`PlayerFacade`、`FSM` | 拓扑构建、线程回收顺序防死锁、显式状态机合法跃迁表 |
 | **D17** | atomic epoch Seek + 带内 `kFlush`/`kEOF`；播放/暂停/Seek/停止全回归 | `SyncContext.epoch_`、`kFlush` | 无锁世代号 vs 多标志握手、带内/带外信令、seek 在飞帧竞态、`avcodec_flush_buffers` |

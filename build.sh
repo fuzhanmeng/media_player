@@ -42,4 +42,4 @@ if [ $? -ne 0 ]; then
 fi
 
 echo -e "\n编译成功！"
-echo "你可以运行: ./build/$BUILD_TYPE/ai_media_player"
+echo "你可以运行: ./build/$BUILD_TYPE//app/ai_media_player"

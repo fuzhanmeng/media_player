@@ -12,6 +12,8 @@ cache/*
 .DS_Store
 Thumbs.db
 
-# 5. VSCode 缓存与历史记录 (忽略这些，但不要忽略 json 文件)
-.vscode/ipch/
-.vscode/.root/
+# 5. VSCode 目录：仅追踪团队共享的配置文件，忽略其余缓存/历史记录
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
