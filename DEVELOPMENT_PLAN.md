@@ -27,7 +27,7 @@
 | **D2** | 定义 Facade 契约（纯头文件）：`IPlayer` + `IVideoSink` + `PlaybackState` | `iplayer.h`、`ivideo_sink.h`、`playback_state.h` | Facade 模式、依赖倒置(DIP)、接口隔离、前向声明降耦合 |
 | **D3** | UI 骨架：`PlayerWidget`(持 `IPlayer`) + `ControllerWidget`(播放/暂停/进度条)，信号槽连通 | `PlayerWidget`、`ControllerWidget` | Qt signal/slot、`Qt::QueuedConnection` 跨线程投递、moc、UI 与逻辑解耦 |
 | **D4** | `OpenGLView` 空画布：`QOpenGLWidget` + `initializeGL/paintGL` 渲染纯色 | `OpenGLView`、`QOpenGLFunctions` | GL 上下文线程亲和、双缓冲、`paintGL` 触发、渲染为何在 GUI 线程 |
-| **D5** | `StubPlayer`(假 `IPlayer`，生成渐变测试帧)推给 `IVideoSink`，打通全回环 | `StubPlayer`、`IVideoSink::OnReceiveVideoFrame` | 桩/Mock 驱动开发、接口先行的可测性、生产者-消费者雏形 |
+| **D5** ✅ | `StubPlayer`(假 `IPlayer`，生成渐变测试帧)推给 `IVideoSink`，打通全回环 | `StubPlayer`、`IVideoSink::OnReceiveVideoFrame` | 桩/Mock 驱动开发、接口先行的可测性、生产者-消费者雏形 |
 
 ## 阶段二：DAG 引擎核心（Core）· Day 6–9
 
@@ -96,7 +96,7 @@
 
 | 阶段 | 状态 | 开始 | 完成 | 备注 |
 |-----|------|-----|-----|-----|
-| 一：外壳与基建 (D1–5) | 未开始 | – | – | – |
+| 一：外壳与基建 (D1–5) | ✅ 已完成 | 2026-07 | 2026-07-27 | StubPlayer 生成渐变帧，打通 UI→IPlayer→IVideoSink→OpenGLView 渲染回环 |
 | 二：DAG 引擎核心 (D6–9) | 未开始 | – | – | – |
 | 三：本地播放主干 (D10–17) | 未开始 | – | – | – |
 | 四：硬核零拷贝与 HDR (D18–24) | 未开始 | – | – | – |
