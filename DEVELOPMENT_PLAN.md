@@ -38,7 +38,7 @@
 | **D6** ✅ | 手写 `ThreadSafeQueue<T>`：双 CV + 背压 + `Abort` | `ThreadSafeQueue<T>`、`condition_variable` | 谓词 `wait` 防虚假唤醒、背压防 OOM、为何需两个 CV、Abort 唤醒退出、`std::move` |
 | **D7** ✅ | 封装 `Link<T>`：语义化连接器 + `epoch` 感知预留 | `Link<T>` | 强类型 vs `void*` 编译期安全、模板、`shared_ptr` 所有权 |
 | **D8** | `INodeBase`(Start/RequestStop/WaitForStop) + `INode<InT,OutT>` 模板 | `INodeBase`、`INode<InT,OutT>` | 模板方法模式、两阶段停止、线程 RAII、虚析构 |
-| **D9** | `ThreadLoop` 三态骨架 + `SyncContext`(atomic state+epoch)；两节点串联单测 | `SyncContext`、`ThreadLoop` | 原子内存序、惊群、如何为并发写单测 |
+| **D9** ✅ | `ThreadLoop` 三态骨架 + `SyncContext`(atomic state+epoch)；两节点串联单测 | `SyncContext`、`ThreadLoop` | 原子内存序、惊群、如何为并发写单测 |
 
 ## 阶段三：本地播放主干（Pipeline）· Day 10–17
 
@@ -97,7 +97,7 @@
 | 阶段 | 状态 | 开始 | 完成 | 备注 |
 |-----|------|-----|-----|-----|
 | 一：外壳与基建 (D1–5) | ✅ 已完成 | 2026-07 | 2026-07-27 | StubPlayer 生成渐变帧，打通 UI→IPlayer→IVideoSink→OpenGLView 渲染回环 |
-| 二：DAG 引擎核心 (D6–9) | 🚧 进行中 | 2026-07-28 | – | D6 ThreadSafeQueue、D7 Link 已完成并通过验证 |
+| 二：DAG 引擎核心 (D6–9) | ✅ 已完成 | 2026-07-28 | 2026-07-28 | ThreadSafeQueue + Link 双CV背压、INode 三态循环(方案甲)、两节点串联验证通过 |
 | 三：本地播放主干 (D10–17) | 未开始 | – | – | – |
 | 四：硬核零拷贝与 HDR (D18–24) | 未开始 | – | – | – |
 | 五：弱网对抗与收尾 (D25–30) | 未开始 | – | – | – |
