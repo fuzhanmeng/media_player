@@ -7,6 +7,7 @@
 set(MEDIACORE_SOURCES
     src/core/stub_player.cpp
     src/core/player_factory.cpp
+    src/core/packet.cpp
 )
 
 # ============ 定义静态库 ============
@@ -26,4 +27,5 @@ find_package(ffmpeg REQUIRED)
 
 target_link_libraries(mediacore PUBLIC
     ffmpeg::avutil    # av_malloc / av_free 等内存与工具函数
+    ffmpeg::avcodec   # AVPacket 相关函数
 )
