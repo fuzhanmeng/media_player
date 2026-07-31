@@ -7,16 +7,20 @@
 set(MEDIACORE_SOURCES
     src/core/stub_player.cpp
     src/core/player_factory.cpp
-    src/core/packet.cpp
+    src/av_types/packet.cpp
 )
 
 # ============ 定义静态库 ============
 add_library(mediacore STATIC ${MEDIACORE_SOURCES})
 
 # ============ 头文件搜索路径 ============
-
-target_include_directories(mediacore PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
+# PUBLIC：app 层可见，随依赖传播（仅 include/mediacore/ 下的契约与跨边界 DTO）
+# PRIVATE：仅库自身可见，不传播（src/ 下的 DAG 框架、并发原语、各具体 Node、内部 DTO）
+target_include_directories(mediacore
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
 # ============ 第三方依赖 ============

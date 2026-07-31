@@ -37,8 +37,8 @@
 |-----|---------|------------|-------------------|
 | **D6** ✅ | 手写 `ThreadSafeQueue<T>`：双 CV + 背压 + `Abort` | `ThreadSafeQueue<T>`、`condition_variable` | 谓词 `wait` 防虚假唤醒、背压防 OOM、为何需两个 CV、Abort 唤醒退出、`std::move` |
 | **D7** ✅ | 封装 `Link<T>`：语义化连接器 + `epoch` 感知预留 | `Link<T>` | 强类型 vs `void*` 编译期安全、模板、`shared_ptr` 所有权 |
-| **D8** | `INodeBase`(Start/RequestStop/WaitForStop) + `INode<InT,OutT>` 模板 | `INodeBase`、`INode<InT,OutT>` | 模板方法模式、两阶段停止、线程 RAII、虚析构 |
-| **D9** ✅ | `ThreadLoop` 三态骨架 + `SyncContext`(atomic state+epoch)；两节点串联单测 | `SyncContext`、`ThreadLoop` | 原子内存序、惊群、如何为并发写单测 |
+| **D8** ✅ | `INodeBase`(Start/RequestStop/WaitForStop) + `INode<InT,OutT>` 模板 | `INodeBase`、`INode<InT,OutT>` | 模板方法模式、两阶段停止、线程 RAII、虚析构 |
+| **D9** ✅ | `ThreadLoop` 三态骨架 + `SyncContext`(atomic state+epoch)；两节点串联单测 | `SyncContext`、`ThreadLoop`、`INode::AbortLinks` | 原子内存序、惊群、如何为并发写单测、**三卡点停止唤醒模型** |
 
 ## 阶段三：本地播放主干（Pipeline）· Day 10–17
 
@@ -46,7 +46,7 @@
 
 | Day | 今日目标 | 核心类/接口 | 技术难点 / 面试考点 |
 |-----|---------|------------|-------------------|
-| **D10** | DTO：`Packet`(RAII 包 `AVPacket*` + pts/dts/flags/epoch) + `AVFrameFlag` | `Packet`、`AVFrameFlag` | `AVPacket` RAII、`enum class` 位运算重载、DTO 设计 |
+| **D10** ✅ | DTO：`Packet`(RAII 包 `AVPacket*` + pts/dts/flags/epoch) + `AVFrameFlag`；`CLAUDE.md` AI 开发规范 | `Packet`、`AVFrameFlag` | `AVPacket` RAII、`enum class` 位运算重载、DTO 设计、时间戳统一微秒 |
 | **D11** | `FfmpegDemuxerNode`：`avformat_open_input`/`find_stream_info`，独立线程 `av_read_frame`，双输出 | `FfmpegDemuxerNode` | 流探测、`codecpar`、`time_base` 换算微秒、多输出扇出 |
 | **D12** | `VideoFrame` sum type(Software variant，保留 `linesize`) + `AudioFrame` | `VideoFrame`、`AudioFrame` | variant 设计、保留 linesize 免重打包、`shared_ptr` 自定义删除器 |
 | **D13** | `VideoDecoderNode`(软解)：`send_packet`/`receive_frame` → `VideoFrame` | `VideoDecoderNode` | send/receive 状态机、EAGAIN/EOF、B 帧重排、`best_effort_timestamp` |
@@ -97,7 +97,30 @@
 | 阶段 | 状态 | 开始 | 完成 | 备注 |
 |-----|------|-----|-----|-----|
 | 一：外壳与基建 (D1–5) | ✅ 已完成 | 2026-07 | 2026-07-27 | StubPlayer 生成渐变帧，打通 UI→IPlayer→IVideoSink→OpenGLView 渲染回环 |
-| 二：DAG 引擎核心 (D6–9) | ✅ 已完成 | 2026-07-28 | 2026-07-28 | ThreadSafeQueue + Link 双CV背压、INode 三态循环(方案甲)、两节点串联验证通过 |
-| 三：本地播放主干 (D10–17) | 未开始 | – | – | – |
+| 二：DAG 引擎核心 (D6–9) | ✅ 已完成 | 2026-07-28 | 2026-07-30 | ThreadSafeQueue(双CV背压+Close/Abort两级) + Link + INode 三态循环(方案甲)；两节点串联单测 20 项断言全通过、TSan 零竞争；补测发现并修复卡点 C 死锁（`AbortLinks`） |
+| 三：本地播放主干 (D10–17) | 🔄 进行中 | 2026-07-30 | – | D10 已完成（Packet DTO + AVFrameFlag）；目录结构按 PUBLIC/PRIVATE 边界重整；下一步 D11 FfmpegDemuxerNode |
 | 四：硬核零拷贝与 HDR (D18–24) | 未开始 | – | – | – |
 | 五：弱网对抗与收尾 (D25–30) | 未开始 | – | – | – |
+
+### 逐日交付明细（D1–D10）
+
+| Day | 状态 | 交付物与验证依据 |
+|-----|------|----------------|
+| D1 | ✅ | CMake + Conan2 + Qt6 工具链打通，`./build.sh` 一键构建出黑框 |
+| D2 | ✅ | `iplayer.h` / `ivideo_sink.h` / `playback_state.h` 契约齐备 |
+| D3 | 🔶 | `PlayerWidget` + `ControllerWidget` 信号槽连通；**进度条仅有 `sliderReleased`，时间显示与进度回填待补** |
+| D4 | ✅ | `OpenGLView` 的 `initializeGL/resizeGL/paintGL` 骨架 |
+| D5 | ✅ | `StubPlayer` 渐变帧 + CAS 状态分派，渲染回环打通 |
+| D6 | ✅ | `ThreadSafeQueue<T>`：双 CV 背压 + `Close`/`Abort` 两级停止语义 + `std::optional` 返回 |
+| D7 | ✅ | `Link<T>`：`Send`/`Receive`/`CloseInput`/`Abort` 语义化管道 |
+| D8 | ✅ | `INodeBase`（管线程）+ `INode<InT,OutT>`（管类型）两层拆分，`ThreadMain` 声明 `final` |
+| D9 | ✅ | `SyncContext` 两态 + `WaitWhilePaused(should_stop)` 注入判据；两节点串联单测 20 项断言全通过；**修复卡点 C 死锁** |
+| D10 | ✅ | `Packet` DTO（RAII + 微秒时间戳 + epoch）、`AVFrameFlag`、`CLAUDE.md` 规范 |
+
+> **当前真实能力**：DAG 骨架（`INode`/`Link`/`SyncContext`/`ThreadSafeQueue`）已全部就绪并通过并发验证，但**具体 Node 尚无一个落地**（`Tick()` 全项目零实现），画面仍由 `StubPlayer` 提供。
+
+### D11 开工前需先确认的三件事
+
+1. **`StreamInfo` DTO 缺失**：Demuxer 探测出的流参数（codec_id / 宽高 / time_base / extradata / fps）无处安放 → 先补 `src/av_types/stream_info.h`；
+2. **一进双出的持有模式未定**：`INode<InT,OutT>` 固定一进一出，Demuxer 需 video/audio 两条输出 Link。此决定会同时影响后续 `TeeNode`（多播）、`Mp4MuxerNode`（多进）、`AVSyncNode`（汇聚），须先定型再动手；
+3. **Demuxer 的输入形态**：建议 D11 先做 `avformat_open_input(url)` 直连，把 `AVIOContext` 自定义读回调 + `ByteChunk` + `ISourceNode` 整套留到 D25 —— 否则 D11 要一次性吃掉数据源层，违背"每次只推进一个小模块"的节奏原则。

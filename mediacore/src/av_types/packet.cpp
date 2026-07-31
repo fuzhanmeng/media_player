@@ -3,7 +3,7 @@
  * @brief Packet DTO 实现
  */
 
-#include "mediacore/av_types/packet.h"
+#include "av_types/packet.h"
 
 extern "C" {
 #include <libavcodec/packet.h>

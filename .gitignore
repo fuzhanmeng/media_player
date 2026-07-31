@@ -17,3 +17,6 @@ Thumbs.db
 !.vscode/settings.json
 !.vscode/tasks.json
 !.vscode/launch.json
+
+# 6. 临时代码审查目录
+_review_temp/

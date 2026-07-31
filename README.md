@@ -27,96 +27,139 @@
 
 ### 1. 源码目录结构
 
-采用 Google C++ Style 分层：对外公共 API 收敛于 `include/mediacore/`（以静态库名 `mediacore` 做前缀目录，`#include "mediacore/xxx.h"` 防冲突、来源自明），实现细节隐藏于 `src/`。
+#### 1.1 公共 / 私有边界（PUBLIC vs PRIVATE）
+
+采用 Google C++ Style 分层，**可见性由构建系统强制，而非靠约定**：
+
+| 目录 | 可见性 | 谁能 include | 内容判定标准 |
+|------|--------|-------------|-------------|
+| `mediacore/include/mediacore/` | `PUBLIC` | `app` 层 + 库自身 | 仅"UI 必须知道"的契约与跨边界 DTO |
+| `mediacore/src/` | `PRIVATE` | 仅库自身 | DAG 框架、并发原语、各具体 Node、内部 DTO |
+
+```cmake
+target_include_directories(mediacore
+    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include   # 随依赖传播给 app
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src       # 不传播，app 无法 include
+)
+```
+
+两条硬规则：
+
+1. **公共头以库名 `mediacore` 做前缀目录**：`#include "mediacore/iplayer.h"` 防重名冲突（`legacy/` 下同样存在 `iplayer.h`）、来源自明；且安装后 `/usr/include/mediacore/...` 与开发期写法完全一致。
+2. **`app` 只允许依赖 4 个公共接口 + 2 个跨边界 DTO**（见下表）。私有头放在 `src/` 后，app 误 include 会**编译期失败**，边界不靠人自觉。
+
+`av_types/` 按可见性一分为二 —— 这是它同时出现在 `include/` 与 `src/` 的原因：
+
+| DTO | 位置 | 理由 |
+|-----|------|------|
+| `video_frame.h` / `frame_size.h` / `av_frame_flag.h` | PUBLIC | 帧要跨内核边界交给 `OpenGLView` 上传纹理 |
+| `packet.h` / `byte_chunk.h` / `audio_frame.h` / `stream_info.h` | PRIVATE | 只在 DAG 节点之间流动，UI 永不触碰 |
+
+> `av_frame_flag.h` 被公共头 `video_frame.h` 引用（`flags_` 字段），故一并公开；它零依赖、仅一个 `enum class` + 位运算重载，公开代价可忽略。
+
+#### 1.2 目录树
+
+图例：`✅` 已实现　`🔶` 部分实现　`⬜` 规划中（尚未落地）
 
 ```
 ai-media-player/
-├── CMakeLists.txt
-├── build.sh
-├── conanfile.py
+├── CMakeLists.txt                             ✅
+├── build.sh / conanfile.py                    ✅
+├── CLAUDE.md                                  ✅ AI 协作开发规范
+├── ARCHITECTURE.md / DEVELOPMENT_PLAN.md      ✅
+├── legacy/                                    ✅ 旧架构归档（功能参考，只读不改）
+│
 ├── mediacore/                                 # 核心媒体引擎静态库（libmediacore）
-│   ├── include/mediacore/                     # 对外暴露的公共 API（PUBLIC 头，以库名做前缀目录）
-│   │   ├── iplayer.h                          # Facade 接口（UI 唯一依赖）
-│   │   ├── ivideo_sink.h                      # UI 渲染注入点
-│   │   ├── igl_context.h                      # 共享 GL 上下文接口
-│   │   ├── playback_state.h
-│   │   ├── logger.h
-│   │   └── av_types/                          # 公共数据类型（DTO）
-│   │       ├── byte_chunk.h                   # 原始字节流（Source 输出）
-│   │       ├── packet.h                       # 压缩包（codec_id/pts_us/dts_us/flags/epoch）
-│   │       ├── video_frame.h                  # sum type：Software / Hardware variant
-│   │       ├── audio_frame.h                  # PCM 帧
-│   │       └── stream_info.h                  # VideoStreamInfo / AudioStreamInfo
+│   ├── include/mediacore/                     # ===== PUBLIC：app 可见的全部内容 =====
+│   │   ├── iplayer.h                          ✅ Facade 接口（UI 唯一控制入口）
+│   │   ├── ivideo_sink.h                      ✅ UI 渲染注入点
+│   │   ├── playback_state.h                   ✅ UI 可见的播放状态枚举
+│   │   ├── player_factory.h                   ✅ CreatePlayer() 工厂
+│   │   ├── igl_context.h                      ⬜ 共享 GL 上下文接口（硬解零拷贝阶段）
+│   │   ├── logger.h                           ⬜ spdlog 封装
+│   │   └── av_types/                          # 跨边界 DTO（仅 UI 需要的）
+│   │       ├── frame_size.h                   ✅ 具名宽高，防相邻 int 参数写反
+│   │       ├── av_frame_flag.h                ✅ 帧标志位（kKeyFrame/kEOF/kFlush）
+│   │       └── video_frame.h                  🔶 Software variant 已实现；Hardware 待 D19
 │   │
-│   └── src/                                   # 内部实现（PRIVATE）
+│   └── src/                                   # ===== PRIVATE：内部实现 =====
+│       ├── av_types/                          # 内部 DTO（UI 不可见）
+│       │   ├── packet.h/.cpp                  ✅ RAII 包 AVPacket* + pts_us/dts_us/epoch/flags
+│       │   ├── audio_frame.h                  ⬜ PCM 帧
+│       │   ├── stream_info.h                  ⬜ VideoStreamInfo / AudioStreamInfo
+│       │   └── byte_chunk.h                   ⬜ 原始字节流（Source 输出）
+│       │
 │       ├── core/                              # DAG 框架
-│       │   ├── inode.h                        # 节点基类模板 INode<InT, OutT> + INodeBase
-│       │   ├── link.h                         # 强类型连接器（有界阻塞队列封装）
-│       │   ├── pipeline.h/.cpp                # 容器：Build / Start / Stop / Seek
-│       │   ├── fsm.h/.cpp                      # 显式状态机（合法跃迁表）
-│       │   ├── sync_context.h                 # 控制总线（atomic epoch + state）
-│       │   ├── iclock_source.h                # 时钟接口 IClockSource
-│       │   └── player_facade.h/.cpp           # 对 UI 的门面（实现 IPlayer）
+│       │   ├── inode.h                        ✅ INodeBase（管线程）+ INode<InT,OutT>（管类型）
+│       │   ├── link.h                         ✅ 强类型连接器（有界阻塞队列封装）
+│       │   ├── sync_context.h                 ✅ 控制总线（atomic state + epoch + 暂停 CV）
+│       │   ├── stub_player.h/.cpp             🔶 桩 IPlayer（渐变测试帧），真实管线就绪后移除
+│       │   ├── player_factory.cpp             ✅ 工厂实现
+│       │   ├── pipeline.h/.cpp                ⬜ 容器：Build / Start / Stop / Seek
+│       │   ├── fsm.h/.cpp                     ⬜ 显式状态机（合法跃迁表）
+│       │   ├── iclock_source.h                ⬜ 时钟接口 IClockSource
+│       │   └── player_facade.h/.cpp           ⬜ 对 UI 的门面（实现 IPlayer，取代 StubPlayer）
 │       │
-│       ├── source/                            # 数据源层
-│       │   ├── isource_node.h
-│       │   ├── file_source_node.h/.cpp        # 本地分块读 + 字节 Seek
-│       │   ├── http_source_node.h/.cpp        # libcurl 流式 GET（Range）
-│       │   └── rtp_source_node.h/.cpp         # UDP recv + RTP 头解析
-│       │
-│       ├── network/                           # QoS 抗弱网层（仅网络源接入）
-│       │   ├── jitter_buffer_node.h/.cpp      # seq 乱序/空洞检测 + 自适应深度
-│       │   ├── gop_cache.h/.cpp               # 最近 GOP 缓存，支撑首帧秒开
-│       │   ├── fec_decoder_node.h/.cpp        # XOR FEC 丢包恢复
-│       │   └── rtp_depacketizer_node.h/.cpp   # FU-A / STAP-A 组帧
+│       ├── utils/
+│       │   ├── thread_safe_queue.h            ✅ 泛型有界阻塞队列（双 CV 背压 + Close/Abort）
+│       │   └── logger.cpp                     ⬜ spdlog 实现
 │       │
 │       ├── demux/
-│       │   └── ffmpeg_demuxer_node.h/.cpp     # libavformat 统一兜底（双输出）
+│       │   └── ffmpeg_demuxer_node.h/.cpp     ⬜ D11：libavformat 统一兜底（双输出）
 │       │
 │       ├── decode/
-│       │   ├── video_decoder_node.h/.cpp      # 软解 / VA-API 硬解双模式
-│       │   ├── audio_decoder_node.h/.cpp      # avcodec + swr 重采样
-│       │   └── hw_device_context.h/.cpp       # av_hwdevice_ctx 封装与探测
-│       │
-│       ├── filter/
-│       │   └── tee_node.h                     # 帧多播（录制分支，shared_ptr 零拷贝转发）
+│       │   ├── video_decoder_node.h/.cpp      ⬜ D13 软解 / D19 VA-API 硬解双模式
+│       │   ├── audio_decoder_node.h/.cpp      ⬜ D14：avcodec + swr 重采样
+│       │   └── hw_device_context.h/.cpp       ⬜ D18：av_hwdevice_ctx 封装与探测
 │       │
 │       ├── sync/
-│       │   └── av_sync_node.h/.cpp            # 非对称音画同步（±40ms）
-│       │
-│       ├── encode/
-│       │   ├── video_encoder_node.h/.cpp      # CBR/CRF/CQP 码率控制
-│       │   ├── audio_encoder_node.h/.cpp      # AAC FLTP 编码
-│       │   └── rate_control_config.h
-│       │
-│       ├── mux/
-│       │   └── mp4_muxer_node.h/.cpp          # av_interleaved_write_frame 交错写盘
+│       │   └── av_sync_node.h/.cpp            ⬜ D15：非对称音画同步（±40ms）
 │       │
 │       ├── sink/                              # 终端输出层（DAG 汇聚点，与 source/ 对称）
-│       │   ├── video_sink_node.h/.cpp         # 把帧推给外部 IVideoSink（OpenGLView）
-│       │   ├── audio_sink_node.h/.cpp         # 消费 PCM，持 IAudioSink 后端，兼 IClockSource（音频主时钟）
-│       │   ├── iaudio_sink.h                  # 音频输出后端抽象（可切 Alsa / Qt / PipeWire）
-│       │   └── alsa_audio_sink.h/.cpp         # IAudioSink 的 ALSA 实现（libasound / snd_pcm_writei）
+│       │   ├── video_sink_node.h/.cpp         ⬜ D15：把帧推给外部 IVideoSink（OpenGLView）
+│       │   ├── audio_sink_node.h/.cpp         ⬜ D14：消费 PCM，兼 IClockSource（音频主时钟）
+│       │   ├── iaudio_sink.h                  ⬜ D14：音频后端抽象（可切 Alsa / Qt / PipeWire）
+│       │   └── alsa_audio_sink.h/.cpp         ⬜ D14：ALSA 实现（libasound / snd_pcm_writei）
 │       │
-│       ├── qos/
-│       │   └── qos_monitor.h/.cpp             # 卡顿率/丢帧率/缓存深度/端到端延迟
+│       ├── source/                            # 数据源层
+│       │   ├── isource_node.h                 ⬜ D25
+│       │   ├── file_source_node.h/.cpp        ⬜ 本地分块读 + 字节 Seek
+│       │   ├── http_source_node.h/.cpp        ⬜ D25：libcurl 流式 GET（Range）
+│       │   └── rtp_source_node.h/.cpp         ⬜ D26：UDP recv + RTP 头解析
 │       │
-│       └── utils/
-│           ├── thread_safe_queue.h            # 泛型有界阻塞队列（背压）
-│           └── logger.cpp
+│       ├── network/                           # QoS 抗弱网层（仅网络源接入）
+│       │   ├── rtp_depacketizer_node.h/.cpp   ⬜ D26：FU-A / STAP-A 组帧
+│       │   ├── jitter_buffer_node.h/.cpp      ⬜ D27/D28：seq 乱序/空洞检测 + 自适应深度
+│       │   ├── gop_cache.h/.cpp               ⬜ D28：最近 GOP 缓存，支撑首帧秒开
+│       │   └── fec_decoder_node.h/.cpp        ⬜ D29：XOR FEC 丢包恢复
+│       │
+│       ├── filter/
+│       │   └── tee_node.h                     ⬜ 帧多播（录制分支，shared_ptr 零拷贝转发）
+│       │
+│       ├── encode/
+│       │   ├── video_encoder_node.h/.cpp      ⬜ CBR/CRF/CQP 码率控制
+│       │   ├── audio_encoder_node.h/.cpp      ⬜ AAC FLTP 编码
+│       │   └── rate_control_config.h          ⬜
+│       │
+│       ├── mux/
+│       │   └── mp4_muxer_node.h/.cpp          ⬜ av_interleaved_write_frame 交错写盘
+│       │
+│       └── qos/
+│           └── qos_monitor.h/.cpp             ⬜ D29：卡顿率/丢帧率/缓存深度/端到端延迟
 │
 └── app/                                       # 桌面应用层（Qt GUI 前端）
-    ├── main.cpp
-    ├── main_window.h/.cpp
-    └── ui/
-        ├── player_widget.h/.cpp               # 持 IPlayer（Facade）
-        ├── opengl_view.h/.cpp                 # 双路径渲染分派（sw / hw）
-        ├── controller_widget.h/.cpp           # 播放控制 + QoS 指标显示
-        └── render/
-            ├── sw_texture_uploader.h/.cpp     # 软件 YUV420P 三平面上传
-            ├── hw_texture_importer.h/.cpp     # 硬件零拷贝（DMA-BUF / EGLImage）
-            └── color_shader.h                 # BT.601/709/2020 + HDR Tone Mapping
+    ├── main.cpp                               ✅ 创建 Qt 事件循环 + 工厂造 IPlayer
+    ├── player_widget.h/.cpp                   ✅ 持 IPlayer*（非拥有），翻译 UI 信号为业务调用
+    ├── controller_widget.h/.cpp               🔶 播放/暂停 + 进度条；时间显示与 QoS 指标待补
+    ├── opengl_view.h/.cpp                     🔶 实现 IVideoSink，软件路径已通；hw 分派待 D22
+    ├── main_window.h/.cpp                     ⬜ 顶层窗口（当前 PlayerWidget 直接作顶层窗口）
+    └── render/
+        ├── sw_texture_uploader.h/.cpp         ⬜ D22：软件 YUV420P 三平面上传（从 opengl_view 抽出）
+        ├── hw_texture_importer.h/.cpp         ⬜ D21：硬件零拷贝（DMA-BUF / EGLImage）
+        └── color_shader.h                     ⬜ D23/D24：BT.601/709/2020 + HDR Tone Mapping
 ```
+
+> **当前状态提要**：DAG 的"骨架与血管"（`INode` / `Link` / `SyncContext` / `ThreadSafeQueue`）已全部就绪并通过并发单测，但**具体 Node 尚无一个落地**（`Tick()` 全项目无实现）。真实播放能力为零，画面由 `StubPlayer` 的渐变测试帧提供，真实管线自 D11 起逐节点接入。
 
 ### 2. 类继承与组合树
 

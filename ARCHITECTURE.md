@@ -406,7 +406,7 @@ sequenceDiagram
     Note over SyncContext,Node: 无需节点间握手, 一个计数器沿数据流自扩散
 ```
 
-### 6.5 Stop —— 停止并拆图（两拳唤醒 + 反向回收）
+### 6.5 Stop —— 停止并拆图（三卡点唤醒 + 反向回收）
 
 ```mermaid
 sequenceDiagram
@@ -421,10 +421,10 @@ sequenceDiagram
     Facade->>Pipeline: Stop()
     Note over Pipeline: 【关键】先置标志,后唤醒(顺序反了会死锁)
     loop 逐个节点(反向)
-        Pipeline->>Node: RequestStop()  【拳②】置 stopRequested_ + OnStopRequested→input_->Abort()
-        Note over Node: 睡在队列 CV(Receive) 的线程被 Abort 叫醒
+        Pipeline->>Node: RequestStop() 置 stopRequested_ + OnStopRequested→AbortLinks()
+        Note over Node: 睡在输入队列(Receive/卡点B)与输出队列(Send/卡点C)的线程均被 Abort 叫醒
     end
-    Pipeline->>SyncContext: WakeAllPausedThreads()  【拳①】纯 notify pauseCv_(不改状态)
+    Pipeline->>SyncContext: WakeAllPausedThreads() 纯 notify pauseCv_(卡点A, 不改状态)
     Note over Node: 睡在 pauseCv_ 的线程被叫醒,谓词 should_stop()=true → 真返回
     loop 逐个节点
         Node->>Node: 循环顶 IsStopRequested() → break, 线程函数返回
@@ -491,14 +491,70 @@ app 退出 ─────────────────┴─▶ PlayerFa
 
 ## 8. 双停止机制详解（方案甲：停止归 Node，注入停止判据）
 
-一个工作线程只可能睡死在**两个卡点之一**，停止必须两个都能踹醒：
+一个工作线程可能睡死在**三个卡点之一**，停止必须全部踹醒：
 
 | 卡点 | 睡眠原因 | 等待的 CV | 由谁唤醒 |
 |------|---------|-----------|---------|
 | **A** | 暂停 (state==kPaused) | `SyncContext::pauseCv_` | `WakeAllPausedThreads()` 的纯 `notify_all` |
-| **B** | 管道空, 等数据 (Receive) | `ThreadSafeQueue::notEmpty_` | `Link::Abort()`（经 RequestStop→OnStopRequested） |
+| **B** | 输入管道**空**，等收 (`input_->Receive()`) | `ThreadSafeQueue::notEmpty_` | `input_->Abort()`（经 RequestStop→OnStopRequested→AbortLinks） |
+| **C** | 输出管道**满**，等发 (`output_->Send()`) | `ThreadSafeQueue::notFull_` | `output_->Abort()`（同上） |
 
-**停止时无法预知线程睡在 A 还是 B，故两拳都要打**：`RequestStop()→Abort()` 敲 B，`WakeAllPausedThreads()` 敲 A。缺任一拳，对应卡点的线程醒不来 → `join()` 挂死。
+**三个卡点，两个唤醒源**：
+
+```
+Pipeline::Stop
+ ├─ ① 逐个 node->RequestStop()
+ │      → stopRequested_ = true
+ │      → OnStopRequested() → INode::AbortLinks()
+ │            ├─ input_->Abort()    踹醒卡点 B（等收）
+ │            └─ output_->Abort()   踹醒卡点 C（等发）
+ │
+ ├─ ② sync_->WakeAllPausedThreads()   踹醒卡点 A（暂停）
+ │
+ └─ ③ 逐个 node->WaitForStop()  → join
+```
+
+缺任一唤醒源，对应卡点的线程永远醒不来、回不到循环顶去检查 `IsStopRequested()`，`join()` 即永久挂死。
+
+### 为什么卡点 C 必须由框架兜住（而非交给派生类自觉）
+
+卡点 C 是**最容易被漏掉、后果最严重**的一个：
+
+- **源节点必然中招**：`FfmpegDemuxerNode` / `FileSourceNode` 没有 `input_`，其唯一阻塞点就是 `output_->Send()`。停止时下游解码器先退出，从此无人再 `Receive()`，源节点永远等不到空位。此时 `input_->Abort()` 打在空指针上完全无效。
+- **中间节点同样中招**：`VideoDecoderNode` 在下游 `AVSyncNode` 先停止后，若恰好卡在 `output_->Send()`，`input_->Abort()` 只能救"等收"，救不了"等发"。
+- **表现为概率性死锁**：仅当"停止瞬间该管道恰好满"才触发。本地短视频队列压不满，测不出来；4K 高码率、弱网卡顿、或用户在缓冲中点停止时必现。症状是整个 UI 冻死、堆栈停在 `pthread_cond_wait` 看不出因果，属最难排查的一类缺陷。
+
+因此 `INode::AbortLinks()` 作为**框架级默认行为**同时断开两端，不依赖任何派生类记得覆写 —— 与"epoch 过滤应下沉到框架"（见第 10 节风险 2）是同一条设计原则：**正确性不能建立在开发者记忆之上**。
+
+### 为什么用 `Abort` 而非 `Close`
+
+两者语义严格分工，不可混用：
+
+| 动作 | 语义 | 服务场景 |
+|------|------|---------|
+| `Close()` | 禁止再 Send，**保留存量**供下游排空，排空后 `Receive` 返回 `nullopt` | EOF 正常收尾（数据要完整处理完） |
+| `Abort()` | 立即唤醒收发两端，**丢弃存量**，Send/Receive 一律失败 | Stop / Seek（拆图丢弃一切） |
+
+`Stop` 的语义就是"拆图丢弃一切"，与 `Abort` 完全对齐。需要完整收尾的节点（如 `Mp4MuxerNode` 要保证录制文件不截断）可覆写 `OnStopRequested()` 改用 `Close()` —— 这正是虚函数应有的用法：**默认安全，特例可调**。
+
+> **`Abort` 不可逆**：`ThreadSafeQueue::aborted_` 一旦置真便无复位接口，被 `Abort` 过的 Link 永久失效。故 Stop 之后 Link 必须随 Pipeline 一同销毁、下次 `Open` 时重建，**不可复用同一条 Link 再次 Start**。这一约束限制了未来"Stop 后不拆图直接重 Start"的优化路径，需在做此类优化前先为队列补 `Reset` 语义。
+
+### `AbortLinks` 与 `OnStopRequested` 为何拆成两个函数
+
+- `OnStopRequested()` 回答**何时**断开 —— 生命周期钩子，由 `RequestStop()` 调用；
+- `AbortLinks()` 回答**如何**断开 —— 具体动作，可被派生类复用。
+
+拆开后，派生类获得第三种覆写姿势："先做默认动作，再补自己的"：
+
+```cpp
+// FfmpegDemuxerNode：一进双出，需额外处理自持的第二条输出管道
+void OnStopRequested() override {
+    AbortLinks();            // 复用框架默认行为，无须书写 INode<InT,OutT>:: 模板限定名
+    audioOutput_->Abort();   // 再补自己那条
+}
+```
+
+若不拆分，派生类想保留默认行为就得写 `INode<Packet, VideoFrame>::OnStopRequested()` —— 模板参数一多极易写错，且编译错误表现为大段模板展开，难以定位。
 
 ### 方案甲核心：停止不进全局态，通过注入判据让谓词能"看到"停止
 
@@ -562,16 +618,19 @@ void ThreadMain() final {
 ```cpp
 void Pipeline::Stop() {
     // 【关键】顺序：先置标志，后唤醒（反了会死锁）
-    
-    // ① 先置所有节点的停止标志 + Abort 队列 CV（踹卡点 B）
+
+    // ① 先置所有节点的停止标志 + 断开两端管道（踹卡点 B 与 C）
     for (auto& node : nodes_) {
-        node->RequestStop();   // 置 stopRequested_ + OnStopRequested→input_->Abort()
+        // 置 stopRequested_ + OnStopRequested → AbortLinks()
+        //   → input_->Abort()  唤醒"等收"的线程（卡点 B）
+        //   → output_->Abort() 唤醒"等发"的线程（卡点 C，源节点唯一阻塞点）
+        node->RequestStop();
     }
-    
+
     // ② 再唤醒暂停 CV（踹卡点 A）
     //    此时谓词 should_stop() 已是 true，线程能真正返回
     sync_->WakeAllPausedThreads();
-    
+
     // ③ join 所有线程
     for (auto& node : nodes_) {
         node->WaitForStop();
@@ -645,11 +704,14 @@ GStreamer 的 flush 事件 = 我们的 `Abort()`，用于踹醒阻塞在数据�
 
 > 以下是当前设计里**尚未闭合**或**需要警惕**的点，按优先级排列。不解决不影响 D9，但要在对应 Day 前想清楚。
 
-1. **【高】停止时的节点回收顺序未定死**
-   反向回收（先消费者后生产者）能防"生产者阻塞在 Send 到已死消费者"，但双输出 Demuxer + 汇聚 AVSync 的拓扑不是简单链，**回收序需按拓扑逆序精确定义**，否则仍可能死锁。→ D16 Pipeline 落地时必须给出确定顺序，并写死锁回归测试。
+1. **【中】停止时的节点回收顺序**（风险等级由【高】下调）
+   原担忧是"生产者阻塞在 Send 到已死消费者"需靠反向回收（先消费者后生产者）规避，而双输出 Demuxer + 汇聚 AVSync 的拓扑不是简单链，回收序难以精确定义。
+   **`AbortLinks()` 落地后此问题已大幅弱化**：任何节点无论睡在"等收"还是"等发"，`RequestStop()` 都能立即唤醒它，不再依赖"下游必须比上游后死"这一时序前提。停止正确性因此**与回收顺序解耦**。
+   → 仍建议 D16 按拓扑逆序 `join`（利于让下游先排空、减少无意义的丢弃），但这已是**优化项而非正确性前提**。死锁回归测试仍需保留。
 
 2. **【高】epoch 过滤散落在每个节点，易漏写**
-   "比较 epoch 丢弃旧帧"靠各节点 Tick() 自觉执行。任一节点漏写 → Seek 后闪旧画面。→ 需在 INode 层或 DTO 层提供统一的 `ShouldDrop(item)` 辅助，降低漏写概率。
+   "比较 epoch 丢弃旧帧"靠各节点 `Tick()` 自觉执行。任一节点漏写 → Seek 后闪旧画面。
+   → 需在 INode 层或 DTO 层提供统一的 `ShouldDrop(item)` 辅助，降低漏写概率。**这与已闭合的风险 5 是同一类问题**（正确性依赖开发者记忆），而卡点 C 的处理方式（下沉为框架默认行为）已验证有效，此处应采用同一策略，最迟在 D11 第一个真实 Node 落地前完成。
 
 3. **【中】Facade 状态 (PlaybackState) 与 SyncContext 状态 (PipelineState) 双份**
    UI 态和内核机械态是两套枚举，需保证不漂移（如 UI 显示 Playing 但 SyncContext 还是 Paused）。→ 明确"Facade 态是权威，SyncContext 态是其投影"，跃迁时同步更新，禁止各写各的。
@@ -657,8 +719,14 @@ GStreamer 的 flush 事件 = 我们的 `Abort()`，用于踹醒阻塞在数据�
 4. **【中】IVideoSink 裸指针的解绑时序**
    UI 销毁 OpenGLView 前必须 `DetachDisplayView`，且要保证此刻没有节点线程正在 `OnReceiveVideoFrame` 中途。→ 推帧处加锁（已有 sinkMutex_ 先例）+ Detach 与推帧互斥；文档化"UI 必须先 Detach 再析构 Sink"的契约。
 
-5. **【中】背压 + 暂停的交互**
-   暂停时数据流冻结，若某 Link 恰好满，上游线程可能阻塞在 Send（卡点 B 变种）而非睡在暂停 CV。停止时 Abort 能救（打拳②），但要确认所有阻塞点都被两拳覆盖。→ D9 单测需专门构造"暂停中队列满 → 停止"用例。
+5. ~~**【中】背压 + 暂停的交互**~~ → **已闭合（D9 + D10 重构）**
+   *原风险*：暂停时数据流冻结，若某 Link 恰好满，上游线程可能阻塞在 `Send()` 而非睡在暂停 CV，需确认所有阻塞点都被覆盖。
+   *结论*：**当时的实现确实存在死锁**。原 `INode::OnStopRequested()` 只 `Abort()` 了 `input_`，而"等发"（卡点 C）无人唤醒 —— 源节点没有 `input_`，这一拳完全打空。已用两节点串联单测复现：改动前"源节点 + 暂停中队列满 + 停止"用例**进程永久挂死**（`join` 无返回）。
+   *修复路径*：
+   - D9: 尝试引入纯虚 `AbortLinks()`，要求所有派生类实现；
+   - D10 重构: 发现纯虚 + 析构调用冲突（vtable 退化导致"pure virtual method called"崩溃）→ 改为**空默认实现**（方案 A），派生类按需覆写；`INode<InT,OutT>` 提供一进一出的标准实现，多路节点自行覆写；
+   - D9 单测补测"源节点不覆写 + 队列满 + 停止"场景，验证基类空实现 + `INode` 标准实现可保底兜住卡点 C。
+   *遗留*：卡点表已从"两个"更正为"三个"；D16 `Pipeline::Stop` 落地时须保留此回归用例。
 
 6. **【低】Seek 期间在飞帧与 kFlush 带内信令的竞态**
    epoch 作废旧帧是"惰性丢弃"，但解码器内部可能已缓存 B 帧重排队列，需 `avcodec_flush_buffers` 配合。→ D17 seek 落地时处理带内 kFlush 与 epoch 的协同。
@@ -676,12 +744,22 @@ GStreamer 的 flush 事件 = 我们的 `Abort()`，用于踹醒阻塞在数据�
 - `PipelineState` 只有 `{kRunning, kPaused}` 两态，停止不进全局态。
 - 停止信号由各节点的 `stopRequested_` 表达，通过注入回调 `should_stop()` 让 `WaitWhilePaused` 谓词能"看到"它。
 - 循环只判 `IsStopRequested()`，不判全局 `kStopped`。
-- Pipeline::Stop 顺序：① RequestStop 先置标志，② WakeAllPausedThreads 再唤醒，③ WaitForStop join。
+- Pipeline::Stop 顺序：① RequestStop 先置标志（内含 `AbortLinks` 断开两端），② WakeAllPausedThreads 再唤醒，③ WaitForStop join。
 - 职责四层分离：Player 控制播放 / Pipeline 管 DAG / SyncContext 存共享态(state+epoch) / Node 管线程生命周期。
 - 扩展性：未来多 Pipeline(Recording/Preview/Transcode)各自独立停止，不争抢同一全局 kStopped。
 
-**下一步（D9 编码）在本架构确认后进行：**
-1. `SyncContext` 砍成两态（移除 kStopped）+ 添加 `WaitWhilePaused(should_stop)` 和 `WakeAllPausedThreads()`；
-2. `INode::ThreadMain` 循环实现方案甲（只判 `IsStopRequested()`，`WaitWhilePaused` 注入 lambda）；
-3. 两节点串联单测（Producer→Consumer + 暂停/恢复/停止/epoch 四类断言）。
+### D9 落地情况（已完成并通过验证）
+
+1. ✅ `SyncContext` 砍成两态（移除 kStopped），添加 `WaitWhilePaused(should_stop)` 与 `WakeAllPausedThreads()`；
+2. ✅ `INode::ThreadMain` 实现方案甲三态循环（声明为 `final`，只判 `IsStopRequested()`，`WaitWhilePaused` 注入 lambda）；
+3. ✅ 两节点串联单测：正常流转（不丢不重不乱序）/ 暂停恢复（计数冻结、睡 CV 不空转）/ 停止 join 不挂死 / epoch 世代过滤，四类断言全部通过，TSan 零数据竞争；
+4. ✅ **补测发现并修复卡点 C 死锁**：单测构造"暂停中队列满 → 停止"用例时暴露 `OnStopRequested` 只 Abort `input_` 的缺口，源节点必然挂死。引入 `INode::AbortLinks()` 后闭合（见第 8 节与第 10 节风险 5）。
+
+> 这条是"为并发写单测"价值的直接体现：设计评审阶段第 10 节已把该场景列为【中】风险并写明"D9 单测需专门构造"，单测确实兑现了它 —— 若跳过此用例，缺陷会一直潜伏到 D11 `FfmpegDemuxerNode` 上线，届时表现为概率性 UI 冻死，排查成本高出一个量级。
+
+**D11 前置条件已全部解除（D9 重构 + 卡点 C 闭合）：**
+1. ~~`INode<InT,OutT>` 固定一进一出，而 Demuxer 是一进双出~~ → **已解决**：`ThreadMain` 上移至 `INodeBase`，多路节点直接继承基类并自己持有 Link 成员；
+2. ~~卡点 C（输出队列满时"等发"的线程无人唤醒）导致停止挂死~~ → **已闭合**：`AbortLinks()` 改为虚函数默认空实现（方案 A），基类析构调用安全，派生类按需覆写；D9 单测已验证"源节点不覆写 + 暂停中队列满 + 停止"场景 join 成功；
+3. `StreamInfo` DTO 尚不存在，Demuxer 探测出的流参数无处安放 → 需先补 `src/av_types/stream_info.h`；
+4. 风险 2（epoch 过滤易漏写）应在第一个真实 Node 落地前下沉到框架，避免重蹈覆辙。
 

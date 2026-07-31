@@ -21,7 +21,7 @@
 #include <optional>
 #include <utility> // std::move
 
-#include "mediacore/utils/thread_safe_queue.h"
+#include "utils/thread_safe_queue.h"
 
 namespace mediacore {
 
