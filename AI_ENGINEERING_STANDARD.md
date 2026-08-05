@@ -30,7 +30,25 @@ _review_temp/
 
 所有的代码由我亲自写，写完后你来检查
 
-### 2. 遵循 Google C++ Style Guide
+### 2. 文档可直接修改（代码除外）
+
+`ARCHITECTURE.md` / `README.md` / `DEVELOPMENT_PLAN.md` / `CLAUDE.md` 等
+Markdown 文档，AI 可直接修改，无需先生成到 `_review_temp/`。
+
+原因：文档与代码不符时，过时的文档会主动误导后续开发
+（例如注释宣称"编译器强制实现"，而实际是空默认实现，读者据此以为漏写会编译失败）。
+文档的修正成本低、风险为零，但滞后的代价高，故不设审阅关卡。
+
+约束：
+
+-   仅限文档正文，不含文档中「建议落地的代码片段」之外的任何 `.h` / `.cpp` 改动；
+-   修改必须基于已核实的代码事实，不允许凭记忆或推测改文档；
+-   若发现文档与代码不符，**改文档使其描述实际代码**，
+    而不是改代码去迎合文档 —— 除非已确认代码本身有缺陷，
+    那种情况按第 1 条走 `_review_temp/` 流程；
+-   每次改文档需说明改了哪几处、依据的代码事实是什么。
+
+### 3. 遵循 Google C++ Style Guide
 
 -   四空格缩进
 -   不使用 Tab
@@ -113,8 +131,8 @@ using namespace std;
 
 推荐：
 
--   RequestStop()
--   WaitForStop()
+-   SignalStop()
+-   Join()
 -   GenerateFrame()
 -   ReceivePacket()
 -   PushFrame()

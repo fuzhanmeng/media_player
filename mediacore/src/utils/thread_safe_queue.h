@@ -3,8 +3,9 @@
  * @brief 泛型的有界阻塞队列 背压防 OOM - DAG 节点间数据通道的底层
  * @details 生产者-消费者模型 多线程安全的 定容队列，满时阻塞生产者，空时阻塞消费者
  *          停止语义分为两级
-            1. Close：禁止再Push，但是已经入队的数据仍然可以被 Pop，用于 EOF/正常结束
-            2. Abort：强制关闭，立即唤醒所有等待者，Push/Pop 立即返回失败，用于 Seek / 关闭播放器等操作
+ *          1. Close：禁止再Push，但是已经入队的数据仍然可以被 Pop，用于 EOF/正常结束
+ *          2. Abort：强制关闭，立即唤醒所有等待者，Push/Pop 立即返回失败，用于立即停止 Pipeline
+ *          3. 队列由 Link 以值成员方式拥有，不允许拷贝或移动
  */
 #pragma once
 
@@ -13,13 +14,14 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <stdexcept> // 标准异常类
 #include <utility> // std::move / std::forward
 
 namespace mediacore {
 
 /**
  * @class ThreadSafeQueue
- * @brief 定容、阻塞、可中止的线程安全队列
+ * @brief 单生产者/单消费者和多生产者/多消费者均可使用的有界阻塞队列
  * @tparam T 元素类型， DAG 中通常都是 std::shared_ptr<Packet> / std::shared_ptr<VideoFrame>
            等轻量句柄，移动开销极低，本类内部一律 用 std::move 转移，避免深拷贝
  * 队列中有 2 种等待者，等待条件完全相反
@@ -31,8 +33,14 @@ class ThreadSafeQueue {
 public:
     /**
      * @brief 构造一个容量上限为 capacity 的有界队列
+     * @param capacity 最大缓存元素数，必须 > 0
+     * @throws std::invalid_argument capacity 为 0 时抛出，避免 Push 永久等待
      */
-    explicit ThreadSafeQueue(std::size_t capacity) : kCapacity(capacity) {}
+    explicit ThreadSafeQueue(std::size_t capacity) : kCapacity(capacity) {
+        if (kCapacity == 0) {
+            throw std::invalid_argument("ThreadSafeQueue capacty must be greater than zero");
+        }
+    }
 
     /**
      * @brief 析构函数
@@ -48,7 +56,7 @@ public:
     /**
      * @brief 阻塞式入队，队列满时，挂起当前线程，直到有空位或者被 Abort/Close
      * @param value 待元素入队，按值接收后 std::move 进队列
-     * @return true 成功入队， false 入队失败
+     * @return true 成功入队， false 入队失败，表示队列已 Close 或 Abort
      */
     bool Push(T value) {
         std::unique_lock<std::mutex> lock(mutex_);
@@ -63,6 +71,7 @@ public:
         }
 
         queue_.push(std::move(value));
+        lock.unlock();
 
         // 定向唤醒一个消费者：队列此刻至少有一个元素可取。
         notEmpty_.notify_one();
@@ -96,6 +105,8 @@ public:
         T value = std::move(queue_.front());
         queue_.pop();
 
+        lock.unlock();
+
         // 唤醒一个生产者
         notFull_.notify_one();
         return value;
@@ -118,12 +129,14 @@ public:
 
     /**
      * @brief 强制终止：立即唤醒所有等待者， Push/Pop 一律返回失败，未处理数据按 "丢弃" 语义处理
-     * @note 幂等，用于 Seek / 窗口关闭等需要 立即停止的 情况
+     * @note 幂等；Abort 后队列不可恢复，只用于立即停止
      */
     void Abort() {
+        std::queue<T> discarded;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             aborted_ = true;
+            discarded.swap(queue_); // 交换两个 queue 的内部内容
         }
 
         notFull_.notify_all();
@@ -139,7 +152,8 @@ public:
     }
 
     /**
-     * @brief 是否已被 Abort
+     * @brief 查询是否已被立即中止
+     * @return true 表示收发均已终止
      */
     bool IsAborted() const {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -147,7 +161,8 @@ public:
     }
 
     /**
-     * @brief 是否已被 Close
+     * @brief 查询是否已正常关闭
+     * @return true 表示不再接受 Push
      */
     bool IsClosed() const {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -164,16 +179,16 @@ private:
     /// 消费者等待 "不空" 的条件变量：队列中有新元素入队时被唤醒
     std::condition_variable notEmpty_;
 
-    /// 底层容器： std::queue
+    /// 实际缓存容器
     std::queue<T> queue_;
 
-    /// 容量上限
+    /// 构造期固定的最大缓存元素数
     const std::size_t kCapacity;
 
-    /// 强制终止的标志
+    /// 立即中止标志；中止后 Push/Pop 均失败
     bool aborted_{false};
 
-    /// 正常关闭的标志
+    /// 正常关闭标志；关闭后禁止 Push，但允许 Pop 存量
     bool closed_{false};
 };
 } // namespace mediacore

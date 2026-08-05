@@ -1,29 +1,46 @@
 # ai-media-player
 
-音视频播放器，基于 FFmpeg + Qt + OpenGL 实现完整媒体处理链路
+基于 FFmpeg + Qt + OpenGL 演进的音视频播放器工程
 
 ---
 
 ## 项目简介
 
-本项目是一款面向"现代播放器工程能力"打磨的 C++17 音视频播放器，遵循标准媒体处理流程，已实现**本地/网络拉流、解封装、软/硬解码、音画同步、零拷贝渲染、录制**全链路能力。
+本项目是一款面向“现代播放器工程能力”打磨的 C++17 音视频播放器。当前正式可运行能力是 Qt UI、`IPlayer`/`IVideoSink` 公共契约、`StubPlayer` 渐变测试帧和 OpenGL 显示闭环；真实媒体解封装、解码、音画同步、录制、硬件零拷贝和网络 QoS 尚未实现。
 
-项目采用**基于独立线程 + 有界阻塞队列的强类型固定拓扑节点图（DAG）** 架构：每个功能模块抽象为"独立线程 + 输入队列"的 Node，节点间通过强类型连接器 `Link<T>` 串联，控制信令通过共享的 `SyncContext` 总线以**无锁 atomic epoch** 广播。相较早期的"上帝对象 + Listener 回调链"，新架构消除了控制流反转、跨线程裸指针生命周期风险与 Seek 竞态。
+媒体内核正在重构为**独立线程 + 有界阻塞队列的强类型固定拓扑节点图（DAG）**。仓库已有 `ThreadSafeQueue`、`Link`、`INodeBase`、`SyncContext` 和 D9 `Pipeline` 生命周期代码，但正式 CTest、ASan/UBSan 与 TSan 验收尚未建立，因此 D9 仍是进行中。D10 `Packet` RAII、时间戳、flags 和 epoch 保持已完成；D11 `StreamInfo + FfmpegDemuxerNode` 尚未开发。
 
-本期（30 天）聚焦四大技术攻坚方向：
+### 唯一产品路线
 
-- **DAG 流水线架构**：`std::condition_variable` 有界阻塞队列背压防 OOM；`atomic epoch` 驱动 Seek 等全局信令，彻底废弃旧的多标志握手式 Seek。
-- **VA-API 硬件解码 + 零拷贝渲染**：`vaExportSurfaceHandle` 导出 DMA-BUF fd，`eglCreateImageKHR` 包装为 OpenGL 纹理，消除显存→内存→显存的 CPU 帧拷贝。
-- **GLSL 高级色彩管线**：BT.601/709/2020 矩阵动态切换，PQ EOTF 反变换 + Reinhard 完成 HDR→SDR Tone Mapping。
-- **全链路 QoS**：HTTP/RTP 拉流 + 抗弱网 Jitter Buffer（序列号乱序/空洞检测、自适应缓存深度、GOP Cache 首帧秒开 <180ms）；非对称音画同步（±40ms）与卡顿率监控。
+从当前 D9 开始，以下是唯一推进顺序，均为目标能力而非当前完成声明。前一阶段未达到可复现验收条件时，不进入后一阶段；D10 是已经完成的独立 DTO 里程碑：
 
-> 决策说明：本期**废弃自写 FLV/MP4 解封装**计划，容器解析统一由 `FfmpegDemuxerNode` 兜底，将预算集中投入硬解与 QoS；WebRTC **不集成源码**，其核心机制（Jitter Buffer / FEC）选择性落地至网络层，完整协议栈以技术白皮书形式产出。
+1. **稳定 DAG**：完成 Queue / Link / Node / SyncContext / Pipeline 生命周期、背压、暂停、停止、异常和正式并发测试。
+2. **本地软件播放器**：用 FFmpeg 完成 StreamInfo、解封装、软件视频解码、软件渲染和最小播放闭环。
+3. **音频与同步**：完成音频解码、ALSA 输出、音频主时钟和视频同步。
+4. **Seek / EOF / 错误闭环**：完成 epoch、带内 Flush、正常排空、播放完成事件和结构化错误上报。
+5. **录制**：在不修改运行中主 DAG 拓扑的前提下增加 Tee、编码、MP4 Mux 和独立 Drain 语义。
+6. **VA-API 与零拷贝**：先验证硬解正确性和软件 fallback，再打通 DMA-BUF / EGLImage，并用数据证明收益。
+7. **色彩管理**：依次完成 SDR 矩阵与范围、HDR 识别和 HDR 到 SDR tone mapping。
+8. **HTTP 网络播放**：先使用 FFmpeg URL、超时和 interrupt callback 建立可靠基线；只有证据充分时才增加自定义 HTTP Source。
+9. **RTP 接收 + Jitter Buffer**：完成可取消 UDP 接收、RTP/H.264 解析、固定重排判丢，再基于指标做自适应。
+10. **可复现弱网测试**：用固定 trace、代理或 netem profile 验证首帧、rebuffer、延迟、丢包、重连和队列峰值，不用主观观看代替验收。
+
+### 明确非目标
+
+- 不自写 FLV/MP4 等容器解析器，容器探测和解封装统一交给 FFmpeg。
+- RTSP/RTMP、SRT 和 QUIC 不在本项目范围内。
+- 不集成完整 WebRTC 协议栈，也不在播放器主线中加入 RTCP、SRTP 或拥塞控制。
+- 默认 RTP 路径不包含 FEC。只有协议、线格式、收发端约定和可复现测试数据全部明确后，才单独评估 FEC；它不能阻塞 RTP + Jitter Buffer 主链。
+- GOP Cache 不在当前主线中。只有暖启动或重连指标证明需要缓存完整 Access Unit 时，才单独评估。
+- FFmpeg HTTP 能满足取消、超时和观测需求时，不增加 `libcurl + AVIOContext` 自定义层。
+- 不修改运行中的主 Pipeline 拓扑；录制采用构建时固定分支或独立 Pipeline，最终方案在录制阶段定型。
+- 不承诺脱离测试条件的“首帧 <180ms”或零拷贝收益，性能结论必须附输入、环境、时间源和测量数据。
 
 ---
 
 ## 架构设计
 
-项目采用 **强类型固定拓扑的节点图（DAG）** 架构。每个功能模块为独立线程 + 输入队列的 Node，节点之间通过强类型连接器（`Link<T>`）串联，控制信令通过共享 `SyncContext` 总线以 atomic epoch 广播，面向"网络拉流、硬件加速零拷贝、色彩空间/HDR、QoS"等方向预留扩展位。
+目标架构是**强类型固定拓扑的节点图（DAG）**：媒体模块以 Node 表达，节点之间通过 `Link<T>` 单向传递数据，`Pipeline` 独占图生命周期并通过 `SyncContext` 协调运行门控和 epoch。当前完成度以源码目录树和 [DEVELOPMENT_PLAN.md](./DEVELOPMENT_PLAN.md) 的进度快照为准。
 
 ### 1. 源码目录结构
 
@@ -46,28 +63,27 @@ target_include_directories(mediacore
 两条硬规则：
 
 1. **公共头以库名 `mediacore` 做前缀目录**：`#include "mediacore/iplayer.h"` 防重名冲突（`legacy/` 下同样存在 `iplayer.h`）、来源自明；且安装后 `/usr/include/mediacore/...` 与开发期写法完全一致。
-2. **`app` 只允许依赖 4 个公共接口 + 2 个跨边界 DTO**（见下表）。私有头放在 `src/` 后，app 误 include 会**编译期失败**，边界不靠人自觉。
+2. **`app` 只允许 include `mediacore/include/mediacore/` 下的公共契约和跨边界 DTO**。私有头放在 `src/` 后，app 误 include 会**编译期失败**，边界不靠人自觉。
 
-`av_types/` 按可见性一分为二 —— 这是它同时出现在 `include/` 与 `src/` 的原因：
+`av_types/` 按可见性一分为二。下表同时包含当前 DTO 和后续规划，是否已经落地以 1.2 节的状态标记为准：
 
 | DTO | 位置 | 理由 |
 |-----|------|------|
-| `video_frame.h` / `frame_size.h` / `av_frame_flag.h` | PUBLIC | 帧要跨内核边界交给 `OpenGLView` 上传纹理 |
-| `packet.h` / `byte_chunk.h` / `audio_frame.h` / `stream_info.h` | PRIVATE | 只在 DAG 节点之间流动，UI 永不触碰 |
-
-> `av_frame_flag.h` 被公共头 `video_frame.h` 引用（`flags_` 字段），故一并公开；它零依赖、仅一个 `enum class` + 位运算重载，公开代价可忽略。
+| `video_frame.h` / `frame_size.h` | PUBLIC | 视频帧要跨内核边界交给 `OpenGLView` 上传纹理 |
+| `av_frame_flag.h` | PUBLIC（待 D12 收口） | 当前 `Packet` 使用它，而 `VideoFrame` 仍有另一套 `FrameFlag`；D12 统一协议后重新确认可见性 |
+| `packet.h` / `stream_info.h` / `byte_chunk.h` / `audio_frame.h` | PRIVATE | 只在 DAG 节点之间流动，UI 永不触碰 |
 
 #### 1.2 目录树
 
-图例：`✅` 已实现　`🔶` 部分实现　`⬜` 规划中（尚未落地）
+图例：`✅` 已实现　`🔄` 进行中　`🔶` 部分实现　`⬜` 规划中（尚未落地）
 
 ```
 ai-media-player/
 ├── CMakeLists.txt                             ✅
 ├── build.sh / conanfile.py                    ✅
-├── CLAUDE.md                                  ✅ AI 协作开发规范
+├── AI_ENGINEERING_STANDARD.md                 ✅ AI 协作开发规范
 ├── ARCHITECTURE.md / DEVELOPMENT_PLAN.md      ✅
-├── legacy/                                    ✅ 旧架构归档（功能参考，只读不改）
+├── legacy/                                    ✅ 旧实现归档（只读，不作新架构设计或迁移依据）
 │
 ├── mediacore/                                 # 核心媒体引擎静态库（libmediacore）
 │   ├── include/mediacore/                     # ===== PUBLIC：app 可见的全部内容 =====
@@ -80,22 +96,22 @@ ai-media-player/
 │   │   └── av_types/                          # 跨边界 DTO（仅 UI 需要的）
 │   │       ├── frame_size.h                   ✅ 具名宽高，防相邻 int 参数写反
 │   │       ├── av_frame_flag.h                ✅ 帧标志位（kKeyFrame/kEOF/kFlush）
-│   │       └── video_frame.h                  🔶 Software variant 已实现；Hardware 待 D19
+│   │       └── video_frame.h                  🔶 Software 基础已实现；契约完善待 D12，Hardware 待 D25
 │   │
 │   └── src/                                   # ===== PRIVATE：内部实现 =====
 │       ├── av_types/                          # 内部 DTO（UI 不可见）
 │       │   ├── packet.h/.cpp                  ✅ RAII 包 AVPacket* + pts_us/dts_us/epoch/flags
 │       │   ├── audio_frame.h                  ⬜ PCM 帧
-│       │   ├── stream_info.h                  ⬜ VideoStreamInfo / AudioStreamInfo
-│       │   └── byte_chunk.h                   ⬜ 原始字节流（Source 输出）
+│       │   ├── stream_info.h                  ⬜ D11：VideoStreamInfo / AudioStreamInfo / MediaInfo / Rational
+│       │   └── byte_chunk.h                   ⬜ D34 决策门通过后供自定义 HTTP Source 使用
 │       │
 │       ├── core/                              # DAG 框架
-│       │   ├── inode.h                        ✅ INodeBase（管线程）+ INode<InT,OutT>（管类型）
-│       │   ├── link.h                         ✅ 强类型连接器（有界阻塞队列封装）
-│       │   ├── sync_context.h                 ✅ 控制总线（atomic state + epoch + 暂停 CV）
+│       │   ├── inode.h                        🔄 D9：线程循环、TickResult、停止原因和端口便利模板
+│       │   ├── link.h                         🔄 D9：强类型数据边 + Pipeline 类型擦除控制接口
+│       │   ├── sync_context.h                 🔄 D9：运行/暂停门控 + epoch + 暂停 CV
 │       │   ├── stub_player.h/.cpp             🔶 桩 IPlayer（渐变测试帧），真实管线就绪后移除
 │       │   ├── player_factory.cpp             ✅ 工厂实现
-│       │   ├── pipeline.h/.cpp                ⬜ 容器：Build / Start / Stop / Seek
+│       │   ├── pipeline.h                     🔄 D9：组图、Start/Pause/Resume/Stop；Build/Seek 待 D15/D20
 │       │   ├── fsm.h/.cpp                     ⬜ 显式状态机（合法跃迁表）
 │       │   ├── iclock_source.h                ⬜ 时钟接口 IClockSource
 │       │   └── player_facade.h/.cpp           ⬜ 对 UI 的门面（实现 IPlayer，取代 StubPlayer）
@@ -105,33 +121,29 @@ ai-media-player/
 │       │   └── logger.cpp                     ⬜ spdlog 实现
 │       │
 │       ├── demux/
-│       │   └── ffmpeg_demuxer_node.h/.cpp     ⬜ D11：libavformat 统一兜底（双输出）
+│       │   └── ffmpeg_demuxer_node.h/.cpp     ⬜ D11：本地 path 探测与读包；D32 验证 HTTP URL
 │       │
 │       ├── decode/
-│       │   ├── video_decoder_node.h/.cpp      ⬜ D13 软解 / D19 VA-API 硬解双模式
-│       │   ├── audio_decoder_node.h/.cpp      ⬜ D14：avcodec + swr 重采样
-│       │   └── hw_device_context.h/.cpp       ⬜ D18：av_hwdevice_ctx 封装与探测
+│       │   ├── video_decoder_node.h/.cpp      ⬜ D13 软解 / D26 VA-API 硬解
+│       │   ├── audio_decoder_node.h/.cpp      ⬜ D16：avcodec + swr 重采样
+│       │   └── hw_device_context.h/.cpp       ⬜ D25：硬件上下文和帧所有权契约
 │       │
 │       ├── sync/
-│       │   └── av_sync_node.h/.cpp            ⬜ D15：非对称音画同步（±40ms）
+│       │   └── av_sync_node.h/.cpp            ⬜ D18：音频主时钟与视频墙钟 fallback
 │       │
 │       ├── sink/                              # 终端输出层（DAG 汇聚点，与 source/ 对称）
-│       │   ├── video_sink_node.h/.cpp         ⬜ D15：把帧推给外部 IVideoSink（OpenGLView）
-│       │   ├── audio_sink_node.h/.cpp         ⬜ D14：消费 PCM，兼 IClockSource（音频主时钟）
-│       │   ├── iaudio_sink.h                  ⬜ D14：音频后端抽象（可切 Alsa / Qt / PipeWire）
-│       │   └── alsa_audio_sink.h/.cpp         ⬜ D14：ALSA 实现（libasound / snd_pcm_writei）
+│       │   ├── video_sink_node.h/.cpp         ⬜ D14：把帧投递给 IVideoSink / OpenGLView
+│       │   ├── audio_sink_node.h/.cpp         ⬜ D17：消费 PCM，兼 IClockSource（音频主时钟）
+│       │   ├── iaudio_sink.h                  ⬜ D17：音频后端抽象
+│       │   └── alsa_audio_sink.h/.cpp         ⬜ D17：ALSA 实现（libasound / snd_pcm_writei）
 │       │
 │       ├── source/                            # 数据源层
-│       │   ├── isource_node.h                 ⬜ D25
-│       │   ├── file_source_node.h/.cpp        ⬜ 本地分块读 + 字节 Seek
-│       │   ├── http_source_node.h/.cpp        ⬜ D25：libcurl 流式 GET（Range）
-│       │   └── rtp_source_node.h/.cpp         ⬜ D26：UDP recv + RTP 头解析
+│       │   ├── http_source_node.h/.cpp        ⬜ D34 决策门通过后才实现
+│       │   └── rtp_source_node.h/.cpp         ⬜ D35：可取消 UDP 接收 + RTP 头解析
 │       │
 │       ├── network/                           # QoS 抗弱网层（仅网络源接入）
-│       │   ├── rtp_depacketizer_node.h/.cpp   ⬜ D26：FU-A / STAP-A 组帧
-│       │   ├── jitter_buffer_node.h/.cpp      ⬜ D27/D28：seq 乱序/空洞检测 + 自适应深度
-│       │   ├── gop_cache.h/.cpp               ⬜ D28：最近 GOP 缓存，支撑首帧秒开
-│       │   └── fec_decoder_node.h/.cpp        ⬜ D29：XOR FEC 丢包恢复
+│       │   ├── rtp_depacketizer_node.h/.cpp   ⬜ D35/D37：FU-A / STAP-A 组帧
+│       │   └── jitter_buffer_node.h/.cpp      ⬜ D36/D38：固定重排、恢复和有界自适应
 │       │
 │       ├── filter/
 │       │   └── tee_node.h                     ⬜ 帧多播（录制分支，shared_ptr 零拷贝转发）
@@ -145,140 +157,146 @@ ai-media-player/
 │       │   └── mp4_muxer_node.h/.cpp          ⬜ av_interleaved_write_frame 交错写盘
 │       │
 │       └── qos/
-│           └── qos_monitor.h/.cpp             ⬜ D29：卡顿率/丢帧率/缓存深度/端到端延迟
+│           └── qos_monitor.h/.cpp             ⬜ D33：指标定义与采样基线
 │
 └── app/                                       # 桌面应用层（Qt GUI 前端）
     ├── main.cpp                               ✅ 创建 Qt 事件循环 + 工厂造 IPlayer
     ├── player_widget.h/.cpp                   ✅ 持 IPlayer*（非拥有），翻译 UI 信号为业务调用
     ├── controller_widget.h/.cpp               🔶 播放/暂停 + 进度条；时间显示与 QoS 指标待补
-    ├── opengl_view.h/.cpp                     🔶 实现 IVideoSink，软件路径已通；hw 分派待 D22
+    ├── opengl_view.h/.cpp                     🔶 StubPlayer 软件测试帧可显示；真实帧接入待 D14
     ├── main_window.h/.cpp                     ⬜ 顶层窗口（当前 PlayerWidget 直接作顶层窗口）
     └── render/
-        ├── sw_texture_uploader.h/.cpp         ⬜ D22：软件 YUV420P 三平面上传（从 opengl_view 抽出）
-        ├── hw_texture_importer.h/.cpp         ⬜ D21：硬件零拷贝（DMA-BUF / EGLImage）
-        └── color_shader.h                     ⬜ D23/D24：BT.601/709/2020 + HDR Tone Mapping
+        ├── sw_texture_uploader.h/.cpp         ⬜ D14：软件 YUV 三平面上传（从 opengl_view 抽出）
+        ├── hw_texture_importer.h/.cpp         ⬜ D28：DMA-BUF / EGLImage 导入
+        └── color_shader.h                     ⬜ D30/D31：SDR 色彩管理 + HDR Tone Mapping
 ```
 
-> **当前状态提要**：DAG 的"骨架与血管"（`INode` / `Link` / `SyncContext` / `ThreadSafeQueue`）已全部就绪并通过并发单测，但**具体 Node 尚无一个落地**（`Tick()` 全项目无实现）。真实播放能力为零，画面由 `StubPlayer` 的渐变测试帧提供，真实管线自 D11 起逐节点接入。
+> **当前状态**：D9 生命周期代码正在重构，尚无加入正式 CMake 的并发测试，不能标记完成；D10 `Packet` 保持已完成；D11 尚未开始，仓库中不存在 `stream_info.h`、`ffmpeg_demuxer_node.h/.cpp` 或其他真实媒体 Node。
 
-### 2. 类继承与组合树
+以下 2-6 节描述目标架构和拟定数据流，不代表对应类或端到端能力已经实现；里程碑状态以 `DEVELOPMENT_PLAN.md` 为准。
+
+### 2. 目标类继承与组合树
 
 ```
 IPlayer (Facade 接口)
 └── PlayerFacade
     ├── FSM (显式状态机，合法跃迁表)
-    ├── SyncContext (控制总线：atomic epoch + atomic state)
     └── Pipeline
-        └── std::vector<unique_ptr<INodeBase>>
-            ├── ISourceNode<void, ByteChunk>
-            │   ├── FileSourceNode
-            │   ├── HttpSourceNode
-            │   └── RtpSourceNode
-            ├── RtpDepacketizerNode<RtpPacket, RtpPacket>    (仅网络源)
-            ├── FecDecoderNode<RtpPacket, RtpPacket>          (仅网络源)
-            ├── JitterBufferNode<RtpPacket, ByteChunk>        (仅网络源，持 GopCache)
-            ├── FfmpegDemuxerNode<ByteChunk, Packet>          (多输出: video / audio)
+        ├── shared_ptr<SyncContext>                         (Pipeline 修改，Node 只读)
+        ├── vector<shared_ptr<ILinkControl>>                (停止时统一 Abort)
+        └── vector<unique_ptr<INodeBase>>
+            ├── HttpSourceNode : INode<NoPort, ByteChunk>     (仅在 D34 决策门通过后)
+            ├── RtpSourceNode : INode<NoPort, RtpPacket>
+            ├── JitterBufferNode<RtpPacket, RtpPacket>        (仅网络源)
+            ├── H264DepacketizerNode<RtpPacket, Packet>       (仅网络源)
+            ├── FfmpegDemuxerNode : INodeBase                 (video / audio 双输出)
             ├── INode<Packet, VideoFrame>
             │   └── VideoDecoderNode (sw / VA-API，持 HwDeviceContext)
             ├── INode<Packet, AudioFrame>
             │   └── AudioDecoderNode
             ├── TeeNode<T>                                    (多输出：主路径 / 录制)
             ├── AVSyncNode (依赖 IClockSource)
-            ├── INode<Frame, Packet>
-            │   ├── VideoEncoderNode (CBR/CRF/CQP)
-            │   └── AudioEncoderNode
-            ├── Mp4MuxerNode<Packet, void>                    (多输入)
-            └── ISinkNode<Frame, void>
-                ├── VideoSinkNode (→ IVideoSink / OpenGLView)
-                └── AudioSinkNode (持 IAudioSink = AlsaAudioSink，兼 IClockSource)
+            ├── VideoEncoderNode : INode<VideoFrame, Packet>
+            ├── AudioEncoderNode : INode<AudioFrame, Packet>
+            ├── Mp4MuxerNode : INodeBase                      (video / audio 双输入)
+            ├── VideoSinkNode : INode<VideoFrame, NoPort>     (→ IVideoSink / OpenGLView)
+            └── AudioSinkNode : INode<AudioFrame, NoPort>     (兼 IClockSource)
 ```
 
-### 3. 主播放管线（含录制分支）
+### 3. 目标主播放管线（含录制分支）
 
-```
-        ┌──────────────┐
-        │ Http / Rtp   │  线程: SourceThread
-        │  SourceNode  │  输出: shared_ptr<ByteChunk> / RtpPacket
-        └──────┬───────┘  动作: 网络读字节 / UDP recv
-               │
-               ▼
-        ┌──────────────┐
-        │ JitterBuffer │  线程: 自有   （仅网络源接入）
-        │  + FEC + GOP │  动作: seq 重排、空洞检测、自适应深度、秒开
-        └──────┬───────┘
-               │ byte stream
-               ▼
-      ┌──────────────────┐
-      │ FfmpegDemuxerNode│  线程: DemuxerThread
-      │   (libavformat)  │  输入: ByteChunk（AVIOContext 自定义读回调）
-      └────┬─────────┬───┘  输出: Packet（video / audio 两路，打 epoch 戳）
-           │ video   │ audio
-   Packet(H264/HEVC)  Packet(AAC)
-           ▼          ▼
-   ┌──────────────┐ ┌──────────────┐
-   │VideoDecoder  │ │AudioDecoder  │  线程: 各自独立
-   │(VA-API / sw) │ │(+ swr)       │
-   └──────┬───────┘ └──────┬───────┘
- VideoFrame │              │  AudioFrame (PCM S16)
- (hw/sw     │              │
-  variant)  ▼              ▼
-   ┌──────────────┐ ┌──────────────┐
-   │  VideoTee    │ │  AudioTee    │  线程: 上游驱动
-   │ (录制多播)   │ │              │  shared_ptr 零拷贝转发
-   └──┬───────┬───┘ └──┬───────┬───┘
-      │主路径 │录制     │主路径 │录制
-      ▼       ▼        ▼       ▼
- ┌──────────┐┌──────────────┐┌──────────┐┌──────────────┐
- │ AVSync   ││VideoEncoder  ││AudioSink ││AudioEncoder  │
- │(查音频   ││(CBR/CRF/CQP) ││(ALSA主钟)││(AAC)         │
- │ 主时钟)  ││              ││          ││              │
- └────┬─────┘└──────┬───────┘└──────────┘└──────┬───────┘
-      │ VideoFrame  │ Packet(H264)               │ Packet(AAC)
-      │ (synced)    └──────────┬─────────────────┘
-      ▼                        ▼
- ┌──────────────┐        ┌──────────────┐
- │ VideoSink    │        │  Mp4Muxer    │  线程: MuxerThread
- └──────┬───────┘        └──────────────┘  动作: 交错写盘
-        │ VideoFrame (sw / hw variant)
-        ▼
- ┌──────────────────────────────┐
- │ OpenGLView                   │  线程: Qt 主线程（paintGL）
- │  ├─ sw:  三平面 glTexSubImage │  Software variant → CPU 上传
- │  ├─ hw:  EGLImage 零拷贝导入   │   Hardware variant → DMA-BUF 直接成纹理
- │  └─ ColorShader: BT.x + HDR  │  矩阵动态切换 + Tone Mapping
- └──────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph INPUT["输入、解封装与 RTP 解包"]
+        direction LR
+        FILE["本地媒体文件"] --> DEMUX["FfmpegDemuxerNode"]
+        HTTP["HTTP URL"] --> DEMUX
+        HTTP -. D34 决策门 .-> HTTP_SOURCE["HttpSourceNode"]
+        HTTP_SOURCE --> AVIO["AVIOContext"] --> DEMUX
+
+        RTP["UDP / RTP"] --> RTP_SOURCE["RtpSourceNode"]
+        RTP_SOURCE -->|RtpPacket| JITTER["JitterBufferNode<br/>重排、去重、超时判丢"]
+        JITTER -->|有序 RtpPacket| DEPACK["H264DepacketizerNode<br/>Single NALU / STAP-A / FU-A"]
+    end
+
+    subgraph DECODE["公共解码路径"]
+        direction LR
+        VDEC["VideoDecoderNode<br/>Software / VA-API"] -->|VideoFrame| VBRANCH["视频逻辑分支<br/>D21 定型"]
+        ADEC["AudioDecoderNode<br/>avcodec + swr"] -->|AudioFrame| ABRANCH["音频逻辑分支<br/>D21 定型"]
+    end
+
+    DEMUX -->|Video Packet| VDEC
+    DEMUX -->|Audio Packet| ADEC
+    DEPACK -->|Video Packet| VDEC
+
+    subgraph PLAYBACK["播放路径"]
+        direction LR
+        AVSYNC["AVSyncNode"] -->|同步后 VideoFrame| VSINK["VideoSinkNode"]
+        ASINK["AudioSinkNode<br/>IClockSource"] -->|PCM| ALSA["ALSA / 声卡"]
+        ASINK -. 音频主时钟 .-> AVSYNC
+    end
+
+    VBRANCH -->|VideoFrame| AVSYNC
+    ABRANCH -->|AudioFrame| ASINK
+
+    subgraph RECORD["可选录制逻辑（D21-D23）"]
+        direction LR
+        VENC["VideoEncoderNode"] -->|H.264 Packet| MUX["Mp4MuxerNode"]
+        AENC["AudioEncoderNode"] -->|AAC Packet| MUX
+        MUX --> MP4["MP4 文件"]
+    end
+
+    VBRANCH -. 可选 VideoFrame .-> VENC
+    ABRANCH -. 可选 AudioFrame .-> AENC
+
+    subgraph RENDER["Qt / OpenGL 渲染路径"]
+        direction LR
+        VIEW["OpenGLView<br/>Qt GUI 线程"]
+        VIEW -->|Software VideoFrame| SW_UPLOAD["YUV 纹理上传"]
+        VIEW -->|VA-API VideoFrame| HW_IMPORT["DMA-BUF / EGLImage 导入"]
+        SW_UPLOAD --> COLOR["ColorShader<br/>SDR / HDR"]
+        HW_IMPORT --> COLOR
+        COLOR --> SCREEN["窗口显示"]
+    end
+
+    VSINK -->|IVideoSink / GUI 线程投递| VIEW
 ```
 
-### 4. 每个节点的详细规格
+- 本地文件、HTTP 和 RTP 是可替换的输入拓扑，不表示同一个 Pipeline 同时启用全部输入。
+- HTTP 默认由 `FfmpegDemuxerNode(url)` 直接读取；虚线的 `HttpSourceNode + AVIOContext` 只在 D34 决策门通过后启用。
+- RTP 直接在解包后产生 `Video Packet`，不经过 `FfmpegDemuxerNode`；第一版只支持 H.264 视频，默认路径不包含 FEC 或 GOP Cache。
+- 录制虚线只表示逻辑数据去向。D21 仍需在“构建时固定分支”和“独立录制 Pipeline”之间定型，不修改运行中的主 Pipeline 拓扑。
+- `AudioSinkNode` 通过 `IClockSource` 向 `AVSyncNode` 提供音频主时钟；video-only 播放使用单调时钟。
+- D26 先使用 `av_hwframe_transfer_data` 将 VA-API 帧转为软件帧验证硬解正确性；D27-D29 再启用图中的 DMA-BUF / EGLImage 路径，不支持时回退到软件路径。
+- Node 媒体处理在各自工作线程中执行；`OpenGLView`、纹理上传、EGLImage 导入和绘制只在 Qt GUI 线程执行。
+
+### 4. 目标节点规格
 
 | 节点 | 输入类型 | 输出类型 | 主要动作 | 线程 |
 |------|---------|---------|---------|-----|
-| **FileSourceNode** | – | `ByteChunk` | 分块读文件 + 字节偏移 Seek | 自有 |
 | **HttpSourceNode** | – | `ByteChunk` | libcurl 流式 GET，支持 Range | 自有 |
 | **RtpSourceNode** | – | `RtpPacket` | UDP recv，解析 RTP 头（seq/ts/marker） | 自有 |
-| **RtpDepacketizerNode** | `RtpPacket` | `RtpPacket` | H.264 FU-A / STAP-A 组帧 | 自有 |
-| **FecDecoderNode** | `RtpPacket` | `RtpPacket` | XOR 异或恢复丢包 | 自有 |
-| **JitterBufferNode** | `RtpPacket` | `ByteChunk` | seq 排序、空洞检测、自适应深度、GOP 秒开 | 自有 |
-| **FfmpegDemuxerNode** | `ByteChunk`（或 url） | `Packet`×2 | libavformat 分包，打 epoch 戳 | 自有 |
+| **JitterBufferNode** | `RtpPacket` | `RtpPacket` | seq 重排、超时判丢、后续自适应深度 | 自有 |
+| **H264DepacketizerNode** | `RtpPacket` | `Packet` | H.264 FU-A / STAP-A 组装完整 Access Unit | 自有 |
+| **FfmpegDemuxerNode** | path / URL（D34 后可选 `ByteChunk`） | `Packet`×2 | libavformat 探测与读包，打 epoch 戳 | 自有 |
 | **VideoDecoderNode** | `Packet` | `VideoFrame` | sw: avcodec / hw: VA-API 显存帧 | 自有 |
 | **AudioDecoderNode** | `Packet` | `AudioFrame` | avcodec + swr 重采样 | 自有 |
-| **TeeNode\<T\>** | `T` | `T`×N | `shared_ptr` 复制多播（可开关） | 上游驱动 |
-| **AVSyncNode** | `VideoFrame` | `VideoFrame` | 查音频主时钟，±40ms 非对称丢/等/送 | 自有 |
+| **TeeNode\<T\>** | `T` | `T`×N | `shared_ptr` 复制多播（可开关） | 自有 |
+| **AVSyncNode** | `VideoFrame` | `VideoFrame` | 根据音频主时钟决定等待、发送或丢帧；偏差阈值由测试确定 | 自有 |
 | **VideoEncoderNode** | `VideoFrame` | `Packet` | x264 + CBR/CRF/CQP 码率控制 | 自有 |
 | **AudioEncoderNode** | `AudioFrame` | `Packet` | AAC FLTP 编码 | 自有 |
 | **Mp4MuxerNode** | `Packet`×2 | – | `av_interleaved_write_frame` | 自有 |
-| **VideoSinkNode** | `VideoFrame` | – | 调 `IVideoSink::OnReceiveVideoFrame` | 上游驱动 |
+| **VideoSinkNode** | `VideoFrame` | – | 调 `IVideoSink::OnReceiveVideoFrame` | 自有 |
 | **AudioSinkNode** | `AudioFrame` | – | 经 `IAudioSink`(AlsaAudioSink) `snd_pcm_writei` 投递 PCM，维护音频主时钟 | 自有 |
 
-### 5. 数据类型流转链
+### 5. 目标数据类型流转链
 
 ```
-原始字节          ByteChunk { uint8_t* data, size_t size, int64_t recv_time_us, uint64_t epoch }
-   │
-   ▼ (网络源) RTP 组帧 / FEC 恢复 / JitterBuffer 重排 / GOP 秒开
-   │
-   ▼ Demux 拆容器、分流
-压缩包            Packet { AVPacket*, codec_id, pts_us, dts_us, frame_kind, flags, stream, epoch }
+本地路径 / HTTP URL -> Demux ----------------------------------+
+                                                               |
+RTP -> Jitter -> H264Depacketizer -----------------------------+
+                                                               v
+压缩包 Packet { AVPacket*, codec_id, pts_us, dts_us, frame_kind, flags, stream, epoch }
    │
    ▼ Decode 解压（软解 or VA-API 硬解）
 未压缩帧          VideoFrame { color_space, color_trc, color_range, flags, epoch, ... }
@@ -296,14 +314,14 @@ IPlayer (Facade 接口)
 
 要点：
 
-- **`ByteChunk`**：原始字节流，仅在 Source→Demuxer（网络源额外经 JitterBuffer）之间存在；解耦"如何拿到字节"与"如何解析容器"。
+- **`ByteChunk`**：仅在 D34 决策门通过、确实需要自定义 Source + AVIO 时引入；D11 先使用 FFmpeg 的本地 path，D32 再验证 HTTP URL。
 - **`Packet`**：保留 `AVPacket*` 内核（供下游 libavcodec），携带业务级元信息（`codec_id`/`pts_us`/`dts_us`/`frame_kind`/`flags`/`stream`）以及 **`epoch`**（Seek 世代号）。
 - **`VideoFrame`** 为 sum type：`Software` 携带紧凑 YUV buffer；`Hardware` 携带 `AVBufferRef*` + DMA-BUF fd，使零拷贝与软件路径共用同一条管线；额外携带 `color_space/color_trc/color_range` 供 GLSL 色彩管线动态选择矩阵与 Tone Mapping。
 - **`AudioFrame`** 保持轻包装，重采样/通道布局在 `AudioDecoderNode` 内消化。
 
-### 6. 控制信令流
+### 6. 目标控制信令流
 
-控制信令独立于数据通道传播，核心是**无锁 atomic epoch（世代号）机制**，替代旧架构跨线程的多标志握手，从根本上消除 Seek 竞态。
+控制接口由同一个 Pipeline 控制线程串行调用。`Pipeline` 是 `SyncContext` 修改接口的唯一调用者；Node 和外部对象只读取运行态与 epoch。Stop 使用独立的 Node 停止标志，不能用 `SyncContext` 的运行/暂停状态代替生命周期停止协议。
 
 ```
 UI (Qt 主线程)
@@ -311,10 +329,14 @@ UI (Qt 主线程)
   ▼
 PlayerFacade → FSM.Dispatch(event)  （校验合法跃迁）
   │
-  ├─ 普通状态变更：修改 SyncContext.state_，notify_all(state_cv_)
-  │     所有节点 ThreadLoop 被唤醒，各自读 state 决定 继续/挂起/退出
+  ├─ Pause / Resume：调用 Pipeline::Pause / Resume
+  │     Pipeline 修改 SyncContext 的运行门控；Node 在 ThreadMain 中 WaitWhilePaused
   │
-  └─ Seek：SyncContext.epoch_.fetch_add(1)   （世代号 +1，无锁）
+  ├─ Stop：Pipeline 按固定阶段停止整张图
+  │     SignalStop(all nodes) → Abort(all links) → InterruptBlockingIo
+  │     → WakeAllPausedThreads → Join(all nodes)
+  │
+  └─ Seek（D20）：由 Pipeline 递增 SyncContext epoch
         │
         ▼
      Source/Demuxer 物理重定位到目标位置，此后产出的 Packet/Frame 均打上"新 epoch"
@@ -325,33 +347,33 @@ PlayerFacade → FSM.Dispatch(event)  （校验合法跃迁）
         item.epoch == 当前 epoch →  正常处理
 ```
 
-- **atomic epoch（带外世代号）**：Seek 只做一件事——原子自增全局 epoch。所有 seek 前产生的、仍在各队列或"在飞"中的数据，其 epoch 已过期，被各节点自然丢弃，**无需 Player 反向下钻清空每个队列，无需 5 个原子标志跨线程握手**。这解决了旧架构"已 Pop 的在飞帧无法冲刷 → 花屏/错位"的结构性问题。
-- **带内信令（Flush / EOF）** 仍沿数据通道顺序传播，保证与数据流时序一致：
-  - **Flush**：Seek 后由 Demuxer 在新位置数据之前注入一个 `kFlush` 空 Packet，解码器遇到时执行 `avcodec_flush_buffers` 重置参考帧，避免解码花屏。
-  - **EOF**：Demuxer 读到 EOF 注入 `kEOF`，末端节点（AVSync / Speaker）收到后经 Facade 判定全局播放完成。
+- **atomic epoch（带外世代号）**：D20 的目标是由 Pipeline 递增 epoch，使 Seek 前产生的队列存量和“在飞”数据可被 Node 判定为过期；epoch 不能替代 Demuxer/Decoder/音频设备的有序 Flush。
+- **Flush**：D20 Seek 后由 Demuxer 在新位置数据之前注入有序的 `kFlush`，Decoder 和音频设备据此清理内部状态。
+- **正常 EOF**：媒体协议可先发送 `kEOF` 供 Decoder drain，随后上游调用 `CloseOutput()`，其底层 `Link::Close()` 禁止继续 Send，但允许下游 Receive 排空；队列耗尽后 Receive 返回 `nullopt`。
+- **立即 Stop**：Pipeline 调用 `Link::Abort()`，唤醒收发双方并丢弃存量，不能与正常 EOF 或录制 Drain 混用。
 
 ---
 
-## 技术栈
+## 目标技术栈
 
-| 技术领域 | 选型方案 | 对标亮点 |
+| 技术领域 | 选型方案 | 在播放器中的用途 |
 |----------|----------|---------|
-| 核心开发语言 | C/C++ 17（Google C++ Style Guide） | – |
-| 媒体处理框架 | FFmpeg（libavcodec / libavformat / libavutil / libswscale / libswresample） | DAG / 硬解 |
-| 硬件解码 | VA-API（`av_hwdevice_ctx` + `AV_PIX_FMT_VAAPI` + `get_format` 回调） | 硬解零拷贝 |
-| 零拷贝互操作 | `vaExportSurfaceHandle` → DMA-BUF fd → `eglCreateImageKHR` → `glEGLImageTargetTexture2DOES` | 硬解零拷贝 |
-| 视频渲染引擎 | OpenGL 3.3 Core / EGL | 零拷贝 / GLSL |
-| 色彩管线 | GLSL：BT.601/709/2020 矩阵动态切换 + PQ EOTF 反变换 + Reinhard Tone Mapping | GLSL 色彩 |
-| 音频后端 | ALSA（libasound）原生 PCM 投递；`IAudioSink` 抽象（可切 QtAudioSink / PipeWire）；兼音频主时钟 IClockSource | 音画同步 |
-| 并发模型 | 独立线程 + `std::condition_variable` 有界阻塞队列（背压防 OOM）+ atomic epoch | DAG |
-| 网络拉流 | libcurl（HTTP/Range）、原生 UDP + RTP | QoS |
-| 抗弱网 QoS | Jitter Buffer（seq 重排/空洞检测/自适应深度）+ GOP Cache（秒开 <180ms）+ XOR FEC | QoS |
-| 界面框架 | Qt 6.x | – |
-| 日志 | spdlog | – |
-| 构建工具 | CMake 3.23+ | – |
-| 依赖管理 | Conan 2 | – |
-| 主开发环境 | Ubuntu 24.04 | – |
-| 版本控制 | GitLab | – |
+| 核心开发语言 | C++17（Google C++ Style Guide） | 媒体内核与桌面应用实现 |
+| 媒体处理框架 | FFmpeg（libavcodec / libavformat / libavutil / libswscale / libswresample） | 解封装、解码、像素转换和音频重采样 |
+| 硬件解码 | VA-API（`av_hwdevice_ctx` + `AV_PIX_FMT_VAAPI` + `get_format` 回调） | 降低视频解码的 CPU 负载 |
+| 零拷贝互操作 | `vaExportSurfaceHandle` → DMA-BUF fd → `eglCreateImageKHR` → `glEGLImageTargetTexture2DOES` | 将硬件帧直接导入渲染路径 |
+| 视频渲染引擎 | OpenGL 3.3 Core / EGL | 软件帧上传、硬件帧导入和显示 |
+| 色彩管线 | GLSL：BT.601/709/2020 矩阵动态切换 + PQ EOTF 反变换 + Reinhard Tone Mapping | 按媒体元数据正确显示 SDR/HDR 内容 |
+| 音频后端 | ALSA（libasound）原生 PCM 投递；`IAudioSink` 抽象（可切 QtAudioSink / PipeWire）；兼音频主时钟 IClockSource | 音频输出和 A/V 同步主时钟 |
+| 并发模型 | 独立线程 + `std::condition_variable` 有界阻塞队列（背压防 OOM）+ atomic epoch | 节点调度、背压、暂停和 Seek 数据过期 |
+| 网络拉流 | FFmpeg HTTP 基线；D34 决策门通过后可选 libcurl；原生 UDP + RTP | HTTP 和 RTP 播放输入 |
+| 抗弱网 QoS | Jitter Buffer（seq 重排/空洞检测/有界自适应）+ 可复现弱网 profile | RTP 重排、恢复和量化验收 |
+| 界面框架 | Qt 6.x | 播放控制和视频窗口 |
+| 日志 | spdlog | 运行诊断与错误定位 |
+| 构建工具 | CMake 3.23+ | 构建应用、媒体库和测试 |
+| 依赖管理 | Conan 2 | 管理第三方库版本 |
+| 主开发环境 | Ubuntu 24.04 | 软件播放和 VA-API/EGL 验证 |
+| 版本控制 | GitLab | 代码和文档变更管理 |
 
 ---
 
@@ -372,7 +394,7 @@ sudo apt install -y libgl1-mesa-dev libegl1-mesa-dev libglu1-mesa-dev
 # VA-API 硬件解码运行时与开发头 + DMA-BUF 支持
 sudo apt install -y vainfo libva-dev libva-drm2 libdrm-dev
 
-# 网络拉流依赖（HTTP）
+# 可选：仅 D34 决策门通过后用于自定义 HTTP Source
 sudo apt install -y libcurl4-openssl-dev
 
 # 音频输出（ALSA 原生 PCM 投递）
@@ -410,7 +432,9 @@ cd ai-media-player
 | 文档 | 说明 |
 |-----|------|
 | [README.md](./README.md) | 项目总览与架构设计（本文件） |
-| [DEVELOPMENT_PLAN.md](./DEVELOPMENT_PLAN.md) | 30 天重构 + 演进路线的详细开发计划书 |
+| [ARCHITECTURE.md](./ARCHITECTURE.md) | 当前 DAG 生命周期协议、所有权和目标数据流 |
+| [DEVELOPMENT_PLAN.md](./DEVELOPMENT_PLAN.md) | 里程碑驱动的播放器重构与演进计划 |
+| [AI_ENGINEERING_STANDARD.md](./AI_ENGINEERING_STANDARD.md) | 工程代码与协作规范 |
 
 ---
 
@@ -453,11 +477,9 @@ cd ai-media-player
 #### 3. Commit 示例
 
 ```
-feat(vaapi-zerocopy): 打通 VA-API 硬解 DMA-BUF 零拷贝渲染
+docs(architecture): 同步 D9 生命周期协议与当前进度
 
-- av_hwdevice_ctx 创建 VAAPI 上下文，get_format 回调返回 AV_PIX_FMT_VAAPI
-- vaExportSurfaceHandle 导出 DMA-BUF fd，eglCreateImageKHR 包装为 GL 纹理
-- 4K@60 HEVC 实测 CPU 占用由 85% 降至 18%，画面无退化
-
-Closes #23
+- 按现有 Pipeline API 更新 Start/Pause/Resume/Stop 流程
+- 明确 D9 尚未完成正式并发和 Sanitizer 验收
+- 将 D11 Demuxer 与 StreamInfo 标记为未开始
 ```
