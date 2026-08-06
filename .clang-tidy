@@ -1,7 +1,6 @@
 Checks: >
   -*,
   readability-identifier-naming,
-  modernize-use-constexpr,
   modernize-use-nullptr,
   modernize-use-override,
   modernize-avoid-c-arrays,
@@ -11,25 +10,37 @@ Checks: >
 WarningsAsErrors: ''
 
 CheckOptions:
-  # ---------- 常量 ----------
-  - key: readability-identifier-naming.ConstantPrefix
+  # ---------- 编译期 / 静态 / 全局常量 ----------
+  - key: readability-identifier-naming.ConstexprVariablePrefix
     value: 'k'
-  - key: readability-identifier-naming.ConstantCase
+  - key: readability-identifier-naming.ConstexprVariableCase
+    value: CamelCase
+  - key: readability-identifier-naming.StaticConstantPrefix
+    value: 'k'
+  - key: readability-identifier-naming.StaticConstantCase
+    value: CamelCase
+  - key: readability-identifier-naming.ClassConstantPrefix
+    value: 'k'
+  - key: readability-identifier-naming.ClassConstantCase
+    value: CamelCase
+  - key: readability-identifier-naming.GlobalConstantPrefix
+    value: 'k'
+  - key: readability-identifier-naming.GlobalConstantCase
     value: CamelCase
 
   # ---------- 变量 ----------
   - key: readability-identifier-naming.VariableCase
-    value: lowerCamelCase
+    value: lower_case
 
   # ---------- 成员变量 ----------
   - key: readability-identifier-naming.MemberCase
-    value: lowerCamelCase
+    value: lower_case
   - key: readability-identifier-naming.MemberSuffix
     value: '_'
 
   # ---------- 函数 ----------
   - key: readability-identifier-naming.FunctionCase
-    value: lowerCamelCase
+    value: CamelCase
 
   # ---------- 类 / 结构体 ----------
   - key: readability-identifier-naming.ClassCase

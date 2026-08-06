@@ -85,7 +85,7 @@ AlignTrailingComments: false
 
 # ==============================
 # Naming (clang-format 无法控制)
-# - 函数：lowerCamelCase
-# - 变量：lowerCamelCase
+# - 函数：PascalCase
+# - 变量：snake_case
 # - 类型：CamelCase
 # ==============================
