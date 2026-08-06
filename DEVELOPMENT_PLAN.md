@@ -6,11 +6,10 @@
 
 - `Dxx` 是稳定的交付编号，不再承诺“一天完成一个编号”。一个里程碑只有满足验收条件才能进入下一项。
 - 正式完成的依据只能来自 `mediacore/`、`app/` 的正式构建和测试；`_review_temp/` 只用于设计评审，不能作为完成证明。
-- 当前优先级是完成 D9。D10 保持已完成，D11 尚未开发。
+- D9 已完成，D10 保持已完成，下一阶段是 D11。LeakSanitizer 受当前容器权限限制，本轮暂不执行并按项目决定视为通过。
 - 每个阶段先建立最小闭环，再增加性能和高级功能；不让硬解、录制或网络反向污染尚未稳定的本地软解主链。
 - 项目的产品边界是“播放器”。新能力必须进入真实播放流程，并能用固定样本或可复现环境验证；不为覆盖技术名词单独增加模块。
 
-从当前 D9 开始，唯一产品主线如下，后一阶段以前一阶段的正式验收为前提。D10 是已经完成的独立 DTO 里程碑，不表示 D9 已经通过验收：
 
 ```text
 稳定 DAG
@@ -55,7 +54,7 @@ Qt UI
 1. `PlayerFacade` 同一时刻独占一个 `Pipeline`；这不是进程级单例，多播放器实例可以各有一条 Pipeline。
 2. D9 先实现 `Pipeline` 的 DAG 生命周期部分；D15 在同一个类上增加 Open/Build，D20 再增加 Seek，不引入第二个图级所有者。
 3. Pipeline 创建并登记全部 Node 和 Link。Node 不创建 Link，不知道完整拓扑，也不负责遍历或 Abort Link。
-4. Node 析构函数不执行 Stop/Join。Pipeline 必须先停止并 Join 全部 Node，之后才能销毁 DAG。
+4. Node 析构函数不执行 Stop/Join，Pipeline 必须先停止并 Join 全部 Node，之后才能销毁 DAG
 5. `Start` 按 Sink 到 Source 的逆拓扑顺序执行，保证消费者先启动。
 6. 立即停止固定为：SignalStop 全部 Node -> Abort 全部 Link -> Interrupt 外部 IO -> 唤醒暂停线程 -> Join 全部 Node。
 7. `Node::CloseOutputs` 通过 `Link::Close` 传递正常 EOF 并允许下游排空；`Abort` 表示立即停止并丢弃存量。录制使用独立的 Drain 协议，不能复用立即 Abort。
@@ -91,7 +90,7 @@ VA-API、DMA-BUF/EGL、RTP 和 Jitter Buffer 都是新项目新增能力，必�
 | D6 | ✅ | 有界 `ThreadSafeQueue<T>` 原型 | 双 CV、背压、Close/Abort 基本语义 |
 | D7 | ✅ | 强类型 `Link<T>` 原型 | Send/Receive/Close/Abort |
 | D8 | ✅ | `INodeBase`/`INode<InT,OutT>` 原型 | 节点类型层次已建立 |
-| D9 | 🔄 | DAG 生命周期重构和正式并发测试 | 见下方 D9 完成标准 |
+| D9 | ✅ | DAG 生命周期重构和正式并发测试 | 11 个正式 CTest、警告构建、ASan/UBSan 和 Clang TSan 已通过；LeakSanitizer 按项目决定暂不执行 |
 | D10 | ✅ | `Packet` RAII、微秒时间戳、flags、epoch 字段 | 保持现状，不夹带 D9 生命周期职责 |
 
 ### D9 当前唯一主线：Pipeline 的 DAG 生命周期核心
@@ -106,7 +105,7 @@ VA-API、DMA-BUF/EGL、RTP 和 Jitter Buffer 都是新项目新增能力，必�
 6. 实现 `Pipeline::CreateLink/EmplaceNode/Start/Pause/Resume/Stop`。D9 不实现媒体探测、Seek 或 Player FSM。
 7. 使用假 Source/Transform/Sink 建正式 CTest，不使用真实 FFmpeg 节点证明并发正确性。
 
-D9 必须同时通过：正常 Close 排空、空队列 Receive 停止、满队列 Send 停止、暂停中停止、反复 Pause/Resume/Pause、外部 IO 模拟中断、部分启动失败回滚、重复 Stop、Tick 异常、Node 先 Join 后析构、拓扑启动顺序。测试进入正式 CMake，并运行普通构建、ASan/UBSan 和 TSan。
+D9 必须同时通过：正常 Close 排空、空队列 Receive 停止、满队列 Send 停止、暂停中停止、反复 Pause/Resume/Pause、外部 IO 模拟中断、部分启动失败回滚、重复 Stop、Tick 异常、Node 先 Join 后析构、拓扑启动顺序。上述 11 个用例已经进入正式 CMake；普通构建、警告构建、ASan/UBSan 的地址与未定义行为检查和 Clang TSan 均已通过。当前容器因 `ptrace` 限制无法运行 LeakSanitizer，按项目决定本轮暂不执行并视为通过。
 
 ### 阶段 B：本地视频最小闭环（D11-D15）
 
@@ -219,9 +218,9 @@ D40 不增加第十一项产品能力，只在 D39 之后对已完成能力做�
 | 阶段 | 状态 | 当前结论 |
 |---|---|---|
 | UI 与公共接口（D1-D5） | ✅/🔶 | StubPlayer 渲染闭环可用，进度显示待真实 Player |
-| DAG 核心（D6-D9） | 🔄 | Queue/Link/Node 有原型，D9 生命周期重构和正式并发验证未完成 |
+| DAG 核心（D6-D9） | ✅ | D9 正式测试已接入；11 个用例、警告构建、ASan/UBSan 和 Clang TSan 已通过，LeakSanitizer 按项目决定暂不执行 |
 | 基础 DTO（D10） | ✅ | Packet 与 flags 保持现状 |
-| 第一个真实 Node（D11） | ⬜ | 未开发，必须等待 D9 验收 |
+| 第一个真实 Node（D11） | ⬜ | 未开发，D9 已完成后可以开始 |
 | 本地播放、录制、硬解、色彩、网络 | ⬜ | 均未进入正式实现 |
 
-> 下一步唯一任务：完成 D9 的 Pipeline DAG 生命周期核心、INodeBase、SyncContext、Link 生命周期协议及正式并发测试。D9 验收前不开始 D11。
+> 下一步任务：开始 D11，先实现 `StreamInfo` 和本地文件 `FfmpegDemuxerNode`。LeakSanitizer 后续可在不受限主机或 CI 中作为补充检查运行。

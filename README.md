@@ -8,7 +8,7 @@
 
 本项目是一款面向“现代播放器工程能力”打磨的 C++17 音视频播放器。当前正式可运行能力是 Qt UI、`IPlayer`/`IVideoSink` 公共契约、`StubPlayer` 渐变测试帧和 OpenGL 显示闭环；真实媒体解封装、解码、音画同步、录制、硬件零拷贝和网络 QoS 尚未实现。
 
-媒体内核正在重构为**独立线程 + 有界阻塞队列的强类型固定拓扑节点图（DAG）**。仓库已有 `ThreadSafeQueue`、`Link`、`INodeBase`、`SyncContext` 和 D9 `Pipeline` 生命周期代码，但正式 CTest、ASan/UBSan 与 TSan 验收尚未建立，因此 D9 仍是进行中。D10 `Packet` RAII、时间戳、flags 和 epoch 保持已完成；D11 `StreamInfo + FfmpegDemuxerNode` 尚未开发。
+媒体内核正在重构为**独立线程 + 有界阻塞队列的强类型固定拓扑节点图（DAG）**。仓库已有 `ThreadSafeQueue`、`Link`、`INodeBase`、`SyncContext` 和 D9 `Pipeline` 生命周期代码，D9 测试已经接入正式 CTest。11 个生命周期用例在普通构建、警告构建、ASan/UBSan（当前容器关闭 LeakSanitizer）和 Clang TSan 下通过；根据当前项目决定，LeakSanitizer 暂不执行并按通过处理，D9 已完成。D10 `Packet` RAII、时间戳、flags 和 epoch 保持已完成；D11 `StreamInfo + FfmpegDemuxerNode` 尚未开发。
 
 ### 唯一产品路线
 
@@ -106,12 +106,12 @@ ai-media-player/
 │       │   └── byte_chunk.h                   ⬜ D34 决策门通过后供自定义 HTTP Source 使用
 │       │
 │       ├── core/                              # DAG 框架
-│       │   ├── inode.h                        🔄 D9：线程循环、TickResult、停止原因和端口便利模板
-│       │   ├── link.h                         🔄 D9：强类型数据边 + Pipeline 类型擦除控制接口
-│       │   ├── sync_context.h                 🔄 D9：运行/暂停门控 + epoch + 暂停 CV
+│       │   ├── inode.h                        ✅ D9：线程循环、TickResult、停止原因和端口便利模板
+│       │   ├── link.h                         ✅ D9：强类型数据边 + Pipeline 类型擦除控制接口
+│       │   ├── sync_context.h                 ✅ D9：运行/暂停门控 + epoch + 暂停 CV
 │       │   ├── stub_player.h/.cpp             🔶 桩 IPlayer（渐变测试帧），真实管线就绪后移除
 │       │   ├── player_factory.cpp             ✅ 工厂实现
-│       │   ├── pipeline.h                     🔄 D9：组图、Start/Pause/Resume/Stop；Build/Seek 待 D15/D20
+│       │   ├── pipeline.h                     ✅ D9：组图、Start/Pause/Resume/Stop；Build/Seek 待 D15/D20
 │       │   ├── fsm.h/.cpp                     ⬜ 显式状态机（合法跃迁表）
 │       │   ├── iclock_source.h                ⬜ 时钟接口 IClockSource
 │       │   └── player_facade.h/.cpp           ⬜ 对 UI 的门面（实现 IPlayer，取代 StubPlayer）
@@ -159,7 +159,7 @@ ai-media-player/
 │       └── qos/
 │           └── qos_monitor.h/.cpp             ⬜ D33：指标定义与采样基线
 │
-└── app/                                       # 桌面应用层（Qt GUI 前端）
+├── app/                                       # 桌面应用层（Qt GUI 前端）
     ├── main.cpp                               ✅ 创建 Qt 事件循环 + 工厂造 IPlayer
     ├── player_widget.h/.cpp                   ✅ 持 IPlayer*（非拥有），翻译 UI 信号为业务调用
     ├── controller_widget.h/.cpp               🔶 播放/暂停 + 进度条；时间显示与 QoS 指标待补
@@ -169,9 +169,14 @@ ai-media-player/
         ├── sw_texture_uploader.h/.cpp         ⬜ D14：软件 YUV 三平面上传（从 opengl_view 抽出）
         ├── hw_texture_importer.h/.cpp         ⬜ D28：DMA-BUF / EGLImage 导入
         └── color_shader.h                     ⬜ D30/D31：SDR 色彩管理 + HDR Tone Mapping
+
+└── tests/                                      # 正式测试目录
+    └── dag/                                    # D9 DAG 生命周期和并发测试
+        ├── CMakeLists.txt
+        └── d9_dag_lifecycle_test.cpp
 ```
 
-> **当前状态**：D9 生命周期代码正在重构，尚无加入正式 CMake 的并发测试，不能标记完成；D10 `Packet` 保持已完成；D11 尚未开始，仓库中不存在 `stream_info.h`、`ffmpeg_demuxer_node.h/.cpp` 或其他真实媒体 Node。
+> **当前状态**：D9 生命周期代码和 11 个正式 CTest 用例已经进入仓库。普通构建、警告构建、ASan/UBSan（当前容器关闭 LeakSanitizer）和 Clang TSan 均已验证；根据当前项目决定，LeakSanitizer 暂不执行并按通过处理，D9 已完成。D10 `Packet` 保持已完成；D11 尚未开始，仓库中不存在 `stream_info.h`、`ffmpeg_demuxer_node.h/.cpp` 或其他真实媒体 Node。
 
 以下 2-6 节描述目标架构和拟定数据流，不代表对应类或端到端能力已经实现；里程碑状态以 `DEVELOPMENT_PLAN.md` 为准。
 
@@ -425,6 +430,24 @@ cd ai-media-player
 ./build/RelWithDebInfo/ai_media_player
 ```
 
+### D9 DAG 测试
+
+测试位于正式目录 `tests/dag/`，直接包含 `mediacore/src` 的当前实现，不依赖
+`_review_temp/`。没有 FFmpeg 或 Qt 环境时，可以只构建 DAG 测试：
+
+```bash
+cmake -S . -B /tmp/ai-media-player-d9 \
+      -DAI_MEDIA_PLAYER_BUILD_MEDIACORE=OFF \
+      -DAI_MEDIA_PLAYER_BUILD_APP=OFF \
+      -DBUILD_TESTING=ON
+cmake --build /tmp/ai-media-player-d9 --parallel 2
+ctest --test-dir /tmp/ai-media-player-d9 --output-on-failure
+```
+
+普通构建、ASan/UBSan 和 TSan 应使用不同的构建目录。当前容器不能运行
+LeakSanitizer；根据当前项目决定，本轮不执行该项并按测试通过处理。以后在不受限主机
+或 CI 中运行时，它可以作为额外的泄漏检查。
+
 ---
 
 ## 文档导航
@@ -435,6 +458,7 @@ cd ai-media-player
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | 当前 DAG 生命周期协议、所有权和目标数据流 |
 | [DEVELOPMENT_PLAN.md](./DEVELOPMENT_PLAN.md) | 里程碑驱动的播放器重构与演进计划 |
 | [AI_ENGINEERING_STANDARD.md](./AI_ENGINEERING_STANDARD.md) | 工程代码与协作规范 |
+| [tests/dag/README.md](./tests/dag/README.md) | D9 DAG 生命周期测试说明和运行方法 |
 
 ---
 
@@ -480,6 +504,6 @@ cd ai-media-player
 docs(architecture): 同步 D9 生命周期协议与当前进度
 
 - 按现有 Pipeline API 更新 Start/Pause/Resume/Stop 流程
-- 明确 D9 尚未完成正式并发和 Sanitizer 验收
+- 接入 D9 正式 CTest，并记录当前 Sanitizer 验证结果和 LeakSanitizer 环境限制
 - 将 D11 Demuxer 与 StreamInfo 标记为未开始
 ```

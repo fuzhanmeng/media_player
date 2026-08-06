@@ -23,6 +23,24 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
-# 把应用层子目录纳入构建
-add_subdirectory(mediacore)
-add_subdirectory(app)
+# BUILD_TESTING 是 CMake/CTest 的标准开关，默认开启。
+# 两个构建选项允许在没有 FFmpeg/Qt 包的环境中只编译 DAG 测试；默认值保持
+# 原来的完整播放器构建行为不变。
+include(CTest)
+option(AI_MEDIA_PLAYER_BUILD_MEDIACORE "Build the mediacore library" ON)
+option(AI_MEDIA_PLAYER_BUILD_APP "Build the Qt application" ON)
+
+if(AI_MEDIA_PLAYER_BUILD_MEDIACORE)
+    add_subdirectory(mediacore)
+endif()
+
+if(AI_MEDIA_PLAYER_BUILD_APP)
+    if(NOT AI_MEDIA_PLAYER_BUILD_MEDIACORE)
+        message(FATAL_ERROR "AI_MEDIA_PLAYER_BUILD_APP requires AI_MEDIA_PLAYER_BUILD_MEDIACORE")
+    endif()
+    add_subdirectory(app)
+endif()
+
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()

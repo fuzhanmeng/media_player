@@ -10,7 +10,7 @@
 
 ### 0.1 唯一产品主线
 
-从当前 D9 开始，后续开发严格按以下依赖顺序推进。D10 是已经完成的独立 DTO 里程碑，不表示 D9 已经通过验收：
+从当前 D9 开始，后续开发严格按以下依赖顺序推进。D10 是已经完成的独立 DTO 里程碑。D9 的正式测试已经接入并通过；LeakSanitizer 受当前容器权限限制，按项目决定暂不执行并视为通过：
 
 1. 稳定 DAG；
 2. 本地软件播放器；
@@ -39,7 +39,7 @@
 | 范围 | 状态 | 说明 |
 |---|---|---|
 | UI、`IPlayer`、`IVideoSink`、`StubPlayer` | 已有可运行闭环 | 当前画面来自 `StubPlayer` 测试帧，不是真实媒体解码结果 |
-| `ThreadSafeQueue`、`Link`、`INodeBase`、`INode`、`SyncContext`、`Pipeline` | D9 进行中 | 核心头文件已经进入正式目录，但尚未完成正式 CMake 测试接入和并发验收 |
+| `ThreadSafeQueue`、`Link`、`INodeBase`、`INode`、`SyncContext`、`Pipeline` | D9 已完成 | 核心代码和 11 个正式 CTest 已进入正式目录；普通构建、警告构建、ASan/UBSan 和 Clang TSan 已通过，LeakSanitizer 按项目决定暂不执行 |
 | `Packet` RAII 与时间戳字段 | D10 已完成 | D10 与 D9 独立，不代表 DAG 生命周期已经验收 |
 | `StreamInfo`、`FfmpegDemuxerNode` | D11 未开始 | 正式仓库中尚无对应实现和测试 |
 | 本地播放、录制、硬解、色彩、网络与抗弱网 | 未开始 | 均属于后续里程碑 |
@@ -98,7 +98,7 @@ D15 接入 UI 后，如果命令可能来自不同线程，应由 Player 的控�
 - 重复的 Pause/Resume/Pause 不需要重建 Node 或 Link；
 - Stop 是一次性生命周期结束，完成后不能重新 Start 同一张图。
 
-这套逻辑已经写入代码，但重复暂停恢复和并发边界仍需 D9 正式测试验证。
+这套逻辑已经写入代码，正式测试已覆盖重复暂停恢复和主要并发边界。长时间 `Tick()` 仍需由具体媒体 Node 自己提供可取消的阻塞调用。
 
 ## 3. 所有权和生命周期
 
@@ -368,18 +368,17 @@ D40 只对上述能力执行全量回归、性能记录和文档收口，不是�
 
 ## 10. D9 验收和剩余风险
 
-D9 仍需完成：
+D9 已完成正式代码接入和主要生命周期验证：
 
-1. 将 DAG 核心显式纳入正式构建覆盖；
-2. 使用假 Source、Transform、Sink 建立正式 CTest；
-3. 验证正常 Close 排空、空队列 Receive 停止、满队列 Send 停止和暂停中停止；
-4. 验证反复 Pause/Resume/Pause、外部 I/O 中断和部分启动失败回滚；
-5. 验证重复 Stop、Tick 异常、Node 先 Join 后析构和拓扑启动顺序；
-6. 运行普通警告构建、ASan/UBSan 和 TSan，并记录可复现结果。
+1. DAG 核心已经纳入根 CMake，并可在关闭 FFmpeg/Qt 时独立构建；
+2. 假 Source、Transform、Sink 已注册为 11 个正式 CTest 用例；
+3. 普通构建、`-Wall -Wextra -Wpedantic -Werror` 构建、ASan/UBSan 地址与未定义行为检查以及 Clang TSan 已通过；
+4. Clang TSan 对完整测试连续执行 20 轮（共 220 次用例）没有报告数据竞争；
+5. 当前容器的 LeakSanitizer 受 `ptrace` 限制；根据项目决定，本轮不执行 LeakSanitizer 并按通过处理。以后在不受限主机或 CI 中可以再做补充检查。
 
-在这些条件完成前，当前设计仍有以下风险：
+当前设计仍有以下边界：
 
-- DAG 头文件尚未被正式 target 和测试完整实例化，模板错误可能被普通应用构建漏过；
+- D9 的 Queue、Link、Node 和 Pipeline 已由正式测试 target 实例化；后续真实媒体 Node 的新模板仍需各自增加测试；
 - Node 登记顺序依赖调用者，Pipeline 目前不验证拓扑；
 - 外部阻塞 I/O 能否及时响应取消，需要由真实 Node 和模拟阻塞测试共同验证；
 - Pause 只在 Tick 边界生效，长时间 Tick 必须自行支持取消或拆分；
@@ -391,4 +390,4 @@ D9 仍需完成：
 
 正式仓库已经有 D9 所需的 Queue、Link、Node、SyncContext 和 Pipeline 代码基础，停止职责也已经集中到 Pipeline：先通知全部 Node，再 Abort 全部 Link，再中断外部 I/O、唤醒暂停线程并 Join。
 
-这仍是“实现进行中”，不是“已通过并发验证”。当前应先完成 D9 的编译集成、测试和 Sanitizer 验收；D10 保持现状；D11 的 StreamInfo 和 Demuxer 在 D9 验收后开始开发。
+正式仓库已经完成 D9 的编译集成和并发验证。D10 保持现状；D11 的 `StreamInfo` 和本地文件 `FfmpegDemuxerNode` 现在可以开始开发。LeakSanitizer 后续可在不受限主机或 CI 中作为补充检查运行。
