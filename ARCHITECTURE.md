@@ -167,7 +167,9 @@ Pipeline 自动注入 `SyncContext`，调用者只传具体 Node 的其他构造
 
 ## 5. Node 线程协议
 
-`INodeBase::ThreadMain` 是固定的非虚函数。具体 Node 只实现 `Tick()`，以及需要时实现外部 I/O 中断钩子。
+`INodeBase::ThreadMain` 是固定的非虚函数。具体 Node 必须实现 `Tick()` 和正常 EOF 时的
+`CloseOutputs()`；如果存在外部阻塞 I/O，还要实现中断钩子。常用的单输入/单输出、Source 和 Sink
+模板已经提供 `CloseOutputs()` 的默认实现。
 
 ```text
 循环开始
@@ -175,7 +177,7 @@ Pipeline 自动注入 `SyncContext`，调用者只传具体 Node 的其他构造
   -> 如果已收到停止请求，结束线程
   -> 调用一次 Tick()
        Continue     -> 下一轮
-       EndOfStream  -> 记录 EOF 并结束
+       EndOfStream  -> CloseOutputs() -> 记录 EOF 并结束
        Stopped      -> 记录停止并结束
        Error        -> 记录错误并结束
   -> 未处理 C++ 异常由 ThreadMain 捕获并记录
@@ -271,7 +273,7 @@ Stop 可以重复调用。只有全部 Node 都完成 Join，Pipeline 才进入 
 
 方向以单个 Node 为参照：
 
-- 输出 Link 的发送方是上游 Node；上游正常结束时调用 `CloseOutput()`，内部关闭输出 Link；
+- 输出 Link 的发送方是上游 Node；上游正常结束时调用 `CloseOutputs()`，内部关闭所有输出 Link；
 - 输入 Link 的接收方是下游 Node；下游不关闭上游的正常输出，只负责继续 Receive 直至排空；
 - Pipeline 站在整张图的控制位置，Stop 时不区分输入端和输出端，而是 Abort 全部已登记 Link。
 
@@ -296,7 +298,7 @@ flowchart TD
 - `Pipeline::GetSyncContext()` 只返回 `shared_ptr<const SyncContext>`；
 - Node 可以读取运行态和 epoch，并在暂停条件变量上等待；
 - 具体 Node 不调用自身的 Start、SignalStop、Interrupt 或 Join，这些函数只向 Pipeline 开放；
-- Link 的 `Abort()` 当前是公开虚接口，但业务 Node 不应使用它承担全图停止。是否进一步收紧访问权限属于 D9 API 冻结工作。
+- Link 的 `Abort()` 是 `ILinkControl` 的私有虚接口，只有 `Pipeline` 可以调用；业务 Node 不应使用它承担全图停止。
 
 ## 9. 目标播放数据流和实现顺序
 
@@ -381,7 +383,7 @@ D9 仍需完成：
 - Node 登记顺序依赖调用者，Pipeline 目前不验证拓扑；
 - 外部阻塞 I/O 能否及时响应取消，需要由真实 Node 和模拟阻塞测试共同验证；
 - Pause 只在 Tick 边界生效，长时间 Tick 必须自行支持取消或拆分；
-- Link 的 Stop 控制权限尚未由类型系统完全限制；
+- `Abort()` 已限制为只能由 Pipeline 调用，但类型系统尚未区分 Link 的上游和下游持有者，`Close()` 的调用方向仍依赖组图约定；
 - EOF、错误和多个分支的完成汇聚要在真实媒体 Pipeline 中另行设计，不能由 `Receive()==nullopt` 单独区分；
 - epoch 辅助接口已经存在，但第一个真实消费者尚未实现，Seek 语义没有端到端验证。
 

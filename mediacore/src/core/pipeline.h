@@ -23,12 +23,16 @@
  * 这些属于 Node 自己的职责
  *
  * Pipeline 只负责让这些 Node 正确连接并运行
+ *
+ * CreateLink、EmplaceNode、Start、Pause、Resume、Stop 和析构必须由同一个控制线程串行调用
+ * PipelineState 使用普通枚举是有意的：状态会和 nodes_、links_ 及停止过程一起变化，
+ * 仅把枚举改成 atomic 不能让这些复合操作支持并发调用
  */
 #pragma once
 
-#include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <stdexcept>
 #include <type_traits>
@@ -41,56 +45,64 @@
 
 namespace mediacore {
 
-/**
- * @enum PipelineState
- * @brief Pipeline 当前所处的执行阶段
- */
+/** @brief Pipeline 的一次性生命周期状态 */
 enum class PipelineState : std::uint8_t {
-    kBuilding, ///< 可以创建 Node/Link 和连接端口；尚未启动任何工作线程
-    kStarting, ///< 正在按 nodes_ 的反向顺序启动 Node
-    kRunning, ///< Node 已启动；拓扑冻结，只允许 Pause/Resume/Stop
-    kStopping, ///< 正在停止，或上一次 Join 失败而仍有线程需要再次回收
-    kStopped, ///< 已完成回收；Pipeline 和内部对象均不可重新启动
+    kBuilding, ///< 可以创建、连接 Node 和 Link
+    kStarting, ///< 正在按反向登记顺序启动 Node
+    kRunning, ///< 全部 Node 已启动，拓扑不可再修改
+    kStopping, ///< 正在停止，或仍有线程尚未成功 Join
+    kStopped, ///< 全部 Node 已 Join，Pipeline 不可重新启动
 };
 
-/**
- * @enum PipelineStartResult
- * @brief Pipeline 启动结果
- */
+/** @brief Pipeline 启动结果 */
 enum class PipelineStartResult : std::uint8_t {
     kStarted, ///< 全部 Node 启动成功
-    kInvalidState, ///< Pipeline 已经启动、正在停止或已经停止
-    kNoNodes, ///< 图为空；保持 Building，调用者仍可继续组图
-    kNodeStartFailed, ///< 某个 Node 启动失败，并且 Stop 回滚成功
-    kRollbackFailed, ///< 某个 Node 启动失败，且至少一个已启动线程未能完成回收
+    kInvalidState, ///< Pipeline 不处于 Building 状态
+    kNoNodes, ///< 尚未创建任何 Node，Pipeline 保持 Building
+    kNodeStartFailed, ///< 一个 Node 启动失败，Stop 回滚成功
+    kRollbackFailed, ///< 一个 Node 启动失败，并且至少一个回滚步骤失败
 };
 
 /**
  * @class Pipeline
- * @brief 拥有 Node，并保存停止时需要访问的全部 Link
- * @details Node 由 unique_ptr 保存，只能由 Pipeline 销毁，Link 使用 shared_ptr，因为 Pipeline
- * 和连接该 Link 的 Node 都需要持有它
- * links_ 保存 shared_ptr<ILinkControl>，因此不同数据类型的 Link<T> 可以放在同一个
- * vector 中。Stop() 只调用 ILinkControl::Abort()，不需要知道 Link 中的数据类型
- * @note CreateLink、EmplaceNode、Start、Pause、Resume、Stop 和析构必须由同一个控制线程串行调用
- *       Pipeline 不支持这些操作彼此并发执行
+ * @brief 拥有 DAG 对象并统一管理全部 Node 工作线程
+ * @details
+ * Node 使用 unique_ptr 保存，生命周期由 Pipeline 独占；Link 使用 shared_ptr，由 Pipeline 和相邻 Node
+ * 共同持有不同类型的 Link<T> 通过 ILinkControl 保存在同一个 vector 中
+ * 所有控制接口只能由一个控制线程按顺序调用，工作线程不直接修改 Pipeline 的容器或生命周期状态
  */
 class Pipeline final {
 public:
     /**
-     * @brief 创建一个空 Pipeline
-     * @details 初始状态为 kBuilding，并创建所有 Node 共用的 SyncContext
+     * @brief 创建使用标准 std::thread 的空 Pipeline
+     * @details 初始状态为 kBuilding，并创建本图全部 Node 共用的 SyncContext
      */
-    Pipeline() : sync_ctx_(std::make_shared<SyncContext>()) {}
+    Pipeline() : Pipeline(CreateDefaultThreadFactory()) {}
 
     /**
-     * @brief 停止并 Join 所有 Node 后再析构成员
+     * @brief 创建使用指定线程工厂的空 Pipeline
+     * @param thread_factory 为每个 Node 创建工作线程的函数
+     * @throws std::invalid_argument thread_factory 为空时抛出
+     * @details 自定义工厂可用于统一设置线程名称、优先级或调度参数，也可确定性验证启动失败回滚
+     */
+    explicit Pipeline(NodeThreadFactory thread_factory)
+        : sync_ctx_(std::make_shared<SyncContext>()), thread_factory_(std::move(thread_factory)) {
+        if (!thread_factory_) {
+            throw std::invalid_argument("Pipeline requires a non-empty NodeThreadFactory");
+        }
+    }
+
+    /**
+     * @brief 停止并 Join 全部 Node 后销毁 Pipeline
      */
     ~Pipeline() {
-        const bool kStopped = Stop();
-        (void)kStopped;
-        assert(state_ == PipelineState::kStopped &&
-               "Pipeline cannot be destroyed while a Node thread remains unjoined");
+        const bool stop_succeeded = Stop();
+        (void)stop_succeeded;
+
+        // Stop 返回 false 也可能只是 Abort 清缓存失败；只有状态不是 kStopped 才表示仍有线程未 Join
+        if (state_ != PipelineState::kStopped) {
+            std::terminate();
+        }
     }
 
     // 禁止拷贝构造/赋值 移动构造/赋值
@@ -102,9 +114,9 @@ public:
 
     /**
      * @brief 创建一个容量固定的 Link<T>，并保存到 links_
-     * @tparam T Link 中传输的数据类型，例如 Packet、VideoFrame 或 AudioFrame
+     * @tparam T Link 中传输的数据类型，例如 Packet / VideoFrame / AudioFrame
      * @param capacity Link 内部 ThreadSafeQueue 的最大元素数量，必须大于 0
-     * @return 新 Link 的 std::shared_ptr， Pipeline 和 Node 共同持有
+     * @return Pipeline 与相邻 Node 共同持有的 shared_ptr<Link<T>>
      * @throws std::logic_error 当前不处于 Building 状态时抛出，防止运行中修改拓扑
      * @throws std::invalid_argument capacity 为 0 时由 ThreadSafeQueue 构造函数抛出
      *
@@ -113,27 +125,25 @@ public:
      * 返回类型是 `std::shared_ptr<Link<Packet>>`
      *
      * @par LinkCreationToken
-     * LinkCreationToken{} 构造的一个无名临时通行证对象，不是函数
+     * `LinkCreationToken{}` 构造一个无名临时令牌对象，不是函数，它不保存数据，只用于通过 Link 的构造权限检查
      */
     template <typename T>
     std::shared_ptr<Link<T>> CreateLink(std::size_t capacity) {
-        // T 必须是一个“对象类型
+        // Link 的元素必须是普通对象类型，不能是引用、数组或 cv 限定类型
         static_assert(std::is_object<T>::value, "Link<T> requires a non-reference object type");
 
-        // T 不能是原生的数组类型
         static_assert(!std::is_array<T>::value, "Link<T> does not support array element types");
 
-        // T 既不能带有 const，也不能带有 volatile
         static_assert(!std::is_const<T>::value && !std::is_volatile<T>::value,
                       "Link<T> requires an unqualified mutable value type");
 
-        // T 不能和 NoPort 是同一个类型
         static_assert(!std::is_same<T, NoPort>::value,
                       "NoPort marks a missing Node port and cannot be transported by a Link");
 
+        // 图启动后不能再增加 Link，否则 Pipeline 的停止登记和启动顺序会失效
         RequireBuilding("Link can only be created while Pipeline is building");
 
-        // 构造 Link<T> 对象，并返回管理该对象的 shared_ptr
+        // make_shared 创建 Link 对象和 shared_ptr 控制块；link 是管理该对象的智能指针
         auto link = std::make_shared<Link<T>>(capacity, LinkCreationToken{});
 
         links_.emplace_back(link);
@@ -141,14 +151,14 @@ public:
     }
 
     /**
-     * @brief 创建一个 Node，并追加到 nodes_
+     * @brief 创建一个具体 Node，并追加到 nodes_
      * @tparam NodeT 要创建的具体 Node 类型，必须公开继承 INodeBase
      * @tparam Args NodeT 构造函数参数的类型列表，不包含 SyncContext
      * @param args 传给 NodeT 构造函数的参数，不包含 SyncContext
      * @return 新 Node 的引用；Node 所有权由 Pipeline 的 nodes_ 独占
      * @throws std::logic_error 当前不处于 Building 状态时抛出
-     * @note 调用者必须按 Source -> Sink 的拓扑顺序调用本函数。Pipeline 只保存调用顺序，
-     *       不分析 Link 连接关系，也不会自动计算拓扑顺序
+     * @note 调用者必须按 Source -> Sink 的拓扑顺序调用本函数，Pipeline 只保存调用顺序，不分析 Link
+     *       连接关系，也不计算拓扑排序；Start() 只会把登记顺序反过来启动
      *
      * @par 可变参数模板展开示例
      * 调用 `pipeline.EmplaceNode<FiniteSourceNode>(200)` 时：
@@ -158,28 +168,25 @@ public:
      * - make_unique 最终调用 FiniteSourceNode(sync_context_, 200)
      *
      * 调用 `pipeline.EmplaceNode<CountingSinkNode>()` 时 Args/args 都是空包，最终调用
-     * `CountingSinkNode(sync_context_)`。`std::forward<Args>(args)...` 逐项展开并保留
-     * 每个实参原来的左值、右值和移动语义
+     * CountingSinkNode(sync_context_)，std::forward<Args>(args)... 逐项展开，并保留每个实参
+     * 原来的左值、右值和移动语义
      *
      * @par 返回引用为什么有效
-     * Node 对象本身由 make_unique 分配在稳定的动态存储中nodes_ 扩容时移动的是
-     * unique_ptr，不会移动它指向的 Node，所以返回引用在 Pipeline 析构前保持有效
-     * 调用方只借用该引用进行 Connect 或查询，不拥有 Node，也不得让引用越过图的生命期
-
+     * Node 对象本身由 make_unique 分配在稳定的动态存储中，nodes_ 扩容时移动的是 unique_ptr，
+     * 不会移动它指向的 Node，所以返回引用在 Pipeline 析构前保持有效
+     * 调用方只借用该引用进行 Connect 或查询，不拥有 Node，也不得让引用越过图的生命周期
      */
     template <typename NodeT, typename... Args>
     NodeT& EmplaceNode(Args&&... args) {
-        // 编译期断言，检查 NodeT 是否继承自 INodeBase
+        // 编译期检查：NodeT 必须继承 INodeBase，且必须是可实例化的具体类型
         static_assert(std::is_base_of<INodeBase, NodeT>::value, "NodeT must derive from INodeBase");
 
-        // 编译期断言，检查能不能把一个指向 NodeT 的指针，隐式转换成指向 INodeBase 的指针
         static_assert(std::is_convertible<NodeT*, INodeBase*>::value,
                       "NodeT must publicly and unambiguously derive from INodeBase");
 
-        // 编译期断言，检查 NodeT 是不是一个抽象类
         static_assert(!std::is_abstract<NodeT>::value, "NodeT must be a concrete, non-abstract Node type");
 
-        // 编译期断言，检查 NodeT 这个类，能不能用 <std::shared_ptr<SyncContext>,  Args...> 作为参数来调用构造函数
+        // 构造函数的第一个参数由 Pipeline 注入，后面的参数来自调用者
         static_assert(std::is_constructible<NodeT, std::shared_ptr<SyncContext>, Args...>::value,
                       "NodeT must be constructible from shared_ptr<SyncContext> followed by Args...");
 
@@ -188,7 +195,7 @@ public:
         // Pipeline 自动注入共享 SyncContext；调用者只传具体 Node 自己需要的参数
         auto node = std::make_unique<NodeT>(sync_ctx_, std::forward<Args>(args)...);
 
-        // nodes_ 接管 unique_ptr，返回值只是对同一个 Node 对象的引用
+        // nodes_ 接管 unique_ptr；返回值只是对同一个 Node 对象的借用引用
         NodeT& ref = *node;
         nodes_.emplace_back(std::move(node));
         return ref;
@@ -198,22 +205,26 @@ public:
      * @brief 按 nodes_ 的反向登记顺序启动全部 Node
      * @return 明确的启动结果；任一 Node 失败时立即执行完整 Stop 回滚
      * @details
-     * 调用者按 EmplaceNode() 的约定以 Source 到 Sink 的顺序登记 Node 后，反向遍历会先启动消费者。
-     * 任一 Node 启动失败时，Stop() 会停止并 Join 已启动的 Node。Pipeline 启动后不能再次调用 Start()
+     * 调用者按 EmplaceNode() 的约定以 Source 到 Sink 的顺序登记 Node 后，反向遍历会先启动消费者
+     * 任一 Node 启动失败时，Stop() 会停止并 Join 已创建的线程，Pipeline 启动后不能再次调用 Start()
      */
     PipelineStartResult Start() {
+        // 只有 Building 状态可以启动
         if (state_ != PipelineState::kBuilding) {
             return PipelineStartResult::kInvalidState;
         }
 
+        // 空图不启动，也不改变状态，调用方仍可继续组图
         if (nodes_.empty()) {
             return PipelineStartResult::kNoNodes;
         }
 
         state_ = PipelineState::kStarting;
 
+        // 反向启动：登记顺序是 Source -> Sink，因此这里先启动消费者
         for (auto it = nodes_.rbegin(); it != nodes_.rend(); ++it) {
-            if ((*it)->Start() != NodeStartResult::kStarted) {
+            if ((*it)->Start(thread_factory_) != NodeStartResult::kStarted) {
+                // 任何一个 Node 创建线程失败，都回滚已经启动的 Node
                 return Stop() ? PipelineStartResult::kNodeStartFailed : PipelineStartResult::kRollbackFailed;
             }
         }
@@ -222,7 +233,7 @@ public:
     }
 
     /**
-     * @brief 停止全部 Node，并等待它们的工作线程退出
+     * @brief 请求全图停止，解除所有已知阻塞并 Join 全部 Node
      * @return 所有停止步骤都成功时返回 true，否则返回 false
      * @details
      * Stop() 按以下顺序执行：
@@ -232,14 +243,15 @@ public:
      * 3. 请求每个 Node 中断 Link 之外的阻塞 I/O；
      * 4. 唤醒等待暂停条件变量的 Node；
      * 5. Join 所有 Node 工作线程
-     * @note 析构函数会调用本函数，因此本函数不抛出异常。可处理的异常会转换为false 返回值，同时继续执行
-     * 剩余停止步骤
+     * @note 析构函数会调用本函数，因此本函数不抛出异常，可处理的异常会转换为 false，停止流程仍会继续
      */
     bool Stop() noexcept {
+        // 已经完成停止时，重复调用返回第一次停止结果
         if (state_ == PipelineState::kStopped) {
             return stop_succeeded_;
         }
 
+        // 只允许一次停止流程；控制接口本身不支持并发调用
         if (stop_in_progress_) {
             return false;
         }
@@ -247,12 +259,12 @@ public:
         stop_in_progress_ = true;
         state_ = PipelineState::kStopping;
 
-        // 1. 通知所有 Node 停止
+        // 1. 先给所有 Node 设置停止标志，包括尚未创建线程的 Node
         for (const auto& node : nodes_) {
             node->SignalStop();
         }
 
-        // 2. 解除 Link 阻塞，Abort 会让阻塞在 Link::Send() 或 Link::Receive() 的线程返回
+        // 2. 解除 Link 阻塞；Abort 让 Send() 和 Receive() 立即返回失败
         bool success = true;
         for (const auto& link : links_) {
             try {
@@ -262,24 +274,24 @@ public:
             }
         }
 
-        // 3. 打断外部阻塞：如av_read_frame() 或 socket recv()
+        // 3. 中断 Link 之外的阻塞 I/O，例如 av_read_frame() 或 socket recv()
         for (auto& node : nodes_) {
             node->InterruptBlockingIo();
         }
 
-        // 4. 让暂停中的线程返回 ThreadMain() 并检查停止标志
+        // 4. 唤醒暂停条件变量上的 Node；它们随后读取自己的停止标志并退出 ThreadMain()
         try {
             sync_ctx_->WakeAllPausedThreads();
         } catch (...) {
             success = false;
         }
 
-        // 5. 等待线程退出
+        // 5. 等待并回收全部工作线程
         bool all_nodes_joined = true;
         for (const auto& node : nodes_) {
-            const NodeJoinResult kResult = node->Join();
+            const NodeJoinResult result = node->Join();
 
-            if (kResult == NodeJoinResult::kCalledFromWorkerThread || kResult == NodeJoinResult::kJoinFailed) {
+            if (result == NodeJoinResult::kCannotJoinSelf || result == NodeJoinResult::kJoinFailed) {
                 success = false;
                 all_nodes_joined = false;
             }
@@ -287,21 +299,23 @@ public:
 
         stop_in_progress_ = false;
 
-        // 6. 只要有一个线程还没有 Join，就不能把状态标记为 kStopped
+        // 只要有一个线程没有 Join，就不能进入 kStopped，也不能析构 Pipeline
         if (!all_nodes_joined) {
             return false;
         }
 
-        // 7. 走到这里，全部线程都已安全退出，销毁 Pipeline 不会再触发 std::thread 的 terminate
+        // 到这里时全部线程都已退出并回收，Node 和 Link 可以安全析构
         state_ = PipelineState::kStopped;
         stop_succeeded_ = success;
         return stop_succeeded_;
     }
 
     /**
-     * @brief 请求所有 Node 在下一次 Tick() 前暂停
-     * @return 当前状态为 kRunning 时返回 true，否则返回 false
-     * @note 本函数只提交暂停状态，不等待所有 Node 都进入暂停等待
+     * @brief 请求所有 Node 在后续工作循环中暂停
+     * @return Pipeline 正在运行时返回 true，否则返回 false
+     * @details
+     * 本函数只提交 Paused 状态，不等待所有 Node 回报 已经暂停，正在执行或阻塞在 Tick() 中的
+     * Node 不会被强行中断；它会在 Tick() 返回并进入下一轮 WaitWhilePaused() 时暂停
      */
     bool Pause() {
         if (state_ != PipelineState::kRunning) {
@@ -313,7 +327,7 @@ public:
     }
 
     /**
-     * @brief 将 SyncContext 设置为 Running， 并唤醒暂停中的 Node
+     * @brief 恢复运行并唤醒所有暂停 Node
      * @return Pipeline 状态为 kRunning 时返回 true，否则返回 false
      */
     bool Resume() {
@@ -326,19 +340,29 @@ public:
     }
 
     /**
-     * @brief 返回所有 Node 共用的 SyncContext，只允许调用只读接口
-     * @return 指向 const SyncContext 的 std::shared_ptr
+     * @brief 返回所有 Node 共用的 SyncContext 的只读视图
+     * @return 指向 const SyncContext 的 std::shared_ptr，外部不能调用 Pipeline 专属的写接口
      */
     std::shared_ptr<const SyncContext> GetSyncContext() const { return sync_ctx_; }
 
     /**
      * @brief 返回 Pipeline 当前状态
-     * @return PipelineState
-     * @note 只能从 Pipeline 的控制线程调用
+     * @return 由控制线程维护的 PipelineState
+     * @note 只能从约定的 Pipeline 控制线程调用；本函数不是跨线程状态观察接口
      */
     PipelineState GetState() const { return state_; }
 
 private:
+    /**
+     * @brief 创建默认 Node 线程工厂
+     * @return 忽略 Node 名称并直接使用 std::thread 执行入口函数的工厂
+     * @details 工厂收到的 entry 就是 Node 的 ThreadMain() 回调；std::thread(entry) 创建并启动一个
+     *          新线程，Pipeline 随后保存返回的线程对象并在 Stop() 中 Join
+     */
+    static NodeThreadFactory CreateDefaultThreadFactory() {
+        return [](const std::string&, NodeThreadEntry entry) { return std::thread(std::move(entry)); };
+    }
+
     /**
      * @brief 检查当前是否允许添加 Node 或 Link
      * @param message 状态不正确时使用的异常文本
@@ -350,18 +374,25 @@ private:
         }
     }
 
-    std::shared_ptr<SyncContext> sync_ctx_; ///< 所有 Node 共享的控制对象
+    /// 本 Pipeline 的共享运行状态；Pipeline 写入，Node 持有 shared_ptr 并读取
+    std::shared_ptr<SyncContext> sync_ctx_;
 
-    std::vector<std::unique_ptr<INodeBase>> nodes_; ///< 保存所有的 Nodes
+    /// 按 Node 启动顺序同步调用的线程创建函数
+    NodeThreadFactory thread_factory_;
 
-    std::vector<std::shared_ptr<ILinkControl>> links_; ///< 保存类型擦除后的全部 Link
+    /// 按 Source 到 Sink 的登记顺序独占全部 Node
+    std::vector<std::unique_ptr<INodeBase>> nodes_;
 
-    PipelineState state_{PipelineState::kBuilding}; ///< 仅由 Pipeline 控制线程访问
+    /// 保存全部 Link 的控制接口，Stop 时不需要知道数据类型
+    std::vector<std::shared_ptr<ILinkControl>> links_;
 
-    /// 防止 Stop 在执行 OnInterruptBlockingIo 等用户钩子期间发生同步重入
+    /// 只由单一 Pipeline 控制线程访问的生命周期状态
+    PipelineState state_{PipelineState::kBuilding};
+
+    /// 防止停止钩子意外同步重入 Stop()
     bool stop_in_progress_{false};
 
-    /// 缓存已经完成的停止结果，使重复 Stop 不会把首次失败错误地改报为成功
+    /// 保存首次完成停止时的结果，重复 Stop() 返回同一结果
     bool stop_succeeded_{false};
 };
 

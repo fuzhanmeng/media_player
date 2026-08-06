@@ -1,23 +1,22 @@
 /**
  * @file inode.h
- * @brief 节点线程生命周期基类及基础输入/输出形态的强类型便利模板
+ * @brief DAG Node 的线程生命周期基类和常用强类型端口模板
  * @details
  * 本文件定义了 DAG 节点的两层架构抽象：
- *
  * 这两部分职责互不影响，因此拆成两个类：
  *
  * INodeBase
  *     1. 负责管理单个工作线程、停止标志、统一的线程循环机制以及退出结果
  *     2. 它自身不持有任何图边（Link），也不在析构函数中尝试隐式停止线程
- *     3. Pipeline 是全局唯一的生命周期协调者，必须按严格顺序完成 SignalStop / Link Abort / 外部
- *        IO Interrupt 和 Join 操作后，方可销毁 Node 对象
+ *     3. Pipeline 是本图的生命周期协调者，必须按顺序完成 SignalStop、Link Abort、外部 I/O
+ *        中断和 Join 后，才能销毁 Node 对象
  *
  * 数据平面 (INode<InT, OutT> 及偏特化):
  *     1. 为常见的单输入/单输出节点形态提供自动化的强类型 Link 管理
  *     2. NoPort 作为一个占位类型，用于触发模板偏特化以表达 Source（无输入）和 Sink（无输出）节点
  *        从而彻底避免编译器尝试实例化非法的 Link<void>
- *     3. 对于多输入或多输出的复杂节点,如 Demuxer，应当直接继承 INodeBase,并自行持有所需的 Link<T>
- *     4. 无论何种拓扑形态，Link 的 Abort 操作始终由 Pipeline 统一集中调度
+ *     3. 对于多输入或多输出的复杂节点，如 Demuxer，应当直接继承 INodeBase，并自行持有所需的 Link<T>
+ *     4. 无论何种拓扑形态，Link 的 Abort 操作始终由 Pipeline 统一调度
  *
  */
 
@@ -27,11 +26,11 @@
 #include <cassert> // 运行时断言
 #include <cstdint> // 固定大小整数类型
 #include <exception> // 异常基类
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept> // 标准异常类
 #include <string>
-#include <system_error> // 系统错误处理
 #include <thread>
 #include <utility> // std::move
 
@@ -44,50 +43,65 @@ namespace mediacore {
 class Pipeline;
 
 /**
+ * @brief Node 工作线程入口函数的可调用类型
+ * @details NodeThreadEntry 保存一个无参数、无返回值的可调用对象，通常是绑定具体 Node 的
+ *          " ThreadMain() " lambda
+ */
+using NodeThreadEntry = std::function<void()>;
+
+/**
+ * @brief 创建 Node 工作线程的函数类型
+ * @details 第一个参数是固定的 Node 名称，第二个参数是必须在线程中执行的入口函数
+ * 工厂成功时必须返回 joinable 的 std::thread，不得在调用者线程同步执行入口函数
+ * 工厂失败时应抛出异常或返回不可 Join 的 std::thread，并且不能遗留未返回的后台线程
+ */
+using NodeThreadFactory = std::function<std::thread(const std::string&, NodeThreadEntry)>;
+
+/**
  * @enum NodeState
- * @brief Node 对象内部状态机枚举，用于标示一次性的线程生命周期状态
+ * @brief Node 的一次性工作线程状态
  * @details std::uint8_t 指定枚举的底层类型
  */
 enum class NodeState : std::uint8_t {
-    kCreated, // 初始态
-    kRunning, // 运行态
-    kStopRequested, // 停止挂起态
-    kFinished, // 逻辑终止态
-    kJoined, // 资源回收态
+    kCreated, ///< Node 已经被构造，但是还未创建工作线程
+    kRunning, ///< Node 线程正在创建、执行或者即将退出
+    kStopRequested, ///< Pipeline 已发出停止请求
+    kFinished, ///< 工作线程已经退出，尚未 Join
+    kJoined, ///< 工作线程已经 Join，Node 可以析构
 };
 
 /**
  * @enum NodeStartResult
- * @brief Start() 调用的可观测返回结果，明确标识 Node 实例不支持重复启动。
+ * @brief Node Start() 的执行结果
  */
 enum class NodeStartResult : std::uint8_t {
-    kStarted,
-    kAlreadyStarted,
-    kStopAlreadyRequested,
-    kThreadCreationFailed,
+    kStarted, ///< 工作线程创建成功
+    kAlreadyStarted, ///< Node 已经启动或已经结束，不能再次启动
+    kStopAlreadyRequested, ///< Node 在启动前已经收到停止请求
+    kThreadCreationFailed, ///< 线程工厂抛出异常或返回了不可 Join 的线程
 };
 
 /**
  * @enum NodeJoinResult
- * @brief Pipeline 回收 Node 底层线程时的状态码枚举
+ * @brief Node 工作线程回收 Join 的结果
  */
 enum class NodeJoinResult : std::uint8_t {
-    kJoined,
-    kNoThread,
-    kAlreadyJoined,
-    kCalledFromWorkerThread,
-    kJoinFailed,
+    kJoined, ///< 成功回收线程
+    kNoThread, ///< Node 没有创建过线程
+    kAlreadyJoined, ///< 工作线程已经被回收
+    kCannotJoinSelf, ///< 工作线程尝试 Join 自己，禁止执行
+    kJoinFailed, ///< std::thread::join() 执行失败
 };
 
 /**
  * @enum TickResult
- * @brief 派生类单次执行负载 (Tick) 的返回结果枚举，提供比布尔值更丰富的终止原因语义
+ * @brief 派生 Node 执行一次 Tick() 的结果
  */
 enum class TickResult : std::uint8_t {
-    kContinue,
-    kEndOfStream,
-    kStopped,
-    kError,
+    kContinue, ///< 本次处理完成，可以继续下一次 Tick()
+    kEndOfStream, ///< 输入正常结束，需要关闭本 Node 的全部输出
+    kStopped, ///< Node 因取消或停止请求结束
+    kError, ///< Node 遇到不可继续的业务错误
 };
 
 /**
@@ -95,29 +109,32 @@ enum class TickResult : std::uint8_t {
  * @brief 工作线程退出原因枚举，供 Pipeline 或状态机 (FSM) 进行向上的错误报告与状态反馈
  */
 enum class NodeFinishReason : std::uint8_t {
-    kNotFinished,
-    kEndOfStream,
-    kStopRequested,
-    kError,
-    kUnhandledException,
+    kNotFinished, ///< 工作线程尚未退出
+    kEndOfStream, ///< 流结束了
+    kStopRequested, ///< Pipeline 请求停止，或 Tick() 报告 kStopped
+    kError, ///< Tick() 报告 kError
+    kUnhandledException, ///< 工作线程入口捕获了未由派生 Node 处理的 C++ 异常
 };
 
 /**
  * @class INodeBase
- * @brief 与具体数据载荷类型无关的节点线程执行器
+ * @brief 与媒体数据类型无关的单线程 Node 基类
  * @details 职责：
- * 严格限定生命周期状态跃迁路径为：Created -> Running -> Finished -> Joined
- * 亦可在任意活动阶段接收停止指令，跃迁为：StopRequested -> Finished -> Joined
- * 控制域方法的调用约束：Start / SignalStop / InterruptBlockingIo / Join
- * 必须且只能由持有该节点的 Pipeline 在主控线程中串行调用
- * 工作线程内部仅执行 ThreadMain 骨架与多态函数 Tick
+ * Pipeline 在控制线程中依次调用 Start()、SignalStop()、InterruptBlockingIo() 和 Join()
+ * Node 工作线程执行 ThreadMain() 和 Tick()；正常 EOF 时 ThreadMain() 调用 CloseOutputs() 将 EOF
+ * 传给下游，本类拥有 std::thread，Node 析构函数不负责停止线程；Pipeline 必须先完成 Join
+ *
+ * CloseOutputs() 是纯虚函数，表示所有具体 Node 都必须定义 "正常 EOF 时如何关闭输出" 的行为
+ * 纯虚函数是接口要求，不提供可直接使用的基类实现，只要类还没有实现全部纯虚函数，它就是抽象类，
+ * 不能创建对象；派生类必须使用完全相同的函数名、参数和限定符进行覆盖，常用端口模板会提供默认实现，
+ * 多输入或多输出 Node 则必须直接继承本类并自行实现
  */
 class INodeBase {
 public:
     /**
      * @brief 构造函数，初始化尚未启动的 Node 实例
      * @param name 节点名，用于诊断日志追踪与拓扑排错的固定标识符
-     * @param sync 由 Pipeline 实例化并注入的全局共享同步总线，严禁为空
+     * @param sync Pipeline 创建并共享给全部 Node 的同步对象
      * @throws std::invalid_argument 当传入的 sync 为 nullptr 时触发
      */
     INodeBase(std::string name, std::shared_ptr<SyncContext> sync)
@@ -128,40 +145,157 @@ public:
     }
 
     /**
-     * @brief 析构函数，断言生命周期已被正确回收
-     * @details 若违反析构前置条件（即线程仍在 joinable 状态），调试模式下将立即触发 assert 终止；
-     *          Release 模式下 std::thread 的析构仍会抛出异常，强制暴露架构级的生命周期管理违规
+     * @brief 析构函数，销毁 Node
+     * @details
+     * 本函数只检查线程是否已经由 Pipeline 回收，不会隐式停止或 Join，调试构建中，违反前置条件会触发
+     * assert；关闭 assert 的构建中，joinable 的 std::thread 随后仍会导致 std::terminate()
      */
-    virtual ~INodeBase() { assert(!thread_.joinable() && "Pipeline must be join every Node before destruction"); }
+    virtual ~INodeBase() { assert(!thread_.joinable() && "Pipeline must join every Node before destruction"); }
 
-    // 禁止拷贝和移动，节点持有线程与同步原语，语义上不可赋值
+    /** @brief Node 拥有线程和同步状态，禁止复制 */
     INodeBase(const INodeBase&) = delete;
+
+    /** @brief Node 拥有线程和同步状态，禁止复制赋值 */
     INodeBase& operator=(const INodeBase&) = delete;
+
+    /** @brief Node 的地址会被工作线程捕获，禁止移动 */
     INodeBase(INodeBase&&) = delete;
+
+    /** @brief Node 的地址会被工作线程捕获，禁止移动赋值 */
     INodeBase& operator=(INodeBase&&) = delete;
 
-private:
-    friend Pipeline;
+    /**
+     * @brief 查询 Pipeline 是否已经请求停止当前 Node
+     * @return 已请求停止返回 true
+     */
+    bool IsStopRequested() const noexcept { return stop_requested_.load(); }
 
     /**
-     * @brief 分配系统线程资源并启动工作线程（非阻塞）
-     * @details 线程创建与状态跃迁结果；若系统资源不足导致异常，状态将原子回滚至 kCreated
-     * @note 采用 CAS (Compare-And-Swap) 保障并发幂等性
+     * @brief 返回当前 Node 生命周期状态
+     * @return 原子读取的状态快照
      */
-    NodeStartResult Start() {
-        // 预期当前节点的原子状态 state_ 是处于初始化完成但未启动的 kCreated 状态
-        NodeState expected = NodeState::kCreated;
+    NodeState GetState() const noexcept { return state_.load(); }
 
-        // 如果 state_ 的状态 = expected(NodeState::kCreated)，那么 state_  == NodeState::kRunning
-        if (!state_.compare_exchange_strong(expected, NodeState::kRunning)) {
-            // 如果交换失败
-            return expected == NodeState::kStopRequested ? NodeStartResult::kStopAlreadyRequested
-                                                         : NodeStartResult::kAlreadyStarted;
+    /**
+     * @brief 返回工作线程退出原因
+     * @return 线程未退出时返回 kNotFinished
+     */
+    NodeFinishReason GetFinishReason() const noexcept { return finish_reason_.load(); }
+
+    /**
+     * @brief 返回 Node 固定名称
+     * @return name_ 的只读引用
+     */
+    const std::string& GetName() const noexcept { return name_; }
+
+    /**
+     * @brief 返回工作线程捕获的未处理 C++ 异常
+     * @return 没有捕获异常时返回空 std::exception_ptr
+     * @throws std::logic_error Node 尚未 Join 时抛出
+     */
+    std::exception_ptr GetUnhandledException() const {
+        if (state_.load(std::memory_order_acquire) != NodeState::kJoined) {
+            throw std::logic_error("GetUnhandledException requires a joined Node");
         }
 
+        return unhandled_exception_;
+    }
+
+protected:
+    /**
+     * @brief 执行一次具体媒体处理
+     * @return 本次处理的 TickResult
+     * @details 若 Tick() 调用阻塞式第三方 I/O，派生类必须实现 OnInterruptBlockingIo()，保证
+     * Pipeline::Stop() 能使调用返回
+     */
+    virtual TickResult Tick() = 0;
+
+    /**
+     * @brief 正常 EOF 时关闭当前 Node 的全部输出 Link
+     * @details
+     * ThreadMain() 只在 Tick() 返回 kEndOfStream 且没有收到停止请求时调用本函数
+     * 这是纯虚函数：每个可实例化的具体 Node 都必须提供实现，函数名即使只少一个复数后缀也不会覆盖
+     * 本接口，名称、参数和限定符必须完全一致
+     */
+    virtual void CloseOutputs() = 0;
+
+    /**
+     * @brief 中断 Link 之外的阻塞式 I/O
+     * @details
+     * Pipeline 控制线程可能在工作线程刚创建后立即调用本函数，也可能与 Tick() 并发调用
+     * 覆盖实现只能设置取消标志、调用线程安全的 shutdown() 或使用库提供的取消接口，不能释放
+     * Tick() 仍可能访问的媒体对象
+     */
+    virtual void OnInterruptBlockingIo() noexcept {}
+
+    /**
+     * @brief 判断当前状态是否允许连接 Link
+     * @return Node 尚未启动时返回 true，否则返回 false
+     */
+    bool CanConfigure() const noexcept { return state_.load() == NodeState::kCreated; }
+
+    /**
+     * @brief 判断媒体项是否属于已经失效的数据世代
+     * @param item_epoch 数据项携带的 epoch
+     * @return item_epoch 小于当前 epoch 时返回 true
+     * @note 这里只比较标记，不会自动清空 Link，也不会刷新解码器或设备
+     */
+    bool ShouldDropStaleItem(std::uint64_t item_epoch) const noexcept { return item_epoch < sync_ctx_->GetEpoch(); }
+
+    /**
+     * @brief 获取当前数据世代号
+     * @return SyncContext 中保存的 epoch
+     */
+    std::uint64_t GetCurrentEpoch() const noexcept { return sync_ctx_->GetEpoch(); }
+
+    /// 由 Pipeline 创建并注入的本图运行控制对象；Node 只读取状态和等待暂停结束
+    std::shared_ptr<SyncContext> sync_ctx_;
+
+private:
+    friend class Pipeline;
+
+    /**
+     * @brief 使用 Pipeline 提供的线程工厂启动底层工作线程
+     * @param thread_factory Pipeline 传入的函数（Lambda），负责真正去调用操作系统的 API 创建线程
+     * @return 启动结果状态码（成功、已经启动过、已经收到停止信号，或者线程创建失败）
+     *
+     * @details
+     * 1. 先用 CAS 把状态从 kCreated 改为 kRunning，防止同一个 Node 被重复启动或在停止请求后启动
+     * 2. 如果线程工厂抛出异常或返回不可 Join 的线程，状态回滚到 kCreated，交由 Pipeline 统一回滚
+     */
+    NodeStartResult Start(const NodeThreadFactory& thread_factory) noexcept {
+        // 1. 预期当前状态为初始化完成且未启动 (kCreated)
+        NodeState expected = NodeState::kCreated;
+
+        // 2. CAS 原子操作
+        // if state_ == expected，则将 state_ 更新为 kRunning 并返回 true
+        // if state_ != expected，说明已经被其他操作更改
+        // 此时 CAS 失败返回 false，并将 expected 覆盖为 state_ 实际的当前值
+        if (!state_.compare_exchange_strong(expected, NodeState::kRunning)) {
+            // 检查 CAS 失败的具体原因
+            if (expected == NodeState::kStopRequested) {
+                // 节点在启动前已接收到 Pipeline 的异步停止信令，拒绝启动
+                return NodeStartResult::kStopAlreadyRequested;
+            }
+
+            // 其他非 kCreated 状态（如 kRunning, kFinished）均视为已启动过
+            return NodeStartResult::kAlreadyStarted;
+        }
+
+        // 3. state_ == kRunning
         try {
-            thread_ = std::thread(&INodeBase::ThreadMain, this);
-        } catch (const std::system_error&) {
+            // 调用外部注入的工厂去真正开线程，让线程去跑 ThreadMain() 循环
+            thread_ = thread_factory(name_, [this]() { ThreadMain(); });
+
+            // 验证系统线程资源是否有效分配
+            if (!thread_.joinable()) {
+                // 资源分配失败，必须回滚状态，避免当前 Node 永久停留在虚假的 kRunning 状态
+                state_.store(NodeState::kCreated);
+                return NodeStartResult::kThreadCreationFailed;
+            }
+        } catch (...) {
+            // 捕获线程创建时可能抛出的异常（如 std::system_error 内存不足）
+            // 执行状态回滚，拦截异常以满足 noexcept 承诺
             state_.store(NodeState::kCreated);
             return NodeStartResult::kThreadCreationFailed;
         }
@@ -170,56 +304,65 @@ private:
     }
 
     /**
-     * @brief Pipeline 两阶段停止协议的第一步：无阻塞停止信令
-     * @details 本操作通过 memory_order 保证内存可见性，且具备高等幂等性，Pipeline 在遍历完所有的 Node 的
-     *          SignalStop 后，再统一执行 Link Abort 和 CV 唤醒，此设计从拓扑层面消除了逐节点停止可能引发
-     *          的死锁时序问题
+     * @brief 异步发送停止信令：阶段一
+     * @details 本函数仅负责原子化地投递停止信号并推进状态机，不阻塞等待底层 OS 线程物理退出
      */
     void SignalStop() noexcept {
-        // 1. 设置跨线程的布尔标志，供工作线程在死循环中作为原子谓词读取
+        // 1. 投递原子退出标志
         stop_requested_.store(true);
 
-        // 2. 状态机跃迁：使用 CAS 循环将 NodeState 安全地推入 kStopRequested
+        // 2. 获取现在的 state_ 状态
         NodeState current = state_.load();
 
-        // 幂等性拦截：如果已经是停止中或已停止的状态，直接跳出循环，放弃修改
+        // 若节点已处于终止序列（停止请求中、已结束、已回收）
         while (current != NodeState::kStopRequested && current != NodeState::kFinished &&
                current != NodeState::kJoined &&
                // 状态比较与交换：若当前状态仍为 current，则更新为 kStopRequested
                !state_.compare_exchange_strong(current, NodeState::kStopRequested)) {
+            // CAS 失败时，current 会被自动更新为内存中的最新值，继续下一轮评估
         }
     }
 
     /**
-     * @brief 触发派生类专属的阻塞 I/O 中断回调
-     * @details 此钩子函数可能与后台 Tick() 发生并发争用，实现方仅限于设置原子标志、调用 shutdown() 关闭
-     *          Socket 等操作；严禁在此释放 Tick 可能正在持有的媒体上下文（如 FFmpeg/ALSA 句柄）
+     * @brief 调用派生类的外部 I/O 中断函数
+     * @details 只有成功创建过且尚未 Join 的线程才需要中断，因此先检查 thread_.joinable()
+     * 线程创建后可能还没有进入 Tick() 就收到停止请求，OnInterruptBlockingIo() 也必须能安全调用
      */
-    void InterruptBlockingIo() noexcept { OnInterruptBlockingIo(); }
+    void InterruptBlockingIo() noexcept {
+        if (thread_.joinable()) {
+            OnInterruptBlockingIo();
+        }
+    }
 
     /**
-     * @brief 阻塞等待底层工作线程退出并回收内核资源
-     * @return 资源回收状态码：若检测到尝试从当前工作线程内部发起 Join 操作，将返回
-     * kCalledFromWorkerThread 以避免自身死锁
+     * @brief 等待工作线程退出并回收线程资源：阶段三
+     * @return Join 的执行结果
+     * @details
+     * 没有创建线程的 Node 也会被记为 kJoined，使 Pipeline 可以使用同一套析构前检查
+     * 禁止工作线程 Join 自己，否则会死锁；std::thread::join() 成功返回后，控制线程可以读取
+     * 工作线程退出前写入的 unhandled_exception_
      */
     NodeJoinResult Join() noexcept {
+        // 1. 已经完成线程回收
         if (state_.load() == NodeState::kJoined) {
             return NodeJoinResult::kAlreadyJoined;
         }
 
+        // 2. 没有可回收线程
         if (!thread_.joinable()) {
             state_.store(NodeState::kJoined);
             return NodeJoinResult::kNoThread;
         }
 
-        // 比较 Node 内部线程 ID 和 当前正在执行的线程 ID
+        // 3. 防止工作线程 Join 自己
         if (thread_.get_id() == std::this_thread::get_id()) {
-            return NodeJoinResult::kCalledFromWorkerThread;
+            return NodeJoinResult::kCannotJoinSelf;
         }
 
+        // 4. 回收线程
         try {
             thread_.join();
-        } catch (const std::system_error&) {
+        } catch (...) {
             return NodeJoinResult::kJoinFailed;
         }
 
@@ -227,136 +370,84 @@ private:
         return NodeJoinResult::kJoined;
     }
 
-public:
     /**
-     * @brief 获取异步停止信令的状态
-     * @return true 标识 Pipeline 已经启动回收流程，工作线程应尽快结束当前 Tick 周期
-     */
-    bool IsStopedRequested() const noexcept { return stop_requested_.load(); }
-
-    /**
-     * @brief 获取内部状态机的当前快照
-     */
-    NodeState GetState() noexcept { return state_.load(); }
-
-    /**
-     * @brief 获取节点退出的语义原因，未退出时返回 kNotFinished
-     */
-    NodeFinishReason GetFinishedReason() noexcept { return finished_reason_.load(); }
-
-    /**
-     * @brief 获取节点的名称
-     */
-    const std::string& GetName() { return name_; }
-
-    /**
-     * @brief 提取在工作线程中捕获的未处理 C++ 异常对象
-     * @return 若无异常抛出， 返回 nullptr， 提取钱确保 Node 处于 kJoined 状态
-     */
-    std::exception_ptr GetUnhandledException() const noexcept {
-        // 必须在 Join() 返回后，才能读取此变量
-        assert(state_.load() == NodeState::kJoined && "Read worker exception only after Pipeline::Stop/Join");
-
-        return unhandled_exception_;
-    }
-
-protected:
-    /**
-     * @brief 数据平面核心多态接口：执行单次数据处理负载
-     * @return 指示线程循环应当继续或是以何种原因终止
-     */
-    virtual TickResult Tick() = 0;
-
-    /**
-     * @brief 相应外部中断的钩子
-     * @details 默认缺省实现为空，派生类覆盖此方法时必须遵循无锁化，幂等且无内存释放操作的并发约束
-     */
-    virtual void OnInterruptBlockingIo() noexcept {}
-
-    /**
-     * @brief 判断当前生命周期阶段是否允许拓扑变更，所有的“连线”操作，必须在节点处于 kCreated
-     * @return 仅在 kCreated 状态（启动前）返回 true
-     */
-    bool CanConfigure() const noexcept { return state_.load() == NodeState::kCreated; }
-
-    /**
-     * @brief 验证数据帧携带的 epoch 与全局控制总线是否一致
-     * @param itme_epoch 数据流经的 DTO 所记录的世代戳
-     * @return true 标识该数据属于已经废弃的 Seek 世代戳，应当执行无延迟的丢弃处理
-     */
-    bool ShouldDropStaleItem(std::uint64_t item_epoch) const noexcept { return item_epoch < sync_ctx_->GetEpoch(); }
-
-    /**
-     * @brief 获取控制总线 sync_ctx_ 的当前 Seek 世代戳，用于为新产出的数据项打戳
-     */
-    std::uint64_t GetCurrentEpoch() const noexcept { return sync_ctx_->GetEpoch(); }
-
-    /// 由 Pipeline 统一分配并注入的控制总线，用于全局状态同步
-    std::shared_ptr<SyncContext> sync_ctx_;
-
-private:
-    /**
-     * @brief 工作线程顶层控制流
-     * @details 在死循环内部实现了基于快速路径判决的协作式休眠，并包含全局 try-catch 块以捕获 C++ 异常
+     * @brief 工作线程入口，重复执行暂停等待和 Tick()，并记录最终退出原因
+     * @details
+     * 每次 Tick() 前检查停止，避免暂停等待被唤醒后又开始处理数据；Tick() 返回后再次检查停止，
+     * 避免 Pipeline 已经要求立即停止时，把 Link Abort 或外部 I/O 中断误报成正常 EOF
+     * 所有未被派生类处理的 C++ 异常都在本函数中捕获，不能越过线程入口
      */
     void ThreadMain() noexcept {
         NodeFinishReason reason = NodeFinishReason::kNotFinished;
 
         try {
             while (true) {
-                // 步骤 1：处理挂起请求，并将当前节点的 Stop 标志作为唤醒条件注入
-                sync_ctx_->WaitWhilePaused([this]() { return IsStopedRequested(); });
+                // 1. Pause 时等待；每个 Node 自己的停止标志是条件变量的额外退出谓词
+                sync_ctx_->WaitWhilePaused([this]() { return IsStopRequested(); });
 
-                // 步骤 2：醒来后，立即检查是否是因为收到 Stop 标志而被迫醒来的
-                if (IsStopedRequested()) {
+                // 2. 被 Stop 唤醒后不再进入 Tick()
+                if (IsStopRequested()) {
                     reason = NodeFinishReason::kStopRequested;
                     break;
                 }
 
-                // 3. 开始执行 Tick
-                const TickResult kResult = Tick();
-                if (kResult == TickResult::kContinue) {
+                // 3. 执行一轮具体 Node 的媒体处理
+                const TickResult result = Tick();
+
+                // 4. Stop 可能与 Tick() 并发发生停止请求优先于 Tick() 返回的业务结果
+                if (IsStopRequested()) {
+                    reason = NodeFinishReason::kStopRequested;
+                    break;
+                }
+
+                // 5. 根据 Tick() 的结果决定继续处理还是结束线程
+                if (result == TickResult::kContinue) {
                     continue;
                 }
 
-                if (kResult == TickResult::kEndOfStream) {
+                if (result == TickResult::kEndOfStream) {
+                    // EOF 是正常结束：先关闭本 Node 的所有输出 Link，让下游排空后收到 EOF
+                    CloseOutputs();
                     reason = NodeFinishReason::kEndOfStream;
-                    break;
-                } else if (kResult == TickResult::kStopped) {
-                    reason = NodeFinishReason::kStopRequested;
-                    break;
-                } else {
-                    reason = NodeFinishReason::kError;
+                    // 不能继续 while，否则会在 EOF 后再次调用 Tick()，可能空转或重复阻塞
                     break;
                 }
+
+                if (result == TickResult::kStopped) {
+                    reason = NodeFinishReason::kStopRequested;
+                    break;
+                }
+
+                // kError 或未来新增但尚未处理的结果都按错误结束
+                reason = NodeFinishReason::kError;
+                break;
             }
         } catch (...) {
-            // 异常被顶层的 catch(...) 拦截然后使用 std::current_exception() 获取这个异常的指针
-            // 并存入到 unhandled_exception_ 变量中
+            // 在线程入口保存未处理异常，避免异常越过线程边界触发 std::terminate()
             unhandled_exception_ = std::current_exception();
             reason = NodeFinishReason::kUnhandledException;
         }
 
-        finished_reason_.store(reason);
+        finish_reason_.store(reason);
         state_.store(NodeState::kFinished);
     }
 
-    /// 节点固定标识符。
+    /// 日志和拓扑诊断使用的固定 Node 名称
     std::string name_;
 
-    /// OS 级线程句柄。
+    /// Pipeline 创建并 Join 的工作线程句柄
     std::thread thread_;
 
-    /// 原子保护的生命周期状态标识
+    /// Pipeline 控制线程和 Node 工作线程共同更新的生命周期状态
     std::atomic<NodeState> state_{NodeState::kCreated};
 
-    /// 跨线程内存可见的停止请求信令
+    /// Pipeline 写入、工作线程读取的停止请求标志
     std::atomic<bool> stop_requested_{false};
 
-    /// 原子保护的退出原因状态码
-    std::atomic<NodeFinishReason> finished_reason_{NodeFinishReason::kNotFinished};
+    /// 工作线程写入、其他线程读取的最终退出原因
+    std::atomic<NodeFinishReason> finish_reason_{NodeFinishReason::kNotFinished};
 
-    /// 存放跨线程捕获异常的智能指针包装器
+    /// 工作线程捕获的异常；只能在成功 Join 后读取
     std::exception_ptr unhandled_exception_;
 };
 
@@ -368,13 +459,13 @@ struct NoPort final {};
 
 /**
  * @class INode
- * @brief 强类型数据契约节点， 输入 InT，输出 OutT，持有类型化的输入/输出 Link
+ * @brief 持有一个输入 Link 和一个输出 Link 的 Node 模板
  * @tparam InT  输入数据项类型（如 std::shared_ptr<Packet>）
  * @tparam OutT 输出数据项类型（如 std::shared_ptr<VideoFrame>）
  * @details 基类 INodeBase 管线程生命周期，本模板叠加 "数据怎么进、怎么出"：
  *          - 持有强类型 Link（input_ / output_）
- *          - 提供连接接口（ConnectInput / ConnectOutput），供 Pipeline 组图时调用
- *          - 提供一进一出拓扑的默认 AbortLinks（基于 input_ / output_）
+ *          - 提供连接接口（ConnectInput / ConnectOutput），供组图阶段调用
+ *          - 实现 INodeBase::CloseOutputs()；派生 Node 仍必须实现 INodeBase::Tick()
  *
  * @par 适用范围
  *   一进一出的节点：VideoDecoderNode / AudioDecoderNode / 单输入的 AVSyncNode 等
@@ -386,7 +477,6 @@ struct NoPort final {};
  *   - 零进一出：源节点（FileSourceNode / HttpSourceNode，无 input_）
  *   - 一进零出：汇节点（VideoSinkNode / AudioSinkNode / Mp4MuxerNode，无 output_）
  *
- *   这些节点自行持有所需 Link，覆写 AbortLinks 处理自持管道。
  */
 template <typename InT, typename OutT>
 class INode : public INodeBase {
@@ -395,16 +485,17 @@ public:
     using OutputLink = Link<OutT>; ///< 输出管道类型别名
 
     /**
-     * @brief 构造函数
+     * @brief 构造一个一进一出的 Node
      * @param name 节点名
-     * @param sync 全局控制块
+     * @param sync Pipeline 共享同步对象
      */
     INode(std::string name, std::shared_ptr<SyncContext> sync) : INodeBase(std::move(name), std::move(sync)) {}
 
     /**
-     * @brief 接入上游：把上游的输出 Link 作为本节点的输入
+     * @brief 连接上游 Link，作为本 Node 的输入
      */
     bool ConnectInput(std::shared_ptr<InputLink> input) {
+        // 只能在 Node 启动前连接，并拒绝空 Link
         if (!CanConfigure() || !input) {
             return false;
         }
@@ -414,9 +505,10 @@ public:
     }
 
     /**
-     * @brief 接入下游：把下游的输出 Link 作为本节点的输出
+     * @brief 连接本 Node，到下游的输出 Link
      */
     bool ConnectOutput(std::shared_ptr<OutputLink> output) {
+        // 只能在 Node 启动前连接，并拒绝空 Link
         if (!CanConfigure() || !output) {
             return false;
         }
@@ -426,51 +518,63 @@ public:
     }
 
 protected:
-    /*
-     * @brief 封装底层的阻塞式接收调用
+    /**
+     * @brief 从输入 Link 阻塞接收一个数据项
+     * @return 接收到数据时，返回有值的 std::optional，未连接、EOF 或者 Abort 时返回 nullopt
      */
     std::optional<InT> ReceiveInput() { return input_ ? input_->Receive() : std::nullopt; }
 
     /**
-     * @brief 封装底层的阻塞式发送调用
+     * @brief 向输出 Link 阻塞发送一个数据项
+     * @param item 要发送的数据项
+     * @return 发送成功返回 true；未连接、Link 已关闭或已 Abort 时返回 false
      */
     bool SendOutput(OutT item) { return output_ && output_->Send(std::move(item)); }
 
     /**
-     * @brief 触发输出管道的温和关闭语义（EOF 排空机制）
+     * @brief 正常关闭一进一出 Node 的全部输出
+     * @details
+     * 这个模板只有一条输出 Link，所以 "全部输出" 实际就是 output_，没有 CloseInput()：输入 Link
+     * 的正常关闭权属于上游发送方，本 Node 作为接收方只负责 Receive() 到排空后的 nullopt
+     * Tick() 返回 kEndOfStream 前，派生 Node 应先完成自己的 drain 或资源收尾；这里的实现只负责
+     * 把 EOF 传给下游， final 表示所有使用该模板的 Node 都使用同一套 Link 关闭规则
      */
-    void CloseOutput() {
+    void CloseOutputs() final {
         if (output_) {
             output_->Close();
         }
     }
 
 private:
-    /// 主输入管道
+    /// 上游与本 Node 共享的输入 Link
     std::shared_ptr<InputLink> input_;
 
-    /// 主输出管道
+    /// 本 Node 与下游共享的输出 Link
     std::shared_ptr<OutputLink> output_;
 };
 
 /**
  * @class INode<NoPort, OutT>
- * @brief 模板偏特化：零进一出形态（Source Node/Producer），剥离 Input 逻辑避免实例化非法类型
+ * @brief 持有一个输出 Link、没有输入 Link 的 Source Node 模板
+ * @tparam OutT 输出 Link 传递的数据类型
+ * @details 本模板拥有输出 Link 的 shared_ptr，不拥有输入端口，并实现 Source 的 CloseOutputs()
  */
 template <typename OutT>
 class INode<NoPort, OutT> : public INodeBase {
 public:
-    using OutputLink = Link<OutT>;
+    using OutputLink = Link<OutT>; ///< 输出 Link 类型
 
     /**
-     * @brief 构造函数
+     * @brief 构造一个零进一出的 Source Node
      * @param name 节点名
-     * @param sync 全局控制块
+     * @param sync Pipeline 共享同步对象
      */
     INode(std::string name, std::shared_ptr<SyncContext> sync) : INodeBase(std::move(name), std::move(sync)) {}
 
     /**
-     * @brief 把下游的输出 Link 作为本节点的输出
+     * @brief 连接本 Node 到下游的输出 Link
+     * @param output Pipeline 创建的非空输出 Link
+     * @return Node 尚未启动且 output 非空时返回 true，否则返回 false
      */
     bool ConnectOutput(std::shared_ptr<OutputLink> output) {
         if (!CanConfigure() || !output) {
@@ -482,25 +586,34 @@ public:
     }
 
 protected:
+    /**
+     * @brief 向输出 Link 阻塞发送一个数据项
+     * @param item 要发送的数据项
+     * @return 发送成功返回 true；未连接、Link 已关闭或已 Abort 时返回 false
+     */
     bool SendOutput(OutT item) { return output_ && output_->Send(std::move(item)); }
 
     /**
-     * @brief 关闭输出
+     * @brief 正常关闭 Source 的全部输出
+     * @details Source 没有输入端口，因此没有 CloseInput()；正常结束只需要关闭它发送数据的 Link
+     * Source 自身的收尾应在 Tick() 返回 kEndOfStream 前完成
      */
-    void CloseOutput() {
+    void CloseOutputs() final {
         if (output_) {
             output_->Close();
         }
     }
 
 private:
-    // 输出管道
+    /// 本 Node 与下游共享的输出 Link
     std::shared_ptr<OutputLink> output_;
 };
 
 /**
  * @class INode<InT, NoPort>
- * @brief 模板偏特化：一进零出形态（Sink Node/Consumer），剥离 Output 逻辑避免实例化非法类型
+ * @brief 持有一个输入 Link、没有输出 Link 的 Sink Node 模板
+ * @tparam InT 输入 Link 传递的数据类型
+ * @details 本模板拥有输入 Link 的 shared_ptr，不拥有输出端口；CloseOutputs() 是空操作
  */
 template <typename InT>
 class INode<InT, NoPort> : public INodeBase {
@@ -510,12 +623,14 @@ public:
     /**
      * @brief 构造函数，构造一个一进零出形态的 Node
      * @param name 节点名称
-     * @param sync 全局同步标志
+     * @param sync Pipeline 共享同步对象
      */
     INode(std::string name, std::shared_ptr<SyncContext> sync) : INodeBase(std::move(name), std::move(sync)) {}
 
     /**
-     * @brief 绑定输入节点
+     * @brief 连接上游 Link 作为本 Node 的输入
+     * @param input Pipeline 创建的非空 Link
+     * @return Node 尚未启动且 input 非空返回 true
      */
     bool ConnectInput(std::shared_ptr<InputLink> input) {
         if (!CanConfigure() || !input) {
@@ -527,20 +642,42 @@ public:
     }
 
 protected:
+    /**
+     * @brief 从输入 Link 阻塞接收一个数据项
+     * @return 接收到数据返回 std::optional<InT>，接收不到数据返回 std::nullopt
+     */
     std::optional<InT> ReceiveInput() { return input_ ? input_->Receive() : std::nullopt; }
 
+    /**
+     * @brief Sink 没有输出 Link，正常 EOF 时无需关闭任何对象
+     */
+    void CloseOutputs() final {}
+
 private:
+    /// 上游与本 Node 共享的输入 Link
     std::shared_ptr<InputLink> input_;
 };
 
 /**
  * @class INode<NoPort, NoPort>
- * @brief 模板偏特化：独立后台控制节点（无任何数据端口依赖）。
+ * @brief 不使用输入或输出 Link 的后台 Node 模板
+ * @details 本模板不拥有 Link；派生类仍由 Pipeline 负责启动、停止和 Join
  */
 template <>
 class INode<NoPort, NoPort> : public INodeBase {
 public:
+    /**
+     * @brief 构造一个无端口 Node
+     * @param name Node 固定名称
+     * @param sync Pipeline 共享同步对象
+     */
     INode(std::string name, std::shared_ptr<SyncContext> sync) : INodeBase(std::move(name), std::move(sync)) {}
+
+protected:
+    /**
+     * @brief 无端口 Node 在正常 EOF 时无需关闭任何对象
+     */
+    void CloseOutputs() final {}
 };
 
 } // namespace mediacore

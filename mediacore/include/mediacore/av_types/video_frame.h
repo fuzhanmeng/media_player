@@ -13,8 +13,8 @@
 #include "frame_size.h" // mediacore::FrameSize：具名宽高，避免相邻 int 参数被写反
 
 extern "C" {
-// av_malloc / av_free：FFmpeg 的对齐内存分配 / 释放函数。
-// av_malloc 返回按 SIMD 友好边界对齐的内存块，必须用 av_free 释放（与 malloc/free 不可混用）。
+// av_malloc / av_free：FFmpeg 的对齐内存分配 / 释放函数
+// av_malloc 返回按 SIMD 友好边界对齐的内存块，必须用 av_free 释放（与 malloc/free 不可混用）
 #include <libavutil/mem.h>
 }
 
@@ -73,7 +73,7 @@ struct VideoFrame {
     // ================= DAG 调度与同步元信息 =================
 
     /// 绝对显示时间戳 - 微秒, 音画同步与进度显示的依据
-    int64_t ptsUs_{0};
+    int64_t pts_us_{0};
 
     /// Seek 世代号（带外信令），用于丢弃旧帧、清空历史缓存、重置解码器参考帧
     int64_t epoch_{0};
@@ -87,40 +87,43 @@ struct VideoFrame {
     VideoFrame() = default;
 
     /**
-     * @brief 含参构造函数 按 YUV420P 布局一次性分配连续内存，并切分为 Y/U/V 三平面
+     * @brief 含参构造函数，按 YUV420P 布局一次性分配连续内存，并切分为 Y/U/V 三平面
      * @param width 视频宽度（像素）
      * @param height 视频高度（像素）
      * @throws std::bad_alloc 底层内存分配失败时抛出
-     * @note 内存流转：单次 av_malloc 分配 (Y + U + V) 连续大块，再将 data[0..2] 指向块内偏移；裸指针交由 shared_ptr托管，绑定删除器 av_free， 最后一个持有者析构时自动释放。一次分配（而非三次）既减少碎片、又 cache 友好、利于后续SIMD 处理。 UV 平面尺寸按 (width+1)/2 * (height+1)/2 向上取整，兼容奇数分辨率，防越界
+     * @note 内存流转：单次 av_malloc 分配 (Y + U + V) 连续大块，再将 data[0..2] 指向块内偏移；裸指针交由
+     *       shared_ptr 托管，绑定删除器 av_free，最后一个持有者析构时自动释放。一次分配（而非三次）既减少
+     *       碎片、又 cache 友好、利于后续 SIMD 处理。UV 平面尺寸按 (width+1)/2 * (height+1)/2 向上取整，
+     *       兼容奇数分辨率，防止越界。
      */
     VideoFrame(FrameSize size) : width_(size.width_), height_(size.height_) {
-        const int kUvWidth = (size.width_ + 1) / 2; ///< UV 平面宽度（色度水平 2:1 下采样，向上取整
+        const int uv_width = (size.width_ + 1) / 2; ///< UV 平面宽度（色度水平 2:1 下采样，向上取整）
 
-        const int kUvHeight = (size.height_ + 1) / 2; ///< UV 平面高度（色度垂直 2:1 下采样，向上取整
+        const int uv_height = (size.height_ + 1) / 2; ///< UV 平面高度（色度垂直 2:1 下采样，向上取整）
 
-        const int kYSize = size.width_ * size.height_; ///< Y 平面字节数
-        const int kUvSize = kUvWidth * kUvHeight; ///< 单个色度平面总字节数
-        const int kTotalSize = kYSize + kUvSize * 2; /// Y + U + V 总字节数
+        const int y_size = size.width_ * size.height_; ///< Y 平面字节数
+        const int uv_size = uv_width * uv_height; ///< 单个色度平面总字节数
+        const int total_size = y_size + uv_size * 2; ///< Y + U + V 总字节数
 
         // av_malloc 分配 SIMD 对齐内存，失败返回 nullptr
-        uint8_t* rawBuffer = static_cast<uint8_t*>(av_mallocz(static_cast<size_t>(kTotalSize)));
+        uint8_t* raw_buffer = static_cast<uint8_t*>(av_mallocz(static_cast<size_t>(total_size)));
 
-        if (rawBuffer == nullptr) {
+        if (raw_buffer == nullptr) {
             throw std::bad_alloc();
         }
 
-        // 交给 shared_Ptr 托管，自定义删除器保证 av_free 释放
-        buffer_ = std::shared_ptr<uint8_t>(rawBuffer, [](uint8_t* p) { av_free(p); });
+        // 交给 shared_ptr 托管，自定义删除器保证 av_free 释放
+        buffer_ = std::shared_ptr<uint8_t>(raw_buffer, [](uint8_t* p) { av_free(p); });
 
         // 在同一块连续内存上切除三平面首地址（指针语义为 "引用块内存偏移"，不额外拥有内存）
-        data_[0] = rawBuffer; ///< Y 平面
-        data_[1] = rawBuffer + kYSize; ///< U 平面
-        data_[2] = rawBuffer + kYSize + kUvSize; ///< V 平面
+        data_[0] = raw_buffer; ///< Y 平面
+        data_[1] = raw_buffer + y_size; ///< U 平面
+        data_[2] = raw_buffer + y_size + uv_size; ///< V 平面
 
         // 紧凑布局： Y行跨距=宽， UV 行跨距 = UV平面宽
         linesize_[0] = size.width_;
-        linesize_[1] = kUvWidth;
-        linesize_[2] = kUvWidth;
+        linesize_[1] = uv_width;
+        linesize_[2] = uv_width;
     }
 
     // ================= 标志位操作 =================
@@ -155,9 +158,9 @@ struct VideoFrame {
             return false;
         }
 
-        const int kUvWidth = (width_ + 1) / 2;
+        const int uv_width = (width_ + 1) / 2;
         // 行跨距不得小于对应平面宽度，否则纹理上传越界
-        if (linesize_[0] < width_ || linesize_[1] < kUvWidth || linesize_[2] < kUvWidth) {
+        if (linesize_[0] < width_ || linesize_[1] < uv_width || linesize_[2] < uv_width) {
             return false;
         }
 

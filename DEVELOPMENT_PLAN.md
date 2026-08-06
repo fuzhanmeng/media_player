@@ -58,7 +58,7 @@ Qt UI
 4. Node 析构函数不执行 Stop/Join。Pipeline 必须先停止并 Join 全部 Node，之后才能销毁 DAG。
 5. `Start` 按 Sink 到 Source 的逆拓扑顺序执行，保证消费者先启动。
 6. 立即停止固定为：SignalStop 全部 Node -> Abort 全部 Link -> Interrupt 外部 IO -> 唤醒暂停线程 -> Join 全部 Node。
-7. `Node::CloseOutput` 通过 `Link::Close` 传递正常 EOF 并允许下游排空；`Abort` 表示立即停止并丢弃存量。录制使用独立的 Drain 协议，不能复用立即 Abort。
+7. `Node::CloseOutputs` 通过 `Link::Close` 传递正常 EOF 并允许下游排空；`Abort` 表示立即停止并丢弃存量。录制使用独立的 Drain 协议，不能复用立即 Abort。
 8. 控制 API 由一个控制线程串行调用。atomic 只用于工作线程确实需要并发读取的状态，不能用 atomic 掩盖复合状态跃迁竞态。
 9. 一条 Link 默认是一条单生产者、单消费者数据边。广播必须由 Tee 创建多条 Link，不能让两个消费者竞争同一队列。
 10. `Open`、网络读取、音频写入等外部阻塞调用必须接受独立的 cancellation/deadline。控制命令可以串行，但 Stop 不能排在一个无限阻塞的 Open 后面等待。
@@ -101,7 +101,7 @@ VA-API、DMA-BUF/EGL、RTP 和 Jitter Buffer 都是新项目新增能力，必�
 1. 冻结 Queue 的 `Push/Pop/Close/Abort` 一次性语义，容量 0 必须拒绝。
 2. 冻结 Link 的数据接口、类型擦除控制接口和创建权限；Link 只能经 Pipeline 创建并登记。
 3. 重写 `SyncContext`，保证 Pause/Resume/Stop 的状态写入、等待注册和通知遵循同一 mutex/CV 协议。
-4. 重写 `INodeBase`：一次性 Start、固定 ThreadMain、`TickResult`、异常边界、SignalStop、InterruptBlockingIo、Join。
+4. 重写 `INodeBase`：一次性 Start、固定 ThreadMain、`TickResult`、`CloseOutputs()` EOF 契约、异常边界、SignalStop、InterruptBlockingIo、Join。
 5. `INode<InT,OutT>` 只提供零/单输入输出端口便利；多输入/多输出节点直接持有所需端口，不引入 `Link<void>`。
 6. 实现 `Pipeline::CreateLink/EmplaceNode/Start/Pause/Resume/Stop`。D9 不实现媒体探测、Seek 或 Player FSM。
 7. 使用假 Source/Transform/Sink 建正式 CTest，不使用真实 FFmpeg 节点证明并发正确性。

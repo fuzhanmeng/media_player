@@ -349,7 +349,7 @@ PlayerFacade → FSM.Dispatch(event)  （校验合法跃迁）
 
 - **atomic epoch（带外世代号）**：D20 的目标是由 Pipeline 递增 epoch，使 Seek 前产生的队列存量和“在飞”数据可被 Node 判定为过期；epoch 不能替代 Demuxer/Decoder/音频设备的有序 Flush。
 - **Flush**：D20 Seek 后由 Demuxer 在新位置数据之前注入有序的 `kFlush`，Decoder 和音频设备据此清理内部状态。
-- **正常 EOF**：媒体协议可先发送 `kEOF` 供 Decoder drain，随后上游调用 `CloseOutput()`，其底层 `Link::Close()` 禁止继续 Send，但允许下游 Receive 排空；队列耗尽后 Receive 返回 `nullopt`。
+- **正常 EOF**：媒体协议可先发送 `kEOF` 供 Decoder drain，随后 Node 的 `CloseOutputs()` 关闭其输出 Link；底层 `Link::Close()` 禁止继续 Send，但允许下游 Receive 排空；队列耗尽后 Receive 返回 `nullopt`。
 - **立即 Stop**：Pipeline 调用 `Link::Abort()`，唤醒收发双方并丢弃存量，不能与正常 EOF 或录制 Drain 混用。
 
 ---
