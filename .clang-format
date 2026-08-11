@@ -1,20 +1,21 @@
-# ==============================
-# Clang-Format Configuration
-# Derived from Provided Code
-# ==============================
-
 BasedOnStyle: Google
 
-# ------------------------------
-# 缩进（与你的代码一致）
+# ==============================
+# Indent
+# ==============================
+
 IndentWidth: 4
 TabWidth: 4
 UseTab: Never
 ContinuationIndentWidth: 4
 
-# ------------------------------
-# 花括号（K&R / Attach）
+
+# ==============================
+# Braces
+# ==============================
+
 BreakBeforeBraces: Attach
+
 BraceWrapping:
   AfterClass: false
   AfterControlStatement: false
@@ -22,70 +23,81 @@ BraceWrapping:
   AfterFunction: false
   AfterNamespace: false
   AfterStruct: false
-  AfterUnion: false
-  BeforeElse: false
-  BeforeCatch: false
-  IndentBraces: false
 
-# ------------------------------
-# 指针 & 引用（贴变量名）
+
+# ==============================
+# Pointer
+# ==============================
+
 PointerAlignment: Left
 ReferenceAlignment: Left
 
-# ------------------------------
-# 访问修饰符
+
+# ==============================
+# Access
+# ==============================
+
 AccessModifierOffset: -4
 
-# ------------------------------
-# switch / case
+
+# ==============================
+# Switch
+# ==============================
+
 IndentCaseLabels: true
 
-# ------------------------------
-# 行宽
+
+# ==============================
+# Line width
+# ==============================
+
 ColumnLimit: 120
 
-# ------------------------------
-# 控制语句
+
+# ==============================
+# Short statements
+# ==============================
+
 AllowShortIfStatementsOnASingleLine: false
 AllowShortLoopsOnASingleLine: false
-AllowShortFunctionsOnASingleLine: All
+AllowShortFunctionsOnASingleLine: Inline
 
-# ------------------------------
-# 对齐策略（与你代码一致：不强行对齐）
+
+# ==============================
+# Alignment
+# ==============================
+
 AlignAfterOpenBracket: Align
 AlignOperands: false
 AlignConsecutiveAssignments: false
 AlignConsecutiveDeclarations: false
 
-# ------------------------------
-# 参数与调用
-BinPackParameters: true
-BinPackArguments: true
 
-# ------------------------------
-# 构造函数初始化列表
+# ==============================
+# Parameters
+# ==============================
+
+BinPackParameters: false
+BinPackArguments: false
+
+
+# ==============================
+# Constructor
+# ==============================
+
 BreakConstructorInitializersBeforeComma: false
 ConstructorInitializerAllOnOneLineOrOnePerLine: true
 
-# ------------------------------
-# 空格规则
-SpaceBeforeAssignmentOperators: true
-SpaceAfterCStyleCast: false
-SpacesInSquareBrackets: false
-SpacesInContainerLiterals: false
-SpacesBeforeTrailingComments: 1
 
-# ------------------------------
-# 空行
-MaxEmptyLinesToKeep: 1
+# ==============================
+# Comments
+# ==============================
 
-# ------------------------------
-# 注释
 AlignTrailingComments: false
 
+
 # ==============================
-# Naming (clang-format 无法控制)
-# - 函数：PascalCase
-# - 变量：snake_case
-# - 类型：CamelCase
+# Empty line
 # ==============================
+
+MaxEmptyLinesToKeep: 1

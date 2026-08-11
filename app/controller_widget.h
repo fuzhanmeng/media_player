@@ -42,6 +42,6 @@ signals:
     void Seek(int position);
 
 private:
-    QPushButton* play_pause_button_; ///< 播放/暂停按钮
-    QSlider* progress_slider_; ///< 进度条
+    QPushButton* play_pause_button_;  ///< 播放/暂停按钮
+    QSlider* progress_slider_;  ///< 进度条
 };

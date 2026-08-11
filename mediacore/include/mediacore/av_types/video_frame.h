@@ -8,9 +8,10 @@
 #include <array>
 #include <cstdint>
 #include <memory>
-#include <new> // std::bad_alloc
+#include <new>  // std::bad_alloc
 
-#include "frame_size.h" // mediacore::FrameSize：具名宽高，避免相邻 int 参数被写反
+#include "frame_size.h"  // mediacore::FrameSize：具名宽高，避免相邻 int 参数被写反
+#include "mediacore/logger.h"
 
 extern "C" {
 // av_malloc / av_free：FFmpeg 的对齐内存分配 / 释放函数
@@ -56,8 +57,8 @@ inline FrameFlag& operator|=(FrameFlag& a, FrameFlag b) {
 struct VideoFrame {
     // ================= 图像属性 =================
 
-    int width_{0}; ///< 画面宽度（像素）
-    int height_{0}; ///< 画面高度（像素）
+    int width_{0};  ///< 画面宽度（像素）
+    int height_{0};  ///< 画面高度（像素）
 
     // ================= 数据与内存布局（YUV420P，平面存储）=================
 
@@ -97,28 +98,33 @@ struct VideoFrame {
      *       兼容奇数分辨率，防止越界。
      */
     VideoFrame(FrameSize size) : width_(size.width_), height_(size.height_) {
-        const int uv_width = (size.width_ + 1) / 2; ///< UV 平面宽度（色度水平 2:1 下采样，向上取整）
+        const int uv_width = (size.width_ + 1) / 2;  ///< UV 平面宽度（色度水平 2:1 下采样，向上取整）
 
-        const int uv_height = (size.height_ + 1) / 2; ///< UV 平面高度（色度垂直 2:1 下采样，向上取整）
+        const int uv_height = (size.height_ + 1) / 2;  ///< UV 平面高度（色度垂直 2:1 下采样，向上取整）
 
-        const int y_size = size.width_ * size.height_; ///< Y 平面字节数
-        const int uv_size = uv_width * uv_height; ///< 单个色度平面总字节数
-        const int total_size = y_size + uv_size * 2; ///< Y + U + V 总字节数
+        const int y_size = size.width_ * size.height_;  ///< Y 平面字节数
+        const int uv_size = uv_width * uv_height;  ///< 单个色度平面总字节数
+        const int total_size = y_size + uv_size * 2;  ///< Y + U + V 总字节数
 
         // av_malloc 分配 SIMD 对齐内存，失败返回 nullptr
         uint8_t* raw_buffer = static_cast<uint8_t*>(av_mallocz(static_cast<size_t>(total_size)));
 
         if (raw_buffer == nullptr) {
+            LOG_ERROR("VideoFrame allocation failed: {}x{}", size.width_, size.height_);
             throw std::bad_alloc();
         }
 
         // 交给 shared_ptr 托管，自定义删除器保证 av_free 释放
-        buffer_ = std::shared_ptr<uint8_t>(raw_buffer, [](uint8_t* p) { av_free(p); });
+        buffer_ = std::shared_ptr<uint8_t>(raw_buffer, [](uint8_t* p) {
+            LOG_TRACE("VideoFrame buffer released: {}", static_cast<const void*>(p));
+
+            av_free(p);
+        });
 
         // 在同一块连续内存上切除三平面首地址（指针语义为 "引用块内存偏移"，不额外拥有内存）
-        data_[0] = raw_buffer; ///< Y 平面
-        data_[1] = raw_buffer + y_size; ///< U 平面
-        data_[2] = raw_buffer + y_size + uv_size; ///< V 平面
+        data_[0] = raw_buffer;  ///< Y 平面
+        data_[1] = raw_buffer + y_size;  ///< U 平面
+        data_[2] = raw_buffer + y_size + uv_size;  ///< V 平面
 
         // 紧凑布局： Y行跨距=宽， UV 行跨距 = UV平面宽
         linesize_[0] = size.width_;
@@ -168,4 +174,4 @@ struct VideoFrame {
     }
 };
 
-} // namespace mediacore
+}  // namespace mediacore

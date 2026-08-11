@@ -1,65 +1,164 @@
+---
+# 以 Google C++ Style 为主，再叠加项目级质量检查。
+#
+# 核心风格：
+# - google-*：Google 风格检查集合。
+# - readability-identifier-naming：补充 Google 命名规范。
+# - modernize-use-nullptr / modernize-use-override / modernize-avoid-c-arrays：
+#   与 Google 风格要求一致的现代化检查。
+#
+# 质量增强：
+# - bugprone-* / performance-*：不是 Google 规范本体，但对项目稳定性和可维护性有帮助。
 Checks: >
   -*,
-  readability-identifier-naming,
+  google-*,
   modernize-use-nullptr,
   modernize-use-override,
   modernize-avoid-c-arrays,
+  readability-identifier-naming,
   bugprone-*,
-  performance-*,
+  performance-*
 
 WarningsAsErrors: ''
 
 CheckOptions:
-  # ---------- 编译期 / 静态 / 全局常量 ----------
+  # ==================================================
+  # 常量命名
+  #
+  # Google:
+  # constexpr / const 全局常量:
+  #     kCamelCase
+  #
+  # Example:
+  # constexpr int kMaxBufferSize = 1024;
+  # ==================================================
+
   - key: readability-identifier-naming.ConstexprVariablePrefix
-    value: 'k'
+    value: k
+
   - key: readability-identifier-naming.ConstexprVariableCase
     value: CamelCase
-  - key: readability-identifier-naming.StaticConstantPrefix
-    value: 'k'
-  - key: readability-identifier-naming.StaticConstantCase
-    value: CamelCase
-  - key: readability-identifier-naming.ClassConstantPrefix
-    value: 'k'
-  - key: readability-identifier-naming.ClassConstantCase
-    value: CamelCase
+
   - key: readability-identifier-naming.GlobalConstantPrefix
-    value: 'k'
+    value: k
+
   - key: readability-identifier-naming.GlobalConstantCase
     value: CamelCase
 
-  # ---------- 变量 ----------
+  - key: readability-identifier-naming.StaticConstantPrefix
+    value: k
+
+  - key: readability-identifier-naming.StaticConstantCase
+    value: CamelCase
+
+  - key: readability-identifier-naming.ClassConstantPrefix
+    value: k
+
+  - key: readability-identifier-naming.ClassConstantCase
+    value: CamelCase
+
+  # ==================================================
+  # 普通变量和参数
+  #
+  # Google:
+  # lower_snake_case
+  #
+  # Example:
+  # frame_count
+  # packet_queue_size
+  #
+  # clang-tidy 18 使用 lower_case 表达 lower_snake_case。
+  # ==================================================
+
   - key: readability-identifier-naming.VariableCase
     value: lower_case
 
-  # ---------- 成员变量 ----------
+  - key: readability-identifier-naming.ParameterCase
+    value: lower_case
+
+  # ==================================================
+  # 成员变量
+  #
+  # Google:
+  #
+  # class Player {
+  #   int frame_count_;
+  # };
+  # ==================================================
+
   - key: readability-identifier-naming.MemberCase
     value: lower_case
-  - key: readability-identifier-naming.MemberSuffix
-    value: '_'
 
-  # ---------- 函数 ----------
+  - key: readability-identifier-naming.MemberSuffix
+    value: _
+
+  # ==================================================
+  # 函数
+  #
+  # Google:
+  #
+  # void StartPlayer();
+  # bool OpenStream();
+  # ==================================================
+
   - key: readability-identifier-naming.FunctionCase
     value: CamelCase
 
-  # ---------- 类 / 结构体 ----------
+  # ==================================================
+  # 类 / struct
+  #
+  # Google:
+  #
+  # class PlayerFacade;
+  # struct VideoFrame;
+  # ==================================================
+
   - key: readability-identifier-naming.ClassCase
     value: CamelCase
+
   - key: readability-identifier-naming.StructCase
     value: CamelCase
 
-  # ---------- 命名空间 ----------
+  # ==================================================
+  # namespace
+  #
+  # Google:
+  #
+  # namespace mediacore {
+  #
+  # }
+  # ==================================================
+
   - key: readability-identifier-naming.NamespaceCase
     value: lower_case
 
-  # ---------- 枚举 ----------
+  # ==================================================
+  # enum
+  #
+  # Google:
+  #
+  # enum class State {
+  #   kIdle,
+  #   kPlaying
+  # };
+  # ==================================================
+
   - key: readability-identifier-naming.EnumCase
     value: CamelCase
+
   - key: readability-identifier-naming.EnumConstantPrefix
-    value: 'k'
+    value: k
+
   - key: readability-identifier-naming.EnumConstantCase
     value: CamelCase
 
-  # ---------- 宏 ----------
+  # ==================================================
+  # Macro
+  #
+  # Google:
+  #
+  # #define LOG_INFO(...)
+  # ==================================================
+
   - key: readability-identifier-naming.MacroDefinitionCase
     value: UPPER_CASE

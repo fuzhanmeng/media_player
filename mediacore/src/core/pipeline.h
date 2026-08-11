@@ -42,26 +42,67 @@
 #include "core/inode.h"
 #include "core/link.h"
 #include "core/sync_context.h"
+#include "mediacore/logger.h"
 
 namespace mediacore {
 
 /** @brief Pipeline 的一次性生命周期状态 */
 enum class PipelineState : std::uint8_t {
-    kBuilding, ///< 可以创建、连接 Node 和 Link
-    kStarting, ///< 正在按反向登记顺序启动 Node
-    kRunning, ///< 全部 Node 已启动，拓扑不可再修改
-    kStopping, ///< 正在停止，或仍有线程尚未成功 Join
-    kStopped, ///< 全部 Node 已 Join，Pipeline 不可重新启动
+    kBuilding,  ///< 可以创建、连接 Node 和 Link
+    kStarting,  ///< 正在按反向登记顺序启动 Node
+    kRunning,  ///< 全部 Node 已启动，拓扑不可再修改
+    kStopping,  ///< 正在停止，或仍有线程尚未成功 Join
+    kStopped,  ///< 全部 Node 已 Join，Pipeline 不可重新启动
 };
 
 /** @brief Pipeline 启动结果 */
 enum class PipelineStartResult : std::uint8_t {
-    kStarted, ///< 全部 Node 启动成功
-    kInvalidState, ///< Pipeline 不处于 Building 状态
-    kNoNodes, ///< 尚未创建任何 Node，Pipeline 保持 Building
-    kNodeStartFailed, ///< 一个 Node 启动失败，Stop 回滚成功
-    kRollbackFailed, ///< 一个 Node 启动失败，并且至少一个回滚步骤失败
+    kStarted,  ///< 全部 Node 启动成功
+    kInvalidState,  ///< Pipeline 不处于 Building 状态
+    kNoNodes,  ///< 尚未创建任何 Node，Pipeline 保持 Building
+    kNodeStartFailed,  ///< 一个 Node 启动失败，Stop 回滚成功
+    kRollbackFailed,  ///< 一个 Node 启动失败，并且至少一个回滚步骤失败
 };
+
+/**
+ * @brief 将 Pipeline 生命周期状态转换为日志可读字符串
+ */
+inline const char* PipelineStateToString(PipelineState state) {
+    switch (state) {
+        case PipelineState::kBuilding:
+            return "Building";
+        case PipelineState::kStarting:
+            return "Starting";
+        case PipelineState::kRunning:
+            return "Running";
+        case PipelineState::kStopping:
+            return "Stopping";
+        case PipelineState::kStopped:
+            return "Stopped";
+    }
+
+    return "Unknown";
+}
+
+/**
+ * @brief 将 Pipeline 启动结果转换为日志可读字符串
+ */
+inline const char* PipelineStartResultToString(PipelineStartResult result) {
+    switch (result) {
+        case PipelineStartResult::kStarted:
+            return "Started";
+        case PipelineStartResult::kInvalidState:
+            return "InvalidState";
+        case PipelineStartResult::kNoNodes:
+            return "NoNodes";
+        case PipelineStartResult::kNodeStartFailed:
+            return "NodeStartFailed";
+        case PipelineStartResult::kRollbackFailed:
+            return "RollbackFailed";
+    }
+
+    return "Unknown";
+}
 
 /**
  * @class Pipeline
@@ -88,21 +129,31 @@ public:
     explicit Pipeline(NodeThreadFactory thread_factory)
         : sync_ctx_(std::make_shared<SyncContext>()), thread_factory_(std::move(thread_factory)) {
         if (!thread_factory_) {
+            LOG_ERROR("Pipeline construction failed: empty NodeThreadFactory");
             throw std::invalid_argument("Pipeline requires a non-empty NodeThreadFactory");
         }
+
+        LOG_INFO("Pipeline constructed");
     }
 
     /**
      * @brief 停止并 Join 全部 Node 后销毁 Pipeline
      */
     ~Pipeline() {
+        LOG_INFO("Pipeline destroying, current state {}", PipelineStateToString(state_));
+
         const bool stop_succeeded = Stop();
-        (void)stop_succeeded;
+        if (!stop_succeeded) {
+            LOG_WARN("Pipeline stop during destruction completed with recoverable errors, state {}",
+                     PipelineStateToString(state_));
+        }
 
         // Stop 返回 false 也可能只是 Abort 清缓存失败；只有状态不是 kStopped 才表示仍有线程未 Join
         if (state_ != PipelineState::kStopped) {
+            LOG_ERROR("Pipeline destruction failed: state is {}, terminating", PipelineStateToString(state_));
             std::terminate();
         }
+        LOG_INFO("Pipeline destroyed");
     }
 
     // 禁止拷贝构造/赋值 移动构造/赋值
@@ -145,8 +196,12 @@ public:
 
         // make_shared 创建 Link 对象和 shared_ptr 控制块；link 是管理该对象的智能指针
         auto link = std::make_shared<Link<T>>(capacity, LinkCreationToken{});
-
+        if (!link) {
+            LOG_ERROR("Create link failed");
+        }
         links_.emplace_back(link);
+
+        LOG_DEBUG("Pipeline link created, capacity {}, total links {}", capacity, links_.size());
         return link;
     }
 
@@ -198,6 +253,7 @@ public:
         // nodes_ 接管 unique_ptr；返回值只是对同一个 Node 对象的借用引用
         NodeT& ref = *node;
         nodes_.emplace_back(std::move(node));
+        LOG_DEBUG("Pipeline node emplaced: {}", ref.GetName());
         return ref;
     }
 
@@ -209,26 +265,49 @@ public:
      * 任一 Node 启动失败时，Stop() 会停止并 Join 已创建的线程，Pipeline 启动后不能再次调用 Start()
      */
     PipelineStartResult Start() {
+        LOG_INFO("Pipeline start requested, state {}, nodes {}, links {}",
+                 PipelineStateToString(state_),
+                 nodes_.size(),
+                 links_.size());
+
         // 只有 Building 状态可以启动
         if (state_ != PipelineState::kBuilding) {
+            LOG_WARN("Pipeline start rejected: state is {}", PipelineStateToString(state_));
+
             return PipelineStartResult::kInvalidState;
         }
 
         // 空图不启动，也不改变状态，调用方仍可继续组图
         if (nodes_.empty()) {
+            LOG_WARN("Pipeline start rejected: no nodes");
+
             return PipelineStartResult::kNoNodes;
         }
 
         state_ = PipelineState::kStarting;
+        LOG_INFO("Pipeline state changed: Building -> Starting");
 
         // 反向启动：登记顺序是 Source -> Sink，因此这里先启动消费者
         for (auto it = nodes_.rbegin(); it != nodes_.rend(); ++it) {
-            if ((*it)->Start(thread_factory_) != NodeStartResult::kStarted) {
+            LOG_DEBUG("Starting node '{}'", (*it)->GetName());
+
+            const NodeStartResult result = (*it)->Start(thread_factory_);
+
+            // 如果启动失败
+            if (result != NodeStartResult::kStarted) {
+                LOG_ERROR("Node '{}' failed to start: {}", (*it)->GetName(), NodeStartResultToString(result));
+
                 // 任何一个 Node 创建线程失败，都回滚已经启动的 Node
-                return Stop() ? PipelineStartResult::kNodeStartFailed : PipelineStartResult::kRollbackFailed;
+                const PipelineStartResult rollback_result =
+                    Stop() ? PipelineStartResult::kNodeStartFailed : PipelineStartResult::kRollbackFailed;
+
+                LOG_ERROR("Pipeline start rollback result: {}", PipelineStartResultToString(rollback_result));
+
+                return rollback_result;
             }
         }
         state_ = PipelineState::kRunning;
+        LOG_INFO("Pipeline started");
         return PipelineStartResult::kStarted;
     }
 
@@ -246,21 +325,27 @@ public:
      * @note 析构函数会调用本函数，因此本函数不抛出异常，可处理的异常会转换为 false，停止流程仍会继续
      */
     bool Stop() noexcept {
+        LOG_INFO("Pipeline stop requested, state {}", PipelineStateToString(state_));
+
         // 已经完成停止时，重复调用返回第一次停止结果
         if (state_ == PipelineState::kStopped) {
+            LOG_DEBUG("Pipeline stop skipped: already stopped");
             return stop_succeeded_;
         }
 
         // 只允许一次停止流程；控制接口本身不支持并发调用
         if (stop_in_progress_) {
+            LOG_WARN("Pipeline stop rejected: stop already in progress");
             return false;
         }
 
         stop_in_progress_ = true;
         state_ = PipelineState::kStopping;
+        LOG_INFO("Pipeline state changed to Stopping");
 
         // 1. 先给所有 Node 设置停止标志，包括尚未创建线程的 Node
         for (const auto& node : nodes_) {
+            LOG_DEBUG("Signaling stop to node '{}' ", node->GetName());
             node->SignalStop();
         }
 
@@ -270,12 +355,14 @@ public:
             try {
                 link->Abort();
             } catch (...) {
+                LOG_ERROR("Pipeline stop failed to abort a link: exception thrown");
                 success = false;
             }
         }
 
         // 3. 中断 Link 之外的阻塞 I/O，例如 av_read_frame() 或 socket recv()
         for (auto& node : nodes_) {
+            LOG_DEBUG("Interrupting blocking I/O for node '{}' ", node->GetName());
             node->InterruptBlockingIo();
         }
 
@@ -283,6 +370,7 @@ public:
         try {
             sync_ctx_->WakeAllPausedThreads();
         } catch (...) {
+            LOG_ERROR("Pipeline stop failed to wake paused threads: exception thrown");
             success = false;
         }
 
@@ -290,8 +378,11 @@ public:
         bool all_nodes_joined = true;
         for (const auto& node : nodes_) {
             const NodeJoinResult result = node->Join();
+            LOG_DEBUG("Node '{}' join result: {}", node->GetName(), NodeJoinResultToString(result));
 
             if (result == NodeJoinResult::kCannotJoinSelf || result == NodeJoinResult::kJoinFailed) {
+                LOG_ERROR("Node '{}' failed to join: {}", node->GetName(), NodeJoinResultToString(result));
+
                 success = false;
                 all_nodes_joined = false;
             }
@@ -301,12 +392,19 @@ public:
 
         // 只要有一个线程没有 Join，就不能进入 kStopped，也不能析构 Pipeline
         if (!all_nodes_joined) {
+            LOG_ERROR("Pipeline stop incomplete: at least one node thread was not joined");
             return false;
         }
 
         // 到这里时全部线程都已退出并回收，Node 和 Link 可以安全析构
         state_ = PipelineState::kStopped;
         stop_succeeded_ = success;
+        if (stop_succeeded_) {
+            LOG_INFO("Pipeline stopped");
+        } else {
+            LOG_WARN("Pipeline stopped with recoverable errors");
+        }
+
         return stop_succeeded_;
     }
 
@@ -318,11 +416,15 @@ public:
      * Node 不会被强行中断；它会在 Tick() 返回并进入下一轮 WaitWhilePaused() 时暂停
      */
     bool Pause() {
+        LOG_INFO("Pipeline pause requested, state {}", PipelineStateToString(state_));
+
         if (state_ != PipelineState::kRunning) {
+            LOG_WARN("Pipeline pause rejected: state is {}", PipelineStateToString(state_));
             return false;
         }
 
         sync_ctx_->SetPaused();
+        LOG_INFO("Pipeline paused");
         return true;
     }
 
@@ -331,11 +433,16 @@ public:
      * @return Pipeline 状态为 kRunning 时返回 true，否则返回 false
      */
     bool Resume() {
+        LOG_INFO("Pipeline resume requested, state {}", PipelineStateToString(state_));
+
         if (state_ != PipelineState::kRunning) {
+            LOG_WARN("Pipeline resume rejected: state is {}", PipelineStateToString(state_));
             return false;
         }
 
         sync_ctx_->SetRunning();
+        LOG_INFO("Pipeline resumed");
+
         return true;
     }
 
@@ -370,6 +477,8 @@ private:
      */
     void RequireBuilding(const char* message) const {
         if (state_ != PipelineState::kBuilding) {
+            LOG_ERROR(
+                "Pipeline topology mutation rejected: state {}, reason: {}", PipelineStateToString(state_), message);
             throw std::logic_error(message);
         }
     }
@@ -396,4 +505,4 @@ private:
     bool stop_succeeded_{false};
 };
 
-} // namespace mediacore
+}  // namespace mediacore

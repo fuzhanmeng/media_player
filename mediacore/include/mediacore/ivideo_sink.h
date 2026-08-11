@@ -29,4 +29,4 @@ public:
      */
     virtual void OnReceiveVideoFrame(std::shared_ptr<VideoFrame> video_frame) = 0;
 };
-} // namespace mediacore
+}  // namespace mediacore

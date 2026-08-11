@@ -28,11 +28,11 @@ namespace mediacore {
  * @brief 帧标志位，支持位运算组合
  * @details 用于标记音视频帧的元信息和控制信令
  */
-enum class AVFrameFlag : uint32_t{
-    kNone = 0, ///< 无标志（默认）
-    kKeyFrame = 1 << 0, ///< 关键帧（I/IDR 帧，可独立解码，无需参考其他帧）
-    kEOF = 1 << 1, ///< 流结束标记（End Of File，上游关闭，通知下游停止等待）
-    kFlush = 1 << 2, ///< Seek 后刷新标记（通知解码器清空状态，丢弃旧帧）
+enum class AVFrameFlag : uint32_t {
+    kNone = 0,  ///< 无标志（默认）
+    kKeyFrame = 1 << 0,  ///< 关键帧（I/IDR 帧，可独立解码，无需参考其他帧）
+    kEOF = 1 << 1,  ///< 流结束标记（End Of File，上游关闭，通知下游停止等待）
+    kFlush = 1 << 2,  ///< Seek 后刷新标记（通知解码器清空状态，丢弃旧帧）
 };
 
 /**
@@ -55,7 +55,9 @@ constexpr AVFrameFlag operator&(AVFrameFlag a, AVFrameFlag b) {
  * @brief 位非运算：翻转标志
  * @details 用法：~AVFrameFlag::kKeyFrame（生成除 kKeyFrame 外的所有位）
  */
-constexpr AVFrameFlag operator~(AVFrameFlag a) { return static_cast<AVFrameFlag>(~static_cast<uint32_t>(a)); }
+constexpr AVFrameFlag operator~(AVFrameFlag a) {
+    return static_cast<AVFrameFlag>(~static_cast<uint32_t>(a));
+}
 
 /**
  * @brief 位或赋值：追加标志
@@ -75,4 +77,4 @@ inline AVFrameFlag& operator&=(AVFrameFlag& a, AVFrameFlag b) {
     return a;
 }
 
-} // namespace mediacore
+}  // namespace mediacore

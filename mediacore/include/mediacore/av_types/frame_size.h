@@ -20,7 +20,7 @@ namespace mediacore {
  *          在需要时校验，本类型不强制约束，保持 "零成本值语义"
  */
 struct FrameSize {
-    int width_{0};   ///< 画面宽度（像素）
+    int width_{0};  ///< 画面宽度（像素）
     int height_{0};  ///< 画面高度（像素）
 
     /// @brief 判断尺寸是否为正（可用于构造有效画面）

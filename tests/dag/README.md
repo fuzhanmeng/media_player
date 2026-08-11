@@ -1,7 +1,7 @@
-# D9 DAG 生命周期测试
+# 项目测试入口
 
-这些测试直接包含 `mediacore/src` 下的正式 DAG 头文件，不链接 FFmpeg、Qt 或真实媒体
-节点。测试使用假 Source、Transform 和 Sink，重点验证线程生命周期、阻塞解除和停止顺序。
+当前测试入口直接包含 `mediacore/src` 下的正式 DAG 头文件，不链接 FFmpeg、Qt 或真实媒体
+节点。目前已有用例使用假 Source、Transform 和 Sink，重点验证线程生命周期、阻塞解除和停止顺序。
 
 ## 构建和运行
 
@@ -19,8 +19,8 @@ ctest --test-dir /tmp/ai-media-player-d9 --output-on-failure
 也可以直接运行测试程序。省略参数时运行全部用例，或使用 `--case` 运行一个用例：
 
 ```bash
-/tmp/ai-media-player-d9/tests/dag/d9_dag_lifecycle_test
-/tmp/ai-media-player-d9/tests/dag/d9_dag_lifecycle_test \
+/tmp/ai-media-player-d9/tests/dag/all_tests
+/tmp/ai-media-player-d9/tests/dag/all_tests \
     --case stop_while_sending
 ```
 

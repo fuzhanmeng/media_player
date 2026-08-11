@@ -12,12 +12,14 @@
 #pragma once
 
 #include <condition_variable>
-#include <cstddef> // std::size_t
+#include <cstddef>  // std::size_t
 #include <mutex>
 #include <optional>
 #include <queue>
-#include <stdexcept> // 标准异常类
-#include <utility> // std::move / std::forward
+#include <stdexcept>  // 标准异常类
+#include <utility>  // std::move / std::forward
+
+#include "mediacore/logger.h"
 
 namespace mediacore {
 
@@ -37,7 +39,10 @@ public:
      */
     explicit ThreadSafeQueue(std::size_t capacity) : capacity_(capacity) {
         if (capacity_ == 0) {
+            LOG_ERROR("ThreadSafeQueue construction failed: capacity must be greater than zero");
             throw std::invalid_argument("ThreadSafeQueue capacity must be greater than zero");
+        } else {
+            LOG_DEBUG("ThreadSafeQueue constructed, capacity {}", capacity_);
         }
     }
 
@@ -66,15 +71,18 @@ public:
 
         // 被唤醒不等于可以写入：Close/Abort 的通知同样会唤醒本线程
         if (closed_ || aborted_) {
+            LOG_DEBUG("ThreadSafeQueue push rejected: closed {}, aborted {}", closed_, aborted_);
             return false;
         }
 
         // 在锁保护下入队，保证多个生产者不会同时修改 queue_
         queue_.push(std::move(value));
+        const std::size_t size_after_push = queue_.size();
 
         // 修改共享数据后先解锁，再通知消费者，避免被唤醒线程立刻阻塞在同一把 mutex 上
         lock.unlock();
         not_empty_cv_.notify_one();
+        LOG_TRACE("ThreadSafeQueue push completed, size {}/{}", size_after_push, capacity_);
         return true;
     }
 
@@ -92,21 +100,26 @@ public:
 
         // 醒来后检查是否强制终止
         if (aborted_) {
+            LOG_DEBUG("ThreadSafeQueue pop aborted");
             return std::nullopt;
         }
 
         // 非 Abort 情况下，空队列只可能表示已 Close 且存量已经排空
         if (queue_.empty()) {
+            LOG_DEBUG("ThreadSafeQueue pop reached end: queue closed and empty");
             return std::nullopt;
         }
 
         // 取出元素
         T value = std::move(queue_.front());
         queue_.pop();
+        const std::size_t size_after_pop = queue_.size();
 
         // 唤醒一个生产者
         lock.unlock();
         not_full_cv_.notify_one();
+
+        LOG_TRACE("ThreadSafeQueue pop completed, size {}", size_after_pop);
         return value;
     }
 
@@ -116,14 +129,18 @@ public:
      * @note 幂等，用于正常 EOF，不用于用户点击停止或错误退出
      */
     void Close() {
+        std::size_t remaining = 0;
+
         {
             std::lock_guard<std::mutex> lock(mutex_);
             closed_ = true;
+            remaining = queue_.size();
         }
 
         // 唤醒所有因阻塞等待的线程
         not_full_cv_.notify_all();
         not_empty_cv_.notify_all();
+        LOG_INFO("ThreadSafeQueue closed, remaining items {}", remaining);
     }
 
     /**
@@ -132,10 +149,13 @@ public:
      * @note 幂等；Abort 后队列不可恢复，只用于立即停止
      */
     void Abort() {
+        std::size_t discarded_count = 0;
+
         // 第一步：只做不可省略的同步操作，先让所有线程都能观察到中止状态
         {
             std::lock_guard<std::mutex> lock(mutex_);
             aborted_ = true;
+            discarded_count = queue_.size();
         }
 
         // 第二步：立即唤醒满队列上的发送者和空队列上的接收者
@@ -148,6 +168,7 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             discarded.swap(queue_);
         }
+        LOG_INFO("ThreadSafeQueue aborted, discarded items {}", discarded_count);
     }
 
     /**
@@ -200,4 +221,4 @@ private:
     /// 立即中止标志；为 true 时 Push 和 Pop 都立即失败
     bool aborted_{false};
 };
-} // namespace mediacore
+}  // namespace mediacore

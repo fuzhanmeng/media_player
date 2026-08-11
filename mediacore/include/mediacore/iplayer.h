@@ -79,4 +79,4 @@ public:
 private:
     // member variables
 };
-} // namespace mediacore
+}  // namespace mediacore

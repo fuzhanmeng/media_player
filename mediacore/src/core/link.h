@@ -14,11 +14,12 @@
  */
 #pragma once
 
-#include <cstddef> // std::size_t
+#include <cstddef>  // std::size_t
 #include <optional>
 #include <type_traits>
-#include <utility> // std::move
+#include <utility>  // std::move
 
+#include "mediacore/logger.h"
 #include "utils/thread_safe_queue.h"
 
 namespace mediacore {
@@ -104,13 +105,14 @@ public:
     Link(std::size_t capacity, LinkCreationToken token) : queue_(capacity) {
         // 通行证没有运行时数据；构造函数能够收到它，就说明调用方已经通过创建权限检查
         (void)token;
+        LOG_INFO("Link constructed, capacity {}", capacity);
     }
 
     /**
      * @brief 销毁数据边
      * @note 销毁前 Pipeline 必须已经 Join 所有访问该 Link 的 Node
      */
-    ~Link() override = default;
+    ~Link() override { LOG_INFO("Link destroyed"); }
 
     // Link 内嵌不可拷贝/移动的 ThreadSafeQueue，故自身同样不可拷贝/移动；
     // 跨节点共享一律通过 std::shared_ptr<Link<T>> 完成
@@ -125,20 +127,29 @@ public:
      * @param item 待发送的数据；成功时移动到队列中
      * @return true 成功送入； false 管道已 Close / Abort，拒绝接收
      */
-    bool Send(T item) { return queue_.Push(std::move(item)); }
+    bool Send(T item) {
+        LOG_TRACE("Link send requested");
+        return queue_.Push(std::move(item));
+    }
 
     /**
      * @brief 由下游接收一个数据项，队列为空时等待数据或结束通知
      * @return 有值 (has_value) 表示收到数据；nullopt 表示数据已枯竭 (EOF) 或管道已被强制 Abort
      */
-    std::optional<T> Receive() { return queue_.Pop(); }
+    std::optional<T> Receive() {
+        LOG_TRACE("Link receive requested");
+        return queue_.Pop();
+    }
 
     /**
      * @brief 由上游正常关闭发送端并向下游传播 EOF
      * @details 关闭后 Send() 返回 false，队列中的存量仍可由下游 Receive() 排空
      * @note 上游 Node 正常结束时调用；用户停止或错误退出使用 Pipeline 的 Abort()
      */
-    void Close() { queue_.Close(); }
+    void Close() {
+        LOG_INFO("Link close requested");
+        queue_.Close();
+    }
 
     /**
      * @brief 返回当前缓存元素数
@@ -168,6 +179,7 @@ private:
      */
     void Abort() override {
         // ThreadSafeQueue 先发布中止状态并通知等待线程，再处理缓存，保证 Stop 可以继续 Join
+        LOG_INFO("Link abort requested");
         queue_.Abort();
     }
 
@@ -175,4 +187,4 @@ private:
     ThreadSafeQueue<T> queue_;
 };
 
-} // namespace mediacore
+}  // namespace mediacore

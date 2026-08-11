@@ -9,6 +9,8 @@
 #include <QPushButton>
 #include <QSlider>
 
+#include "mediacore/logger.h"
+
 ControllerWidget::ControllerWidget(QWidget* parent)
     : QWidget(parent),
       play_pause_button_(new QPushButton("Play", this)),
@@ -22,8 +24,17 @@ ControllerWidget::ControllerWidget(QWidget* parent)
 
     // 按钮的 clicked(bool check) 我们不关心 checked 参数，
     // 用lambda 显示表达式 "只是转发动作"，而不是业务判断
-    connect(play_pause_button_, &QPushButton::clicked, this, [this]() { emit PlayPauseClicked(); });
+    connect(play_pause_button_, &QPushButton::clicked, this, [this]() {
+        LOG_INFO("Play / Pause button clicked");
+        emit PlayPauseClicked();
+    });
 
     // sliderReleased()无参，Seek(int) 需要当前位置，必须在 lambda 手动读取 progress_slider_->value
-    connect(progress_slider_, &QSlider::sliderReleased, this, [this]() { emit Seek(progress_slider_->value()); });
+    connect(progress_slider_, &QSlider::sliderReleased, this, [this]() {
+        const int position = progress_slider_->value();
+        LOG_INFO("Progress slider released, position {}", position);
+        emit Seek(position);
+    });
+
+    LOG_INFO("ControllerWidget constructed");
 }

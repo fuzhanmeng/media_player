@@ -8,11 +8,11 @@
 #pragma once
 
 /// Qt 对 OpenGL 的封装
-#include <QOpenGLBuffer> /// GPU 显存缓冲的封装（VBO/EBO）
-#include <QOpenGLFunctions_3_3_Core> /// OpenGL 3.3 核心版的全部函数入口
-#include <QOpenGLShaderProgram> /// 着色器程序的 RAII 封装
-#include <QOpenGLVertexArrayObject> /// 顶点属性布局的封装，记录"顶点数据怎么解析"
-#include <QOpenGLWidget> /// 能渲染 OpenGL 的窗口控件
+#include <QOpenGLBuffer>  /// GPU 显存缓冲的封装（VBO/EBO）
+#include <QOpenGLFunctions_3_3_Core>  /// OpenGL 3.3 核心版的全部函数入口
+#include <QOpenGLShaderProgram>  /// 着色器程序的 RAII 封装
+#include <QOpenGLVertexArrayObject>  /// 顶点属性布局的封装，记录"顶点数据怎么解析"
+#include <QOpenGLWidget>  /// 能渲染 OpenGL 的窗口控件
 #include <memory>
 #include <mutex>
 
@@ -82,8 +82,9 @@ protected:
 private:
     /**
      * @brief 编译链接 YUV -> RGB 的顶点 + 片段着色器
+     * @return true 表示着色器编译链接成功，false 表示失败
      */
-    void BuildShader();
+    bool BuildShader();
 
     /**
      * @brief 上传全屏矩形顶点（位置 + 纹理坐标） 到 VAO/VBO/EBO
@@ -106,18 +107,18 @@ private:
     // ================= 跨线程共享数据（信箱）=================
 
     /// 保护 currentFrame_ 的跨线程交接，后台线程写入 / GUI 线程 paintGL 读取
-    std::mutex frameMutex_;
+    std::mutex frame_mutex_;
 
     /// 信箱：仅保留最新的一帧，旧帧会被新帧覆盖
-    std::shared_ptr<mediacore::VideoFrame> currentFrame_{nullptr};
+    std::shared_ptr<mediacore::VideoFrame> current_frame_{nullptr};
 
     // ================= GPU 渲染资源 =================
 
     /// 着色器程序:顶点 + 片段链接后的整体
-    QOpenGLShaderProgram shaderProgram_;
+    QOpenGLShaderProgram shader_program_;
 
     /// Y/U/V 三平面对应的纹理句柄
-    GLuint textureIds_[3]{0, 0, 0};
+    std::array<GLuint, 3> texture_ids_{0, 0, 0};
 
     /// 顶点数组对象：记录顶点属性布局
     QOpenGLVertexArrayObject vao_;
@@ -129,9 +130,12 @@ private:
     QOpenGLBuffer ebo_{QOpenGLBuffer::IndexBuffer};
 
     /// 纹理显存是否已经首次分配： false 时用 glTexImage2D 分配, true 时使用 glTexSubImage2D 更新
-    bool textureAllocated_{false};
+    bool texture_allocated_{false};
+
+    /// 着色器程序是否已成功编译链接
+    bool shader_ready_{false};
 
     /// 上一帧分辨率，用于检测尺寸变化触发纹理重新分配
-    int lastFrameWidth_{0};
-    int lastFrameHeight_{0};
+    int last_frame_width_{0};
+    int last_frame_height_{0};
 };

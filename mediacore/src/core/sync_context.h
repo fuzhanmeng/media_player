@@ -17,6 +17,8 @@
 #include <cstdint>
 #include <mutex>
 
+#include "mediacore/logger.h"
+
 namespace mediacore {
 
 class Pipeline;
@@ -29,9 +31,23 @@ class Pipeline;
  * Pipeline 的 Building、Running、Stopping 等状态由 PipelineState 单独管理
  */
 enum class PipelineRunState {
-    kRunning, ///< Node 可以继续执行 Tick()
-    kPaused, ///< Node 在当前 Tick() 返回后，于下一次 Tick() 前等待
+    kRunning,  ///< Node 可以继续执行 Tick()
+    kPaused,  ///< Node 在当前 Tick() 返回后，于下一次 Tick() 前等待
 };
+
+/**
+ * @brief 将运行门控状态转换为日志可读字符串
+ */
+inline const char* PipelineRunStateToString(PipelineRunState state) {
+    switch (state) {
+        case PipelineRunState::kRunning:
+            return "Running";
+        case PipelineRunState::kPaused:
+            return "Paused";
+    }
+
+    return "Unknown";
+}
 
 /**
  * @class SyncContext
@@ -111,6 +127,7 @@ private:
             state_.store(PipelineRunState::kRunning);
         }
         pause_cv_.notify_all();
+        LOG_INFO("SyncContext state set to {}", PipelineRunStateToString(PipelineRunState::kRunning));
     }
 
     /**
@@ -119,8 +136,11 @@ private:
      *          它在下一次工作循环进入 WaitWhilePaused() 时等待。
      */
     void SetPaused() {
-        std::lock_guard<std::mutex> lock(pause_mutex_);
-        state_.store(PipelineRunState::kPaused);
+        {
+            std::lock_guard<std::mutex> lock(pause_mutex_);
+            state_.store(PipelineRunState::kPaused);
+        }
+        LOG_INFO("SyncContext state set to {}", PipelineRunStateToString(PipelineRunState::kPaused));
     }
 
     /**
@@ -132,6 +152,7 @@ private:
         // 与 WaitWhilePaused() 使用同一把锁，保证通知和等待注册的顺序清晰
         std::lock_guard<std::mutex> lock(pause_mutex_);
         pause_cv_.notify_all();
+        LOG_DEBUG("SyncContext woke all paused threads");
     }
 
     /**
@@ -141,7 +162,9 @@ private:
      */
     std::uint64_t BumpEpoch() noexcept {
         // fetch_add 返回递增前的值，因此加 1 后才是本次 Seek 对应的新 epoch
-        return epoch_.fetch_add(1) + 1;
+        const std::uint64_t next_epoch = epoch_.fetch_add(1) + 1;
+        LOG_INFO("SyncContext epoch bumped to {}", next_epoch);
+        return next_epoch;
     }
 
     /// 运行/暂停快照；写入时持有 pause_mutex_，读取可由 Node 并发执行
@@ -157,4 +180,4 @@ private:
     std::condition_variable pause_cv_;
 };
 
-} // namespace mediacore
+}  // namespace mediacore

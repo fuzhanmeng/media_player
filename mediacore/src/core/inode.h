@@ -23,20 +23,21 @@
 #pragma once
 
 #include <atomic>
-#include <cassert> // 运行时断言
-#include <cstdint> // 固定大小整数类型
-#include <exception> // 异常基类
+#include <cassert>  // 运行时断言
+#include <cstdint>  // 固定大小整数类型
+#include <exception>  // 异常基类
 #include <functional>
 #include <memory>
 #include <optional>
-#include <stdexcept> // 标准异常类
+#include <stdexcept>  // 标准异常类
 #include <string>
 #include <thread>
-#include <utility> // std::move
+#include <utility>  // std::move
 
 // 私有头：路径相对 mediacore/src（PRIVATE include 目录），不对外暴露
 #include "core/link.h"
 #include "core/sync_context.h"
+#include "mediacore/logger.h"
 
 namespace mediacore {
 
@@ -63,11 +64,11 @@ using NodeThreadFactory = std::function<std::thread(const std::string&, NodeThre
  * @details std::uint8_t 指定枚举的底层类型
  */
 enum class NodeState : std::uint8_t {
-    kCreated, ///< Node 已经被构造，但是还未创建工作线程
-    kRunning, ///< Node 线程正在创建、执行或者即将退出
-    kStopRequested, ///< Pipeline 已发出停止请求
-    kFinished, ///< 工作线程已经退出，尚未 Join
-    kJoined, ///< 工作线程已经 Join，Node 可以析构
+    kCreated,  ///< Node 已经被构造，但是还未创建工作线程
+    kRunning,  ///< Node 线程正在创建、执行或者即将退出
+    kStopRequested,  ///< Pipeline 已发出停止请求
+    kFinished,  ///< 工作线程已经退出，尚未 Join
+    kJoined,  ///< 工作线程已经 Join，Node 可以析构
 };
 
 /**
@@ -75,10 +76,10 @@ enum class NodeState : std::uint8_t {
  * @brief Node Start() 的执行结果
  */
 enum class NodeStartResult : std::uint8_t {
-    kStarted, ///< 工作线程创建成功
-    kAlreadyStarted, ///< Node 已经启动或已经结束，不能再次启动
-    kStopAlreadyRequested, ///< Node 在启动前已经收到停止请求
-    kThreadCreationFailed, ///< 线程工厂抛出异常或返回了不可 Join 的线程
+    kStarted,  ///< 工作线程创建成功
+    kAlreadyStarted,  ///< Node 已经启动或已经结束，不能再次启动
+    kStopAlreadyRequested,  ///< Node 在启动前已经收到停止请求
+    kThreadCreationFailed,  ///< 线程工厂抛出异常或返回了不可 Join 的线程
 };
 
 /**
@@ -86,11 +87,11 @@ enum class NodeStartResult : std::uint8_t {
  * @brief Node 工作线程回收 Join 的结果
  */
 enum class NodeJoinResult : std::uint8_t {
-    kJoined, ///< 成功回收线程
-    kNoThread, ///< Node 没有创建过线程
-    kAlreadyJoined, ///< 工作线程已经被回收
-    kCannotJoinSelf, ///< 工作线程尝试 Join 自己，禁止执行
-    kJoinFailed, ///< std::thread::join() 执行失败
+    kJoined,  ///< 成功回收线程
+    kNoThread,  ///< Node 没有创建过线程
+    kAlreadyJoined,  ///< 工作线程已经被回收
+    kCannotJoinSelf,  ///< 工作线程尝试 Join 自己，禁止执行
+    kJoinFailed,  ///< std::thread::join() 执行失败
 };
 
 /**
@@ -98,10 +99,10 @@ enum class NodeJoinResult : std::uint8_t {
  * @brief 派生 Node 执行一次 Tick() 的结果
  */
 enum class TickResult : std::uint8_t {
-    kContinue, ///< 本次处理完成，可以继续下一次 Tick()
-    kEndOfStream, ///< 输入正常结束，需要关闭本 Node 的全部输出
-    kStopped, ///< Node 因取消或停止请求结束
-    kError, ///< Node 遇到不可继续的业务错误
+    kContinue,  ///< 本次处理完成，可以继续下一次 Tick()
+    kEndOfStream,  ///< 输入正常结束，需要关闭本 Node 的全部输出
+    kStopped,  ///< Node 因取消或停止请求结束
+    kError,  ///< Node 遇到不可继续的业务错误
 };
 
 /**
@@ -109,12 +110,108 @@ enum class TickResult : std::uint8_t {
  * @brief 工作线程退出原因枚举，供 Pipeline 或状态机 (FSM) 进行向上的错误报告与状态反馈
  */
 enum class NodeFinishReason : std::uint8_t {
-    kNotFinished, ///< 工作线程尚未退出
-    kEndOfStream, ///< 流结束了
-    kStopRequested, ///< Pipeline 请求停止，或 Tick() 报告 kStopped
-    kError, ///< Tick() 报告 kError
-    kUnhandledException, ///< 工作线程入口捕获了未由派生 Node 处理的 C++ 异常
+    kNotFinished,  ///< 工作线程尚未退出
+    kEndOfStream,  ///< 流结束了
+    kStopRequested,  ///< Pipeline 请求停止，或 Tick() 报告 kStopped
+    kError,  ///< Tick() 报告 kError
+    kUnhandledException,  ///< 工作线程入口捕获了未由派生 Node 处理的 C++ 异常
 };
+
+/**
+ * @brief 将 Node 生命周期状态转换为日志可读字符串
+ */
+inline const char* NodeStateToString(NodeState state) {
+    switch (state) {
+        case NodeState::kCreated:
+            return "Created";
+        case NodeState::kRunning:
+            return "Running";
+        case NodeState::kStopRequested:
+            return "StopRequested";
+        case NodeState::kFinished:
+            return "Finished";
+        case NodeState::kJoined:
+            return "Joined";
+    }
+
+    return "Unknown";
+}
+
+/**
+ * @brief 将 Node 启动结果转换为日志可读字符串
+ */
+inline const char* NodeStartResultToString(NodeStartResult result) {
+    switch (result) {
+        case NodeStartResult::kStarted:
+            return "Started";
+        case NodeStartResult::kAlreadyStarted:
+            return "AlreadyStarted";
+        case NodeStartResult::kStopAlreadyRequested:
+            return "StopAlreadyRequested";
+        case NodeStartResult::kThreadCreationFailed:
+            return "ThreadCreationFailed";
+    }
+
+    return "Unknown";
+}
+
+/**
+ * @brief 将 Node Join 结果转换为日志可读字符串
+ */
+inline const char* NodeJoinResultToString(NodeJoinResult result) {
+    switch (result) {
+        case NodeJoinResult::kJoined:
+            return "Joined";
+        case NodeJoinResult::kNoThread:
+            return "NoThread";
+        case NodeJoinResult::kAlreadyJoined:
+            return "AlreadyJoined";
+        case NodeJoinResult::kCannotJoinSelf:
+            return "CannotJoinSelf";
+        case NodeJoinResult::kJoinFailed:
+            return "JoinFailed";
+    }
+
+    return "Unknown";
+}
+
+/**
+ * @brief 将 Tick 返回结果转换为日志可读字符串
+ */
+inline const char* TickResultToString(TickResult result) {
+    switch (result) {
+        case TickResult::kContinue:
+            return "Continue";
+        case TickResult::kEndOfStream:
+            return "EndOfStream";
+        case TickResult::kStopped:
+            return "Stopped";
+        case TickResult::kError:
+            return "Error";
+    }
+
+    return "Unknown";
+}
+
+/**
+ * @brief 将 Node 线程退出原因转换为日志可读字符串
+ */
+inline const char* NodeFinishReasonToString(NodeFinishReason reason) {
+    switch (reason) {
+        case NodeFinishReason::kNotFinished:
+            return "NotFinished";
+        case NodeFinishReason::kEndOfStream:
+            return "EndOfStream";
+        case NodeFinishReason::kStopRequested:
+            return "StopRequested";
+        case NodeFinishReason::kError:
+            return "Error";
+        case NodeFinishReason::kUnhandledException:
+            return "UnhandledException";
+    }
+
+    return "Unknown";
+}
 
 /**
  * @class INodeBase
@@ -140,8 +237,11 @@ public:
     INodeBase(std::string name, std::shared_ptr<SyncContext> sync)
         : sync_ctx_(std::move(sync)), name_(std::move(name)) {
         if (!sync_ctx_) {
+            LOG_ERROR("Node '{}' construction failed: null SyncContext", name_);
             throw std::invalid_argument("INodeBase requires a SyncContext");
         }
+
+        LOG_INFO("Node '{}' constructed", name_);
     }
 
     /**
@@ -150,7 +250,15 @@ public:
      * 本函数只检查线程是否已经由 Pipeline 回收，不会隐式停止或 Join，调试构建中，违反前置条件会触发
      * assert；关闭 assert 的构建中，joinable 的 std::thread 随后仍会导致 std::terminate()
      */
-    virtual ~INodeBase() { assert(!thread_.joinable() && "Pipeline must join every Node before destruction"); }
+    virtual ~INodeBase() {
+        if (thread_.joinable()) {
+            LOG_ERROR("Node '{}' destroyed while thread is still joinable", name_);
+        } else {
+            LOG_INFO("Node '{}' destroyed", name_);
+        }
+
+        assert(!thread_.joinable() && "Pipeline must join every Node before destruction");
+    }
 
     /** @brief Node 拥有线程和同步状态，禁止复制 */
     INodeBase(const INodeBase&) = delete;
@@ -264,6 +372,8 @@ private:
      * 2. 如果线程工厂抛出异常或返回不可 Join 的线程，状态回滚到 kCreated，交由 Pipeline 统一回滚
      */
     NodeStartResult Start(const NodeThreadFactory& thread_factory) noexcept {
+        LOG_INFO("Node '{}' start requested, state {}", name_, NodeStateToString(state_.load()));
+
         // 1. 预期当前状态为初始化完成且未启动 (kCreated)
         NodeState expected = NodeState::kCreated;
 
@@ -275,10 +385,12 @@ private:
             // 检查 CAS 失败的具体原因
             if (expected == NodeState::kStopRequested) {
                 // 节点在启动前已接收到 Pipeline 的异步停止信令，拒绝启动
+                LOG_WARN("Node '{}' start rejected: stop already requested", name_);
                 return NodeStartResult::kStopAlreadyRequested;
             }
 
             // 其他非 kCreated 状态（如 kRunning, kFinished）均视为已启动过
+            LOG_WARN("Node '{}' start rejected: current state {}", name_, NodeStateToString(expected));
             return NodeStartResult::kAlreadyStarted;
         }
 
@@ -291,15 +403,18 @@ private:
             if (!thread_.joinable()) {
                 // 资源分配失败，必须回滚状态，避免当前 Node 永久停留在虚假的 kRunning 状态
                 state_.store(NodeState::kCreated);
+                LOG_ERROR("Node '{}' thread creation returned non-joinable thread", name_);
                 return NodeStartResult::kThreadCreationFailed;
             }
         } catch (...) {
             // 捕获线程创建时可能抛出的异常（如 std::system_error 内存不足）
             // 执行状态回滚，拦截异常以满足 noexcept 承诺
             state_.store(NodeState::kCreated);
+            LOG_ERROR("Node '{}' thread creation threw an exception", name_);
             return NodeStartResult::kThreadCreationFailed;
         }
 
+        LOG_INFO("Node '{}' started", name_);
         return NodeStartResult::kStarted;
     }
 
@@ -308,6 +423,8 @@ private:
      * @details 本函数仅负责原子化地投递停止信号并推进状态机，不阻塞等待底层 OS 线程物理退出
      */
     void SignalStop() noexcept {
+        LOG_INFO("Node '{}' stop signal requested, state {}", name_, NodeStateToString(state_.load()));
+
         // 1. 投递原子退出标志
         stop_requested_.store(true);
 
@@ -321,6 +438,8 @@ private:
                !state_.compare_exchange_strong(current, NodeState::kStopRequested)) {
             // CAS 失败时，current 会被自动更新为内存中的最新值，继续下一轮评估
         }
+
+        LOG_DEBUG("Node '{}' stop signal published, state {}", name_, NodeStateToString(state_.load()));
     }
 
     /**
@@ -330,7 +449,10 @@ private:
      */
     void InterruptBlockingIo() noexcept {
         if (thread_.joinable()) {
+            LOG_DEBUG("Node '{}' interrupting blocking I/O", name_);
             OnInterruptBlockingIo();
+        } else {
+            LOG_TRACE("Node '{}' has no joinable thread, skip blocking I/O interrupt", name_);
         }
     }
 
@@ -343,19 +465,24 @@ private:
      * 工作线程退出前写入的 unhandled_exception_
      */
     NodeJoinResult Join() noexcept {
+        LOG_INFO("Node '{}' join requested, state {}", name_, NodeStateToString(state_.load()));
+
         // 1. 已经完成线程回收
         if (state_.load() == NodeState::kJoined) {
+            LOG_DEBUG("Node '{}' already joined", name_);
             return NodeJoinResult::kAlreadyJoined;
         }
 
         // 2. 没有可回收线程
         if (!thread_.joinable()) {
             state_.store(NodeState::kJoined);
+            LOG_DEBUG("Node '{}' has no thread to join", name_);
             return NodeJoinResult::kNoThread;
         }
 
         // 3. 防止工作线程 Join 自己
         if (thread_.get_id() == std::this_thread::get_id()) {
+            LOG_ERROR("Node '{}' cannot join itself", name_);
             return NodeJoinResult::kCannotJoinSelf;
         }
 
@@ -363,10 +490,12 @@ private:
         try {
             thread_.join();
         } catch (...) {
+            LOG_ERROR("Node '{}' thread join threw an exception", name_);
             return NodeJoinResult::kJoinFailed;
         }
 
         state_.store(NodeState::kJoined);
+        LOG_INFO("Node '{}' joined, finish reason {}", name_, NodeFinishReasonToString(finish_reason_.load()));
         return NodeJoinResult::kJoined;
     }
 
@@ -378,6 +507,7 @@ private:
      * 所有未被派生类处理的 C++ 异常都在本函数中捕获，不能越过线程入口
      */
     void ThreadMain() noexcept {
+        LOG_INFO("Node '{}' thread entered", name_);
         NodeFinishReason reason = NodeFinishReason::kNotFinished;
 
         try {
@@ -405,6 +535,8 @@ private:
                     continue;
                 }
 
+                LOG_DEBUG("Node '{}' Tick returned {}", name_, TickResultToString(result));
+
                 if (result == TickResult::kEndOfStream) {
                     // EOF 是正常结束：先关闭本 Node 的所有输出 Link，让下游排空后收到 EOF
                     CloseOutputs();
@@ -426,10 +558,12 @@ private:
             // 在线程入口保存未处理异常，避免异常越过线程边界触发 std::terminate()
             unhandled_exception_ = std::current_exception();
             reason = NodeFinishReason::kUnhandledException;
+            LOG_ERROR("Node '{}' thread caught unhandled exception", name_);
         }
 
         finish_reason_.store(reason);
         state_.store(NodeState::kFinished);
+        LOG_INFO("Node '{}' thread exited, reason {}", name_, NodeFinishReasonToString(reason));
     }
 
     /// 日志和拓扑诊断使用的固定 Node 名称
@@ -481,8 +615,8 @@ struct NoPort final {};
 template <typename InT, typename OutT>
 class INode : public INodeBase {
 public:
-    using InputLink = Link<InT>; ///< 输入管道类型别名
-    using OutputLink = Link<OutT>; ///< 输出管道类型别名
+    using InputLink = Link<InT>;  ///< 输入管道类型别名
+    using OutputLink = Link<OutT>;  ///< 输出管道类型别名
 
     /**
      * @brief 构造一个一进一出的 Node
@@ -497,10 +631,15 @@ public:
     bool ConnectInput(std::shared_ptr<InputLink> input) {
         // 只能在 Node 启动前连接，并拒绝空 Link
         if (!CanConfigure() || !input) {
+            LOG_WARN("Node '{}' ConnectInput rejected: configurable {}, input valid {}",
+                     GetName(),
+                     CanConfigure(),
+                     static_cast<bool>(input));
             return false;
         }
 
         input_ = std::move(input);
+        LOG_DEBUG("Node '{}' input connected", GetName());
         return true;
     }
 
@@ -510,10 +649,15 @@ public:
     bool ConnectOutput(std::shared_ptr<OutputLink> output) {
         // 只能在 Node 启动前连接，并拒绝空 Link
         if (!CanConfigure() || !output) {
+            LOG_WARN("Node '{}' ConnectOutput rejected: configurable {}, output valid {}",
+                     GetName(),
+                     CanConfigure(),
+                     static_cast<bool>(output));
             return false;
         }
 
         output_ = std::move(output);
+        LOG_DEBUG("Node '{}' output connected", GetName());
         return true;
     }
 
@@ -541,7 +685,10 @@ protected:
      */
     void CloseOutputs() final {
         if (output_) {
+            LOG_INFO("Node '{}' closing output link", GetName());
             output_->Close();
+        } else {
+            LOG_DEBUG("Node '{}' has no output link to close", GetName());
         }
     }
 
@@ -562,7 +709,7 @@ private:
 template <typename OutT>
 class INode<NoPort, OutT> : public INodeBase {
 public:
-    using OutputLink = Link<OutT>; ///< 输出 Link 类型
+    using OutputLink = Link<OutT>;  ///< 输出 Link 类型
 
     /**
      * @brief 构造一个零进一出的 Source Node
@@ -578,10 +725,15 @@ public:
      */
     bool ConnectOutput(std::shared_ptr<OutputLink> output) {
         if (!CanConfigure() || !output) {
+            LOG_WARN("Node '{}' ConnectOutput rejected: configurable {}, output valid {}",
+                     GetName(),
+                     CanConfigure(),
+                     static_cast<bool>(output));
             return false;
         }
 
         output_ = std::move(output);
+        LOG_DEBUG("Node '{}' output connected", GetName());
         return true;
     }
 
@@ -600,7 +752,10 @@ protected:
      */
     void CloseOutputs() final {
         if (output_) {
+            LOG_INFO("Node '{}' closing output link", GetName());
             output_->Close();
+        } else {
+            LOG_DEBUG("Node '{}' has no output link to close", GetName());
         }
     }
 
@@ -634,10 +789,15 @@ public:
      */
     bool ConnectInput(std::shared_ptr<InputLink> input) {
         if (!CanConfigure() || !input) {
+            LOG_WARN("Node '{}' ConnectInput rejected: configurable {}, input valid {}",
+                     GetName(),
+                     CanConfigure(),
+                     static_cast<bool>(input));
             return false;
         }
 
         input_ = std::move(input);
+        LOG_DEBUG("Node '{}' input connected", GetName());
         return true;
     }
 
@@ -651,7 +811,7 @@ protected:
     /**
      * @brief Sink 没有输出 Link，正常 EOF 时无需关闭任何对象
      */
-    void CloseOutputs() final {}
+    void CloseOutputs() final { LOG_TRACE("Node '{}' has no output links to close", GetName()); }
 
 private:
     /// 上游与本 Node 共享的输入 Link
@@ -677,7 +837,7 @@ protected:
     /**
      * @brief 无端口 Node 在正常 EOF 时无需关闭任何对象
      */
-    void CloseOutputs() final {}
+    void CloseOutputs() final { LOG_TRACE("Node '{}' has no output links to close", GetName()); }
 };
 
-} // namespace mediacore
+}  // namespace mediacore

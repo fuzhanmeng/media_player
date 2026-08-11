@@ -1,6 +1,6 @@
 /**
- * @file d9_dag_lifecycle_test.cpp
- * @brief D9 DAG 生命周期和阻塞解除验证。
+ * @file all_tests.cpp
+ * @brief 项目测试入口，目前覆盖 DAG 生命周期和阻塞解除验证。
  *
  * 这些测试只实例化 Queue、Link、INode 和 Pipeline，不创建 FFmpeg 或 Qt 对象。
  * 每个用例都使用小型假 Node，通过条件变量等待确定的事件；测试本身不依赖
@@ -343,7 +343,7 @@ protected:
     TickResult Tick() override {
         probe_->ticks_.fetch_add(1);
         probe_->event_.Notify();
-        throw std::runtime_error("D9 test exception");
+        throw std::runtime_error("all tests exception");
     }
 
 private:
@@ -633,7 +633,7 @@ int main(int argc, char** argv) {
     }
 
     if (argc != 1 && requested_case.empty()) {
-        std::cerr << "usage: d9_dag_lifecycle_test [--case NAME]\n";
+        std::cerr << "usage: all_tests [--case NAME]\n";
         return 2;
     }
 

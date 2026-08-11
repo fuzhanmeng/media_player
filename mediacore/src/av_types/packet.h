@@ -1,7 +1,7 @@
 /**
  * @file packet.h
  * @brief Packrt DTO --- RAII 封装的 AVPacket，携带时间戳/世代号/标志位
- * @details Demuxer 从容器中读出压缩数据包， 通过 Link<Packet> 传递给 Decoder 消费
+ * @details Demuxer 从容器中读出压缩数据包，通过 Link<Packet> 传递给 Decoder 消费
  *  时间戳统一换算为微秒（下游无须关系 time_base），epoch_ 用于 Seek 时抛弃旧世代包，flags 扩展带内
  *  信令
  *

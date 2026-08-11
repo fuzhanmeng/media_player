@@ -5,6 +5,8 @@
 
 #include "av_types/packet.h"
 
+#include "mediacore/logger.h"
+
 extern "C" {
 #include <libavcodec/packet.h>
 }
@@ -16,7 +18,13 @@ namespace mediacore {
  * @details av_packet_alloc() 只分配结构体，不分配 data 缓冲
  *  data 缓冲由 Demuxer 调用 av_read_frame 时分配，失败时返回 nullptr，调用时需要检查 IsEmpty()
  */
-Packet::Packet() : pkt_(av_packet_alloc()), pts_us_(0), dts_us_(0), epoch_(0), flags_(AVFrameFlag::kNone) {}
+Packet::Packet() : pkt_(av_packet_alloc()), pts_us_(0), dts_us_(0), epoch_(0), flags_(AVFrameFlag::kNone) {
+    if (pkt_ == nullptr) {
+        LOG_ERROR("AVPacket allocation failed");
+    }
+
+    LOG_TRACE("AVPacket allocated: {}", static_cast<const void*>(pkt_));
+}
 
 /**
  * @brief 析构函数
@@ -27,7 +35,10 @@ Packet::Packet() : pkt_(av_packet_alloc()), pts_us_(0), dts_us_(0), epoch_(0), f
  */
 Packet::~Packet() {
     if (pkt_) {
+        LOG_TRACE("AVPacket released: {}", static_cast<const void*>(pkt_));
         av_packet_free(&pkt_);
+    } else {
+        LOG_TRACE("Packet destructor called with empty AVPacket");
     }
 }
 
@@ -44,6 +55,9 @@ Packet::~Packet() {
  */
 Packet::Packet(Packet&& other) noexcept
     : pkt_(other.pkt_), pts_us_(other.pts_us_), dts_us_(other.dts_us_), epoch_(other.epoch_), flags_(other.flags_) {
+    LOG_TRACE(
+        "AVPacket move-constructed: {} -> {}", static_cast<const void*>(other.pkt_), static_cast<const void*>(pkt_));
+
     other.pkt_ = nullptr;
     other.pts_us_ = 0;
     other.dts_us_ = 0;
@@ -72,6 +86,7 @@ Packet& Packet::operator=(Packet&& other) noexcept {
     if (this != &other) {
         // 释放当前对象持有的资源
         if (pkt_) {
+            LOG_TRACE("AVPacket released before move assignment: {}", static_cast<const void*>(pkt_));
             av_packet_free(&pkt_);
         }
 
@@ -88,8 +103,12 @@ Packet& Packet::operator=(Packet&& other) noexcept {
         other.dts_us_ = 0;
         other.epoch_ = 0;
         other.flags_ = AVFrameFlag::kNone;
+
+        LOG_TRACE("AVPacket move-assigned: {}", static_cast<const void*>(pkt_));
+    } else {
+        LOG_TRACE("Packet self move-assignment ignored");
     }
 
     return *this;
 }
-} // namespace mediacore
+}  // namespace mediacore

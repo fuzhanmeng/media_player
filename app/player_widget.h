@@ -18,7 +18,7 @@ class ControllerWidget;
  * @class PlayerWidget
  * @brief UI 与 IPlayer 之间的桥梁
  */
-class PlayerWidget : public QWidget{
+class PlayerWidget : public QWidget {
     Q_OBJECT
 public:
     /**
@@ -27,7 +27,7 @@ public:
      * @param parent Qt 父子对象树的父指针
      */
     explicit PlayerWidget(mediacore::IPlayer* player, QWidget* parent = nullptr);
-    
+
     /**
      * @brief 析构函数
      */
@@ -46,7 +46,7 @@ private slots:
     void OnSeek(int position);
 
 private:
-    mediacore::IPlayer* player_; ///< IPlayer 实例
-    ControllerWidget* controller_; ///< 子控件，Qt 父子对象树会自动管理其生命周期
-    OpenGLView* gl_view_; ///< 视频渲染画布 
+    mediacore::IPlayer* player_;  ///< IPlayer 实例
+    ControllerWidget* controller_;  ///< 子控件，Qt 父子对象树会自动管理其生命周期
+    OpenGLView* gl_view_;  ///< 视频渲染画布
 };
