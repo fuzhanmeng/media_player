@@ -14,4 +14,7 @@ if [ -f "CMakeUserPresets.json" ]; then
     echo " -> 已删除 CMakeUserPresets.json"
 fi
 
+git clean -dfx 
+git reset --hard HEAD
+
 echo "清理完成"
