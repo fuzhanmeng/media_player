@@ -1,16 +1,26 @@
 /**
  * @file video_frame.h
- * @brief 视频帧的数据传输对象 DTO，DAG 管线中在节点间流动的 智能指针
+ * @brief 视频帧数据对象，保存一帧 YUV420P 图像和随帧传递的时间戳/世代号/控制标志
+ * @details
+ * VideoFrame 是 Decoder 的输出给音画同步、渲染的原始帧，即 YUV420P
+ * 数据流
+ * Demuxer 读取 AVPacket -> Decoder 解码 -> VideoFrame -> Renderer / Sync / Filter
+ *
+ * 生命周期
+ * - 构造时按 YUV420P 布局分配一块连续内存
+ * - data_ 里的三个裸指针指向 buffer_ 内部的 Y / U / V 平面，不单独拥有内存
  */
 
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <new>  // std::bad_alloc
 
-#include "frame_size.h"  // mediacore::FrameSize：具名宽高，避免相邻 int 参数被写反
+#include "frame_size.h"
+#include "mediacore/av_types/av_frame_flag.h"
 #include "mediacore/logger.h"
 
 extern "C" {
@@ -22,45 +32,14 @@ extern "C" {
 namespace mediacore {
 
 /**
- * @brief 帧的带内控制标志（Flush / EOF 等信令，沿数据通道随帧顺序传播）
- * @details 使用位掩码（enum + 位运算），便于一帧同时携带多个标志
- *          - kNone ：普通数据帧，无特殊语义
- *          - kFlush：Seek 后注入，通知下游清空历史缓存 / 重置解码器参考帧
- *          - kEOF  ：数据流结束，末端节点据此判定全局播放完成
- * @note DAG 架构里，带外信令（Seek 世代号）走 epoch 原子广播；带内信令（Flush/EOF）走本标志随帧传播，二者分工明确
- */
-enum class FrameFlag : uint32_t {
-    kNone = 0,
-    kFlush = 1u << 0,
-    kEOF = 1u << 1,
-};
-
-/// @brief 位或：组合多个标志
-inline FrameFlag operator|(FrameFlag a, FrameFlag b) {
-    return static_cast<FrameFlag>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
-}
-
-/// @brief 位与：检测是否包含某标志
-inline FrameFlag operator&(FrameFlag a, FrameFlag b) {
-    return static_cast<FrameFlag>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
-}
-
-/// @brief 位或赋值：向已有标志集追加标志
-inline FrameFlag& operator|=(FrameFlag& a, FrameFlag b) {
-    a = a | b;
-    return a;
-}
-
-/**
- * @brief 视频帧 DTO
+ * @struct VideoFrame
+ * @brief 解码后的单帧 YUV420P 视频帧 DTO
+ * @details
+ * 当前渲染器 按照 YUV420P 三平面上传 OpenGL 纹理，所以 VideoFrame 固定保存 Y/U/V 三个平面
  */
 struct VideoFrame {
-    // ================= 图像属性 =================
-
     int width_{0};  ///< 画面宽度（像素）
     int height_{0};  ///< 画面高度（像素）
-
-    // ================= 数据与内存布局（YUV420P，平面存储）=================
 
     /// YUV420P 三平面首地址
     std::array<uint8_t*, 3> data_{{nullptr, nullptr, nullptr}};
@@ -68,22 +47,25 @@ struct VideoFrame {
     /// YUV420P 三平面每行字节数（stride / pitch）
     std::array<int, 3> linesize_{{0, 0, 0}};
 
-    /// 底层连续内存块的唯一持有者，shared_ptr + 自定义删除器（av_free）统一管理生命周期
+    /**
+     * @brief buffer_ 是存储图像的实际的内存
+     * @details data_ 只是指向这块内存中的三个便宜位置，data_不实际拥有内存，buffer_ 还活着，指针就有效
+     * 当最后一个 std::shared_ptr 引用释放时，这块内存也随之释放
+     */
     std::shared_ptr<uint8_t> buffer_{nullptr};
 
-    // ================= DAG 调度与同步元信息 =================
-
-    /// 绝对显示时间戳 - 微秒, 音画同步与进度显示的依据
+    /// 显示时间戳，单位微秒，后续音画同步和进度显示都使用这个值
     int64_t pts_us_{0};
 
     /// Seek 世代号（带外信令），用于丢弃旧帧、清空历史缓存、重置解码器参考帧
-    int64_t epoch_{0};
+    uint64_t epoch_{0};
 
-    /// 带内控制标志 Flush/EOF
-    FrameFlag flags_{FrameFlag::kNone};
+    ///< 随帧传递的控制标志，例如 kFlush / kEOF / kKeyFrame
+    AVFrameFlag flags_{AVFrameFlag::kNone};
 
     /**
-     * @brief 默认构造函数
+     * @brief 构造一个空视频帧
+     * @details 空帧不持有图像内存，IsValid() 返回 false，它可用于临时变量或者控制信令帧
      */
     VideoFrame() = default;
 
@@ -92,12 +74,13 @@ struct VideoFrame {
      * @param width 视频宽度（像素）
      * @param height 视频高度（像素）
      * @throws std::bad_alloc 底层内存分配失败时抛出
-     * @note 内存流转：单次 av_malloc 分配 (Y + U + V) 连续大块，再将 data[0..2] 指向块内偏移；裸指针交由
-     *       shared_ptr 托管，绑定删除器 av_free，最后一个持有者析构时自动释放。一次分配（而非三次）既减少
-     *       碎片、又 cache 友好、利于后续 SIMD 处理。UV 平面尺寸按 (width+1)/2 * (height+1)/2 向上取整，
-     *       兼容奇数分辨率，防止越界。
+     * @details
+     * YUV420P 有三个平面：
+     * - Y 平面保存亮度，大小约为 width * height；
+     * - U/V 平面保存色度，水平方向和垂直方向都是 2:1 下采样；
+     * - 奇数宽高需要向上取整，否则最后一列或最后一行色度数据会越界。
      */
-    VideoFrame(FrameSize size) : width_(size.width_), height_(size.height_) {
+    explicit VideoFrame(FrameSize size) : width_(size.width_), height_(size.height_) {
         const int uv_width = (size.width_ + 1) / 2;  ///< UV 平面宽度（色度水平 2:1 下采样，向上取整）
 
         const int uv_height = (size.height_ + 1) / 2;  ///< UV 平面高度（色度垂直 2:1 下采样，向上取整）
@@ -132,24 +115,25 @@ struct VideoFrame {
         linesize_[2] = uv_width;
     }
 
-    // ================= 标志位操作 =================
     /**
      * @brief 追加一个带内标志
+     * @param flag 要追加的标志，例如 AVFrameFlag::kEOF
      */
-    void AddFlag(FrameFlag flag) { flags_ |= flag; };
+    void AddFlag(AVFrameFlag flag) { flags_ |= flag; };
 
     /**
-     * @brief 检测是否携带指定标志位
-     * @return true -- 表示携带标志位
+     * @brief 检查当前帧是否携带指定控制标志。
+     * @param flag 要检查的标志。
+     * @return true 表示包含该标志，false 表示不包含。
      */
-    bool HasFlag(FrameFlag flag) { return (flags_ & flag) != FrameFlag::kNone; }
+    bool HasFlag(AVFrameFlag flag) const { return (flags_ & flag) != AVFrameFlag::kNone; }
 
-    // ================= 有效性校验 =================
     /**
      * @brief 校验本帧是否为可安全渲染的有效数据帧
      * @return true结构完整、可安全上传 GPU， false 为空帧或者不符合需求
-     * @note 控制信令帧 Flush/EOF 通常是空帧， IsValid() 返回 false 属于是预期行为，调用方应该先
-             检查 HasFlag 再决定是否渲染
+     * @details
+     * 控制信令帧 Flush/EOF 通常是空帧， IsValid() 返回 false 属于是预期行为，调用方如果关心控制信令，应
+     * 先调用 HasFlag()，再决定是否渲染
      */
     bool IsValid() const {
         if (width_ <= 0 || height_ <= 0) {
