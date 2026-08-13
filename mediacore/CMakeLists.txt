@@ -8,6 +8,7 @@ set(MEDIACORE_SOURCES
     src/av_types/packet.cpp
     src/utils/logger.cpp
     src/config/player_config.cpp
+    src/core/media_error.cpp
 )
 
 # ============ 定义静态库 ============
