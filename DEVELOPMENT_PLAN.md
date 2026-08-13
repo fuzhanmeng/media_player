@@ -1,19 +1,14 @@
 # 开发计划书
 
 > 本文是 ai-media-player 从 Day 01 到项目完成的完整开发计划。
->
-> 只回答"要做什么、按什么顺序做、做到什么程度算完成"，不记录实际进度。
-> 仓库实现到哪一步，以源码和测试为准。
->
-> 只有开发顺序、阶段目标、项目范围或验收标准本身变化时，才修改本文。
 
 ---
 
 ## 一、计划口径
 
 - 一个 Day 按 6–8 小时有效开发时间估算，编号只表示执行顺序，不表示自然日。
-- 一个 Day 没有达到验收标准，就不进入下一个 Day。宁可拆成两天，不要带着未验证的代码往前走。
-- 完成的依据只能来自 `mediacore/`、`app/`、`tests/` 的正式构建和测试。
+- 一个 Day 没有达到验收标准，就不进入下一个 Day。宁可拆成两天，不要带着没跑通的核心功能往前走。
+- 验收标准表示"核心功能可验证、高风险路径有保护、关键回归能被发现"，不表示每个 Day 都要写大量测试文件，也不追求函数级 100% 覆盖。
 - 每个阶段先建立最小闭环，再加性能和高级功能。不让硬解、录制或网络反向污染尚未稳定的软解主链。
 - 项目边界是"播放器"。新能力必须进入真实播放流程，并能用固定样本或可复现环境验证。
 
@@ -28,6 +23,11 @@
   → HTTP → RTP + Jitter Buffer → 弱网验证
   → 系统收口
 ```
+
+播放主链和录制链路要分开看：
+
+- **播放主链**：解封装读出压缩 `Packet`，解码把 `Packet` 变成 `VideoFrame` / `AudioFrame`，然后进入视频输出、音频输出和音画同步。
+- **录制链路**：编码和 MP4 封装只在录制分支使用，等本地播放、Seek、EOF 和错误闭环稳定后再接入。
 
 | 阶段 | Day | 交付 |
 |---|---|---|
@@ -67,13 +67,13 @@ Qt UI
 
 1. `PlayerFacade` 同一时刻独占一个 `Pipeline`；不是进程级单例，多播放器实例可各有一条。
 2. `Pipeline` 先实现 DAG 生命周期，后续在同一个类上加 Open/Build 和 Seek，不引入第二个图级所有者。
-3. Pipeline 创建并登记全部 Node 和 Link。Node 不创建 Link，不知道完整拓扑，不负责 Abort Link。
-4. Node 析构函数不执行 Stop/Join。Pipeline 必须先停止并 Join 全部 Node，之后才能销毁 DAG。
+3. Pipeline 创建并登记全部 Node 和 Link，Node 不创建 Link，不知道完整拓扑，不负责 Abort Link
+4. Node 析构函数不执行 Stop/Join，Pipeline 必须先停止并 Join 全部 Node，之后才能销毁 DAG
 5. `Start` 按 Sink 到 Source 的逆拓扑顺序执行，保证消费者先启动。
-6. 立即停止固定为：SignalStop 全部 Node → Abort 全部 Link → Interrupt 外部 IO → 唤醒暂停线程 → Join 全部 Node。
-7. `CloseOutputs` 通过 `Link::Close` 传递正常 EOF 并允许下游排空；`Abort` 表示立即停止并丢弃存量。录制用独立 Drain 协议，不复用 Abort。
+6. 立即停止固定为：SignalStop 全部 Node → Abort 全部 Link → Interrupt 外部 IO → 唤醒暂停线程 → Join 全部 Node
+7. `CloseOutputs` 通过 `Link::Close` 传递正常 EOF 并允许下游排空；`Abort` 表示立即停止并丢弃存量。录制用独立 Drain 协议，不复用 Abort
 8. 控制 API 由一个控制线程串行调用。atomic 只用于工作线程确实需要并发读取的状态。
-9. 一条 Link 默认单生产者、单消费者。广播必须由 Tee 创建多条 Link。
+9. 一条 Link 默认单生产者、单消费者。广播必须由 Tee 创建多条 Link
 10. Open、网络读取、音频写入等外部阻塞调用必须支持独立的 cancellation/deadline。Stop 不能排在一个无限阻塞的 Open 后面等待。
 
 ---
@@ -118,15 +118,24 @@ VA-API、DMA-BUF/EGL、RTP、Jitter Buffer 是新增能力，从契约、测试�
 除各 Day 自己的验收条件外，以下对每个 Day 都成立：
 
 1. 代码在正式目录并加入 CMake target，头文件 PUBLIC/PRIVATE 边界正确。
-2. 用固定输入和确定性条件验证，不用 `sleep` 证明并发正确。
-3. 失败、EOF、Stop、部分初始化失败、重复调用路径都有测试。
-4. 构建开 `-Wall -Wextra -Wpedantic`，新增警告必须修。
-5. 所有权/并发改动过 ASan/UBSan，线程协议改动过 TSan。环境不支持要记录原因。
-6. 集成测试有超时，死锁以测试失败结束而不是永久挂起。
-7. 日志和错误含模块名、错误码及 FFmpeg/系统错误文本，不把错误伪装成 EOF。
-8. 每个 `.h`/`.cpp` 有 Doxygen 文件注释，类和函数说明职责、线程模型和生命周期。
-9. 新增的可调参数必须进 `PlayerConfig` 并在第六节的预算表里有一行，不允许在调用点写魔数。
-10. 新增模块必须有自己的模块名日志；新增的缓冲、队列或缓存必须有明确上限，不允许无界增长。
+2. 核心功能必须能被验证：可以是单元测试、集成测试、固定样本手动验证、日志证据或小型测试程序；按风险选择，不要求每天都写大量测试。
+3. 高风险路径优先自动化：线程生命周期、队列阻塞、FFmpeg 对象所有权、Seek/EOF/Stop、时间戳换算和错误分支，至少要有能重复运行的验证手段。
+4. 低风险代码不强求独立测试文件：简单 DTO、字符串转换、只读配置结构，可以通过编译、少量断言或被上层测试覆盖。
+5. 构建开 `-Wall -Wextra -Wpedantic`，新增警告必须修。
+6. 线程协议和资源所有权有较大改动时跑 Sanitizer；环境不支持或暂时不跑，要说明原因，不写成已通过。
+7. 可能死锁的集成测试必须有超时；并发正确性不要只靠固定 `sleep` 证明。
+8. 日志和错误含模块名、错误码及 FFmpeg/系统错误文本，不把错误伪装成 EOF。
+9. 每个 `.h`/`.cpp` 有 Doxygen 文件注释，类和公开函数说明职责、线程模型和生命周期；内部简单函数不为了形式写冗余注释。
+10. 新增的可调参数必须进 `PlayerConfig` 并在第六节的预算表里有一行，不允许在调用点写魔数。
+11. 新增模块必须有自己的模块名日志；新增的缓冲、队列或缓存必须有明确上限，不允许无界增长。
+
+测试粒度按风险决定：
+
+| 风险等级 | 典型模块 | 推荐验证方式 |
+|---|---|---|
+| 高 | `Pipeline`、`Link`、线程退出、Seek、EOF、FFmpeg RAII、时间戳换算 | 自动化测试 + 超时 + 日志；必要时跑 ASan/UBSan/TSan |
+| 中 | Demuxer、Decoder、格式转换、AudioSink、AVSync | 固定媒体样本 + 关键路径自动化 + 和 `ffprobe` 或可计算期望比对 |
+| 低 | DTO、配置默认值、枚举映射、简单字符串转换 | 编译验证 + 少量断言或被上层测试覆盖 |
 
 ---
 
@@ -134,7 +143,9 @@ VA-API、DMA-BUF/EGL、RTP、Jitter Buffer 是新增能力，从契约、测试�
 
 ### 6.1 配置从哪来
 
-所有可调参数集中在一个 `PlayerConfig` 结构里，按模块分组嵌套（`config.demux.*`、`config.decode.*`、`config.audio.*`、`config.network.*`……）。三层来源，后者覆盖前者：
+所有可调参数集中在一个 `PlayerConfig` 结构里，按模块分组嵌套（`config.demux.*`、`config.decode.*`、`config.audio.*`、`config.network.*`……）。
+
+基础阶段先实现代码内默认值和 `Validate()`，保证没有配置文件也能运行。配置文件、环境变量和命令行覆盖在真实模块需要运行时调参时再补齐。最终配置来源按三层设计，后者覆盖前者：
 
 1. **代码内 `constexpr` 默认值** —— 不给任何配置也能跑，这是唯一的默认值定义处；
 2. **配置文件** —— 运行时可选加载，文件不存在就用默认值，不报错；
@@ -148,7 +159,7 @@ VA-API、DMA-BUF/EGL、RTP、Jitter Buffer 是新增能力，从契约、测试�
 
 ### 6.2 资源预算基线
 
-播放器必须对内存、队列深度和延迟设上限，否则弱网或慢消费者会把内存吃光。下表是**初始值**，作用是让每条链路从第一天起就是有界的；具体数字在 Day 43 用实测校准，在 Day 45 写回默认值。
+播放器必须对内存、队列深度和延迟设上限，否则弱网或慢消费者会把内存吃光。下表是**初始值**，作用是让每条链路从第一天起就是有界的；具体数字在 Day 43 用实测校准，在 Day 45 写回默认值
 
 | 资源 | 配置项 | 初始值 | 依据 |
 |---|---|---|---|
@@ -358,44 +369,47 @@ Day 07。
 
 ---
 
-## Day 09 — DAG 生命周期测试与 Sanitizer
+## Day 09 — DAG 生命周期验证
 
 ### Objective
-用确定性条件覆盖全部生命周期边界，并用动态检查确认没有 UB 和数据竞争。
+用确定性条件覆盖 DAG 生命周期的高风险边界，确保后续媒体节点可以安全接入。
 
 ### Tasks
 - 建 `tests/dag/` 及 CMake 入口，直接包含 `mediacore/src`，不链接 FFmpeg/Qt；加 `BUILD_MEDIACORE` / `BUILD_APP` 开关。
 - 测试脚手架：`TestEvent`（mutex + CV + 序号）、`Probe`（atomic 可观察状态）、`GateNode`（测试方精确控制 Tick 返回时机）。
 - 假 Node：EOF Source、Increment Transform、Drain Sink、阻塞收/发 Node、可中断 IO Node、抛异常 Node、具名阻塞 Node。
-- 11 个用例：`eof_close_and_drain`、`stop_while_receiving`、`stop_while_sending`、`stop_while_paused`、`pause_resume_pause`、`interrupt_blocking_io`、`partial_start_rollback`、`repeated_stop`、`tick_exception`、`join_before_destruction`、`consumer_starts_first`，每个注册为独立 CTest 并设超时。
-- 分别在普通构建、ASan/UBSan、TSan 下跑，用独立构建目录；`ctest --repeat until-fail:N` 暴露低概率竞态。
+- 覆盖关键路径：正常 EOF 排空、Stop 解除 Receive/Send/Pause/外部 IO 阻塞、启动失败回滚、重复 Stop、Tick 异常、析构前 Join、消费者先启动。
+- 每个会阻塞的验证都要有超时，死锁以失败结束而不是永久挂起。
+- 普通构建必须能跑；Sanitizer 作为阶段性验证，在修改线程协议、队列或所有权规则后再跑。
 - 在 `tests/dag/README.md` 记录构建命令、覆盖范围和环境限制。
 
 ### Dependencies
 Day 08。
 
 ### Acceptance Criteria
-- 11 个用例在普通构建、警告构建、ASan/UBSan、TSan 下全部通过，不依赖固定时长 sleep。
+- DAG 生命周期关键路径在普通构建下通过，不依赖固定时长 sleep。
 - 关闭 mediacore 与 app 构建时测试仍可编译运行。
 - 任一用例死锁时以超时失败结束。
-- 环境不支持某项 Sanitizer 时记录具体原因，不写成已通过。
+- 线程协议或队列行为改动较大时跑 Sanitizer；暂时不跑时记录原因，不写成已通过。
 
 ---
 
-## Day 10 — Packet DTO 与配置系统
+## Day 10 — Packet DTO、配置与基础媒体协议
 
 ### Objective
-定义在 Node 之间流动的压缩包对象，并建立全项目唯一的参数来源。
+定义在 Node 之间流动的基础数据对象，并建立当前阶段会用到的配置和错误表达。
 
 ### Tasks
 - `av_frame_flag.h`：`AVFrameFlag` 位掩码（`kKeyFrame`/`kEOF`/`kFlush`）+ `constexpr` 位运算重载。
 - `packet.h/.cpp`：RAII 封装 `AVPacket*`，构造 `av_packet_alloc()`，析构 `av_packet_free()`。
 - 禁拷贝，实现移动构造与移动赋值：窃取指针后源对象置空，移动赋值先释放自身资源并做自赋值检查。
 - 携带 `pts_us_`/`dts_us_`/`epoch_`/`flags_` 及读写接口，`IsEmpty()` 判断是否已被移动或分配失败。
-- `player_config.h`：按模块分组的嵌套结构（`demux` / `decode` / `audio` / `sync` / `record` / `network` / `jitter`），字段和默认值按第六节预算表定义，默认值一律 `constexpr`。
-- 配置加载：可选读配置文件，文件不存在用默认值且不报错；支持环境变量覆盖用于调试。
-- `Validate()`：检查数值范围和相互约束（如 `jitter.min_delay_ms <= target <= max_delay_ms`、各容量必须大于 0），非法值返回明确错误而不是静默夹取。
-- 本 Day 只定义结构和加载逻辑，各模块接线在各自的 Day 完成。
+- `player_config.h/.cpp`：先定义近期会用到的 `demux` / `decode` / `audio` 三组参数，提供 `Default()` 和 `Validate()`；后续网络、录制和 Jitter Buffer 开始实现时再扩展对应分组。
+- `media_error.h/.cpp`：定义结构化错误对象，能保存错误类别、模块名、原始错误码、可读错误文本和是否可恢复；公共头文件不暴露 FFmpeg 类型。
+- `stream_info.h`：定义探测结果 DTO，包括 `Rational`、`VideoStreamInfo`、`AudioStreamInfo`、`MediaInfo`；只保存普通 C++ 字段，不保存 `AVFormatContext` / `AVStream` / `AVCodecParameters` 指针。
+- `audio_format.h` / `audio_frame.h`：定义解码后 packed PCM 的格式和音频帧对象，与 `Packet` / `VideoFrame` 共用 `AVFrameFlag`。
+- `VideoFrame` 改用与 `Packet` 相同的 `AVFrameFlag`，删掉重复的 `FrameFlag`；统一 `pts_us` 与 `epoch` 语义。
+- 本 Day 只定义基础 DTO 和校验规则，各模块接线在各自的 Day 完成。
 - CMake 链接 `avutil` 与 `avcodec`。
 
 ### Dependencies
@@ -405,23 +419,26 @@ Day 01。
 - 移动后源对象析构不发生 double free，拷贝构造与拷贝赋值编译失败。
 - 时间戳单位在注释和接口命名上明确为微秒。
 - 不提供任何配置时能拿到一份完整可用的默认配置。
-- 配置文件缺失、字段缺失、字段非法三种情况行为明确：前两者回落默认值，后者报错。
-- 每个默认值在代码中只有一处定义。
+- 配置字段非法时返回明确错误，不静默夹取。
+- 全仓库只有一套帧标志枚举，`Packet`、`VideoFrame`、`AudioFrame` 都使用 `AVFrameFlag`。
+- 错误对象能同时表达 FFmpeg 负错误码与系统 errno，且不依赖 Qt。
+- `MediaInfo` 能表达视频-only、音频-only、音视频都有三种组合，并且不泄漏 FFmpeg 类型。
 
 ---
 
 # 阶段 B：本地视频最小闭环（Day 11–18）
 
-## Day 11 — 流信息 DTO
+## Day 11 — 流信息转换与测试
 
 ### Objective
-定义解封装探测结果的表达方式。
+把流信息 DTO 接入 FFmpeg 探测结果，并补齐转换和测试。
 
 ### Tasks
-- `stream_info.h`：`Rational`（num/den）避免直接暴露 `AVRational`。
-- `VideoStreamInfo`（codec_id、宽高、像素格式、帧率、time_base、色彩元数据、stream_index）、`AudioStreamInfo`（codec_id、采样率、声道布局、采样格式、time_base、stream_index）、`MediaInfo`（容器名、总时长微秒、可选轨道信息、是否可 Seek）。
-- 用 `std::optional` 表达"没有该轨道"，不用魔数索引。
-- 提供从 `AVStream*` 填充的转换函数，集中处理 time_base 与色彩字段。
+- 在 `mediacore/src/ffmpeg/` 或 Demuxer 私有实现中提供从 FFmpeg 对象填充 `MediaInfo` 的转换函数。
+- 从 `AVStream::time_base`、`avg_frame_rate`、`duration`、`AVCodecParameters` 中复制字段到项目 DTO。
+- 用 `std::optional` 表达"没有该轨道"，不用魔数索引；只有音频或只有视频的输入也必须是合法媒体。
+- 集中处理 time_base、duration、帧率和像素/采样格式映射；无法识别的格式映射为项目自己的 `kUnknown`。
+- 头文件保持在 `mediacore/include`，允许 app 和测试读取探测结果，但不允许公共头包含 FFmpeg 头文件。
 
 ### Dependencies
 Day 10。
@@ -429,7 +446,8 @@ Day 10。
 ### Acceptance Criteria
 - 单测覆盖只有视频、只有音频、音视频齐全三种组合。
 - 时长和帧率换算有固定输入的期望值比对。
-- 头文件在 `src/`，`app` 无法 include。
+- 公共头文件可以被 app include，但不会引入任何 FFmpeg 类型。
+- FFmpeg 转换实现留在 `mediacore/src`，app 无法直接调用 FFmpeg 对象转换细节。
 
 ---
 
@@ -442,7 +460,7 @@ Day 10。
 - `ffmpeg_demuxer_node.h/.cpp`：双输出，直接继承 `INodeBase`，自持两条 `Link<Packet>`，自己实现 `CloseOutputs()`。
 - `Open(path)`：`avformat_open_input` + `avformat_find_stream_info` + `av_find_best_stream`；挂 `interrupt_callback` 读取本 Node 的取消标志；`OnInterruptBlockingIo()` 置该标志；设 Open/Read 超时选项。
 - 打开失败返回结构化错误：模块名 + 错误码 + `av_strerror` 文本。
-- Open/Read 超时取自 `config.network`，本地文件同样走这套超时路径。
+- Open/Read 超时先使用 Demuxer 当前阶段的默认值或 `PlayerConfig` 中已有字段；网络播放阶段再扩展 `config.network`。
 - `Tick()`：一次 `av_read_frame`，按 `stream_index` 分发到 video 或 audio 输出 Link。
 - 时间戳一次换算成微秒（`pts * num * 1000000 / den`），`AV_NOPTS_VALUE` 单独处理；epoch 从 `GetCurrentEpoch()` 读取写入每个 Packet；关键帧映射到 `kKeyFrame`。
 - 三种返回严格区分：`AVERROR_EOF` → `kEndOfStream`，取消标志生效 → `kStopped`，其他负值 → `kError`。
@@ -459,24 +477,25 @@ Day 11。
 
 ---
 
-## Day 13 — 帧协议收口与音频帧 DTO
+## Day 13 — FFmpeg 生命周期封装与解码前置规则
 
 ### Objective
-统一帧的所有权规则和带内信令，补齐音频侧数据对象和错误表达。
+在写 Decoder 前固定 FFmpeg 对象的所有权规则，避免后续模块到处裸管生命周期。
 
 ### Tasks
-- `VideoFrame` 改用与 `Packet` 相同的 `AVFrameFlag`，删掉重复的 `FrameFlag`；补色彩元数据（`color_space`/`color_trc`/`color_range`/像素格式）；统一 `pts_us` 与 `epoch` 的类型；修正前置声明的 class/struct 不一致。
-- 明确 `VideoFrame` 的 move/copy 规则并写进注释：buffer 用 `shared_ptr` 共享，帧对象可拷贝但不深拷像素。
-- `audio_frame.h`：RAII 封装 `AVFrame*`，携带 `pts_us`、采样率、声道数、采样格式、样本数、`epoch`、`flags`；禁拷贝、支持移动，规则同 `Packet`。
-- 定义结构化错误类型：模块名、错误码、系统/FFmpeg 错误文本、可恢复标志；定义上报通道的接口形状（Node → Pipeline → Facade），本 Day 只定接口不接线。
+- 明确 `AVFormatContext`、`AVCodecContext`、`AVPacket`、`AVFrame`、`SwsContext`、`SwrContext` 的创建者、释放者和跨线程传递规则。
+- 约定 Decoder 内部使用的 `AVFrame` 生命周期：`avcodec_receive_frame()` 得到的帧必须在离开 Decoder 前复制或转换成项目自己的 `VideoFrame` / `AudioFrame`。
+- 约定 `SwsContext` 和 `SwrContext` 按输入/输出参数缓存复用，参数变化时重建。
+- 定义 FFmpeg 错误码进入 `MediaError::FromFfmpeg()` 的统一写法。
+- 必要时新增轻量 RAII helper；如果暂时不写 wrapper，也必须把规则写进对应模块注释。
 
 ### Dependencies
 Day 10、Day 12。
 
 ### Acceptance Criteria
-- 全仓库只有一套帧标志枚举，前置声明与定义一致无警告。
-- `VideoFrame` 的 RAII 与共享语义、`AudioFrame` 移动后源对象析构安全，都有单测。
-- 错误对象能同时表达 FFmpeg 负错误码与系统 errno，且不依赖 Qt。
+- 每一种 FFmpeg 对象都能说清楚谁创建、谁释放、是否可以跨线程传递。
+- Decoder、Demuxer、格式转换、重采样不直接把 FFmpeg 指针暴露给 app。
+- 后续写 Decoder 时不再临时决定对象释放方式。
 
 ---
 
@@ -1160,22 +1179,23 @@ Day 42、Day 39。
 
 # 阶段 G：系统收口（Day 44–45）
 
-## Day 44 — 全量回归
+## Day 44 — 关键回归
 
 ### Objective
-在完整能力集上做一次系统性回归。
+在完整能力集上做一次关键路径回归，确认主要功能没有互相破坏。
 
 ### Tasks
 - 建回归矩阵，维度：输入源（本地 / HTTP / RTP）、轨道组合（音频-only / 视频-only / 音视频）、解码路径（软解 / 硬解）、控制操作（播放 / 暂停 / Seek / Stop / Reopen）、录制开关。
-- 逐组合执行并记录结果，修复暴露的问题。
-- 全矩阵在 ASan/UBSan 与 TSan 下各跑一轮。
+- 按风险挑选关键组合执行并记录结果：本地音视频软解、视频-only、音频-only、Seek/Stop/Reopen、录制 Drain、一个网络弱网样本、一个硬解样本。
+- 对改动过的高风险模块跑 Sanitizer，不要求全矩阵都跑 ASan/UBSan/TSan。
 - 记录各组合的常驻内存、峰值内存和队列深度峰值，与预算表比对，超出的项要么修代码要么修预算并写明理由。
 
 ### Dependencies
 Day 43。
 
 ### Acceptance Criteria
-- 回归矩阵全部通过，Sanitizer 无新增报告。
+- 选定的关键回归组合通过；未覆盖组合在文档中说明原因和剩余风险。
+- 跑过的 Sanitizer 无新增报告；未跑的 Sanitizer 不写成已通过。
 - 长时间播放（不少于 1 小时）无内存增长、无 fd 泄漏。
 - 实测内存和队列峰值不超过预算表，或预算表已按实测更新。
 
@@ -1230,10 +1250,10 @@ Day 44。
 
 - 全部代码在正式目录并纳入 CMake target，PUBLIC/PRIVATE 头文件边界正确。
 - `app` 层无法 include 任何私有头，边界由构建系统强制而非约定。
-- 全部测试为确定性测试，不用 sleep 证明并发正确，每个用例有超时。
-- 普通构建、警告构建、ASan/UBSan、TSan 全部通过。
+- 高风险自动化测试为确定性测试，不用 `sleep` 证明并发正确；可能阻塞的用例必须有超时。
+- 普通构建和关键测试通过；Sanitizer 用于线程、所有权和内存相关的高风险改动，不要求对所有组合常态全量运行。
 - 长时间运行无内存增长、无线程泄漏、无 FD 泄漏。
-- 全部 `.h`/`.cpp` 有 Doxygen 注释，类和函数说明职责、线程模型与生命周期。
+- 全部 `.h`/`.cpp` 有文件注释；类和公开函数说明职责、线程模型与生命周期。
 - 代码通过 clang-format 与 clang-tidy 检查。
 - 代码中不存在未经 `PlayerConfig` 的可调魔数。
 
@@ -1256,4 +1276,3 @@ Day 44。
 - 全部性能结论附输入、环境、时间源和测量方法。
 
 满足以上全部条件，项目视为完成。
-
