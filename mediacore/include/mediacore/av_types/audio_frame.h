@@ -1,7 +1,7 @@
 /**
  * @file audio_frame.h
  * @brief 音频帧数据对象，保存一段 packed（多声道音频数据的 交错排列（Interleaved）方式 ）
- * PCM 数据和随帧传递的时间戳、世代号、AVFrameFlag
+ * PCM 数据和随帧传递的时间戳、世代号、MediaDataFlag
  *
  * @details
  * AudioFrame 是 Decoder 的输出，后续会流向音画同步和音频输出设备和录制分支
@@ -23,7 +23,7 @@
 #include <memory>
 
 #include "audio_format.h"
-#include "mediacore/av_types/av_frame_flag.h"
+#include "mediacore/av_types/media_data_flag.h"
 #include "mediacore/logger.h"
 
 namespace mediacore {
@@ -54,7 +54,7 @@ struct AudioFrame {
     uint64_t epoch_{0};
 
     /// 随帧传递的控制标志 kFlush / kEOF/ kKeyFrame
-    AVFrameFlag flags_{AVFrameFlag::kNone};
+    MediaDataFlag flags_{MediaDataFlag::kNone};
 
     /**
      * @brief 构造一个空的音频帧
@@ -100,14 +100,14 @@ struct AudioFrame {
      * @brief 追加一个带内标志
      * @param flag 要追加的带内标志
      */
-    void AddFlag(AVFrameFlag flag) { flags_ |= flag; }
+    void AddFlag(MediaDataFlag flag) { flags_ |= flag; }
 
     /**
      * @brief 检查当前帧是否携带指定的带内标志
      * @param flag 要检查的标志
      * @return true 表示含有指定的带内标志，false 表示不携带指定的标志
      */
-    bool HasFlag(AVFrameFlag flag) const { return (flags_ & flag) != AVFrameFlag::kNone; }
+    bool HasFlag(MediaDataFlag flag) const { return (flags_ & flag) != MediaDataFlag::kNone; }
 
     /**
      * @brief 检查本帧是不是一个有效的 packed PCM 音频帧

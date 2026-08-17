@@ -64,7 +64,7 @@ ai-media-player/
 │   │   ├── logger.h                    日志宏与初始化接口
 │   │   └── av_types/                   跨边界 DTO
 │   │       ├── frame_size.h            具名宽高
-│   │       ├── av_frame_flag.h         帧/包带内标志位
+│   │       ├── media_data_flag.h         帧/包带内标志位
 │   │       └── video_frame.h           视频帧（Software / Hardware 两种形态）
 │   │
 │   └── src/                            PRIVATE：仅库自身可见

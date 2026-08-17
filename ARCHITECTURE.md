@@ -451,11 +451,11 @@ RAII 封装 `AVPacket*`：构造时 `av_packet_alloc()`（只分配结构体，�
 |---|---|
 | `pts_us_` / `dts_us_` | 微秒时间戳。FFmpeg 的 `pts`/`dts` 以各流自己的 `time_base` 为单位，在 Demuxer 一次换算成微秒后，下游不必关心 `time_base`，同步节点也能直接比较音视频时间戳 |
 | `epoch_` | Seek 世代号，从 `SyncContext::GetEpoch()` 读取 |
-| `flags_` | `AVFrameFlag` 位掩码：`kKeyFrame` / `kEOF` / `kFlush` |
+| `flags_` | `MediaDataFlag` 位掩码：`kKeyFrame` / `kEOF` / `kFlush` |
 
-`AVFrameFlag` 定义在公共头 `include/mediacore/av_types/av_frame_flag.h`，用 `enum class` + `constexpr` 位运算重载。
+`MediaDataFlag` 定义在公共头 `include/mediacore/av_types/media_data_flag.h`，用 `enum class` + `constexpr` 位运算重载。
 
-**已知不一致：** `VideoFrame`（`video_frame.h`）目前有自己的一套 `FrameFlag`（只有 `kNone` / `kFlush` / `kEOF`），与 `Packet` 使用的 `AVFrameFlag` 并存。两套标志的统一是后续 Frame 协议里程碑的工作，当前未收口。
+**已知不一致：** `VideoFrame`（`video_frame.h`）目前有自己的一套 `FrameFlag`（只有 `kNone` / `kFlush` / `kEOF`），与 `Packet` 使用的 `MediaDataFlag` 并存。两套标志的统一是后续 Frame 协议里程碑的工作，当前未收口。
 
 `Packet` 目前**没有任何生产者或消费者** —— Demuxer 和 Decoder 尚未实现。它是独立完成的 DTO，不代表解封装能力已经存在。
 

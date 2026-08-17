@@ -1,52 +1,40 @@
 /**
  * @file packet.h
- * @brief Packrt DTO --- RAII 封装的 AVPacket，携带时间戳/世代号/标志位
+ * @brief RAII 封装的 AVPacket，携带时间戳/世代号/标志位
  * @details Demuxer 从容器中读出压缩数据包，通过 Link<Packet> 传递给 Decoder 消费
- *  时间戳统一换算为微秒（下游无须关系 time_base），epoch_ 用于 Seek 时抛弃旧世代包，flags 扩展带内
- *  信令
+ *  时间戳统一换算为微秒，epoch_ 用于 Seek 时抛弃旧世代包，flags 扩展带内信令
  *
  * @par 职责边界
- *  - Packet 只负责"数据容器"：持有 AVPacket* + 元信息（pts/dts/epoch/flags）
+ *  - Packet 只负责把 Demuxer 读到的压缩数据和少量随包信息一起带着走
+ *  - AVPacket*：FFmpeg 真实包体
+ *  - pts/dts：微秒时间戳，区分“有值”和“没有值”
+ *  - epoch：Seek 世代号，用来丢掉旧数据
+ *  - flags：关键帧、刷新等随包标记
  *  - 不负责解封装逻辑（由 DemuxerNode 完成）
  *  - 不负责解码逻辑（由 DecoderNode 完成）
  *
- * @par 生命周期
- *  创建：DemuxerNode 调用 av_read_frame 后构造 Packet
- *  传递：通过 Link<Packet> 在 DAG 节点间移动（移动语义，零拷贝）
- *  销毁：Decoder 消费后自动析构，av_packet_free 释放 FFmpeg 内存
- *
- * @par 线程安全性
- *  Packet 本身不保证线程安全（单一所有者模型）。跨线程传递通过 Link<Packet>
- *  的 ThreadSafeQueue 保证安全（生产者-消费者模式）
- *
- * @par 时间戳为什么用微秒？
- *  FFmpeg 的 AVPacket.pts/dts 以 time_base 为单位（各流不同，如 1/90000）
- *  统一换算为微秒后：
- *  - 下游无需关心 time_base 复杂度
- *  - AVSyncNode 可直接比较音视频时间戳
- *  - 换算公式：pts_us_ = pts * time_base.num * 1000000 / time_base.den
- *  换算时机：Demuxer 读取时完成，一次换算，全链路受益
+ * 正常播放结束不要再给 Packet 单独塞 EOF 包，统一交给 Link::Close() 传播
  */
 
 #pragma once
 
 #include <cstdint>
+#include <optional>
 
-#include "mediacore/av_types/av_frame_flag.h"
+#include "mediacore/av_types/media_data_flag.h"
 
 struct AVPacket;
 
 namespace mediacore {
 
 /**
- * @file packet.h
  * @brief 压缩数据包 DTO， RAII 封装的 AVPacket*
  *
  * @details
- * - 独占所有权：禁止拷贝（AVPacket 深拷贝代价高），支持移动（零拷贝传递）
+ * - 独占所有权：禁止拷贝，支持移动
  * - 时间戳统一微秒：下游无需关心 time_base
  * - epoch 字段：Seek 时递增，下游丢弃旧世代包
- * - 带内信令：通过 flags 传递 EOF/Flush，无需额外通道
+ * - 带内信令：通过 flags 传递 kKeyFrame/Flush，无需额外通道
  *
  * @par 与 AVPacket 的关系
  *  Packet 是 AVPacket 的 RAII 包装 + 元信息扩展，生命周期管理：
@@ -63,16 +51,20 @@ class Packet {
 public:
     /**
      * @brief 默认构造函数：分配空的 AVPacket
+     * @details
+     * 会先分配一个 FFmpeg 的 AVPacket 结构体；如果分配失败，pkt_ 保持为空，调用方需要用 IsEmpty() 判断
      */
     Packet();
 
     /**
      * @brief 析构函数：释放 AVPacket 内存
+     * 这里只释放 FFmpeg 包体，不负责通知下游，也不负责改动队列
      */
     ~Packet();
 
-    // 禁止拷贝 AVPacket
+    /** @brief 禁止拷贝，避免 AVPacket 被重复释放。 */
     Packet(const Packet&) = delete;
+    /** @brief 禁止拷贝赋值，避免 AVPacket 被重复释放。 */
     Packet& operator=(const Packet&) = delete;
 
     /**
@@ -96,35 +88,55 @@ public:
     AVPacket* GetAVPacket() { return pkt_; }
 
     /**
+     * @brief 判断当前 packet 包是否含有 pts
+     * @return true 表示含有 pts，false 表示不含 pts
+     */
+    bool HasPts() const noexcept { return pts_us_.has_value(); }
+
+    /**
+     * @brief 判断当前 packet 包是否含有 dts
+     * @return true 表示含有 dts，false 表示不含 dts
+     */
+    bool HasDts() const noexcept { return dts_us_.has_value(); }
+
+    /**
      * @brief 获取展示时间戳（微秒）
      * @return int64_t 已换算为微秒的 PTS（Presentation Time Stamp）
      */
-    int64_t GetPtsUs() const { return pts_us_; }
+    std::optional<std::int64_t> GetPtsUs() const { return pts_us_; }
 
     /**
-     * @brief 设置展示时间戳（微秒）
-     * @param pts 微秒级时间戳（由 Demuxer 从 AVPacket.pts 换算）
+     * @brief 获取解码时间戳
+     * @return 有值时返回微秒时间戳，没有时返回空值
      */
-    void SetPtsUs(int64_t pts) { pts_us_ = pts; }
+    std::optional<std::int64_t> GetDtsUs() const noexcept { return dts_us_; }
 
     /**
-     * @brief 获取解码时间戳（微秒）
-     * @return int64_t 已经换算为微秒的 DTS
-     * @note 对于无 B 帧的流，如Baseline H.264，DTS = PTS
+     * @brief 设置展示时间戳
+     * @param pts 微秒级时间戳；如果没拿到时间戳，就传空值
      */
-    int64_t GetDtsUs() const { return dts_us_; }
+    void SetPtsUs(std::optional<std::int64_t> pts) noexcept { pts_us_ = pts; }
+    /**
+     * @brief 设置解码时间戳
+     * @param dts 微秒级时间戳；如果没拿到时间戳，就传空值
+     */
+    void SetDtsUs(std::optional<std::int64_t> dts) noexcept { dts_us_ = dts; }
 
     /**
-     * @brief 设置解码时间戳（微秒）
-     * @param dts 微秒级时间戳（由 Demuxer 从 AVPacket.dts 换算）
+     * @brief 清空 PTS，表示这包没有可用展示时间戳
      */
-    void SetDtsUs(int64_t dts) { dts_us_ = dts; }
+    void ClearPtsUs() noexcept { pts_us_.reset(); }
+
+    /**
+     * @brief 清空 DTS，表示这包没有可用解码时间戳
+     */
+    void ClearDtsUs() noexcept { dts_us_.reset(); }
 
     /**
      * @brief 获取世代号
-     * @return uint64_t 当前 Packet 所属的 Seek 世代（从 SyncContext 同步）
+     * @return 读取本包所属的 Seek 世代号
      */
-    uint64_t GetEpoch() const { return epoch_; }
+    std::uint64_t GetEpoch() const { return epoch_; }
 
     /**
      * @brief 设置世代号
@@ -134,36 +146,36 @@ public:
 
     /**
      * @brief 获取标志位
-     * @return AVFrameFlag 包含 KeyFrame/EOF/Flush 等标志
+     * @return MediaDataFlag 包含 KeyFrame/EOF/Flush 等标志
      */
-    AVFrameFlag GetFlags() const { return flags_; }
+    MediaDataFlag GetFlags() const { return flags_; }
 
     /**
      * @brief 设置标志位（覆盖）
      * @param flag 新的标志位
      */
-    void SetFlags(AVFrameFlag flags) { flags_ = flags; }
+    void SetFlags(MediaDataFlag flags) { flags_ = flags; }
 
     /**
      * @brief 检查是否包含标志位
-     * @param flag 要检查的标志 如（AVFrameFlag::kKeyFrame）
+     * @param flag 要检查的标志 如（MediaDataFlag::kKeyFrame）
      * @return true，包含该标志位，false，不含该标志位
      */
-    bool HasFlag(AVFrameFlag flag) const { return (flags_ & flag) != AVFrameFlag::kNone; }
+    bool HasFlag(MediaDataFlag flag) const { return (flags_ & flag) != MediaDataFlag::kNone; }
 
     /**
      * @brief 追加标志（不影响已有标志）
      * @param flag 要追加的标志位
-     * @details 用法：pkt.AddFlag(AVFrameFlag::kFlush); // 保留已有 kKeyFrame
+     * @details 用法：pkt.AddFlag(MediaDataFlag::kFlush); // 保留已有 kKeyFrame
      */
-    void AddFlag(AVFrameFlag flag) { flags_ |= flag; }
+    void AddFlag(MediaDataFlag flag) { flags_ |= flag; }
 
     /**
      * @brief 移除标志（不影响其他标志）
      * @param flag 要移除的标志位
      * @details 用法：pkt.RemoveFlag(AVFramFlag::kFlush)
      */
-    void RemoveFlag(AVFrameFlag flag) { flags_ &= ~flag; }
+    void RemoveFlag(MediaDataFlag flag) { flags_ &= ~flag; }
 
     /**
      * @brief 是否为空包（分配失败或已被移动）
@@ -172,11 +184,11 @@ public:
     bool IsEmpty() const { return pkt_ == nullptr; }
 
 private:
-    AVPacket* pkt_; ///< FFmpeg 原生包，通过 av_packet_alloc/free 管理
-    int64_t pts_us_; ///< 展示时间戳（微秒，已从 time_base 换算）
-    int64_t dts_us_; ///< 解码时间戳（微秒，已从 time_base 换算）
-    uint64_t epoch_; ///< Seek 世代号（从 SyncContext 同步，用于作废旧包）
-    AVFrameFlag flags_; ///< 标志位（KeyFrame/EOF/Flush，支持位运算组合）
+    AVPacket* pkt_{nullptr};  ///< FFmpeg 原生包，通过 av_packet_alloc/free 管理
+    std::optional<std::int64_t> pts_us_{};  ///< 展示时间戳（微秒，已从 time_base 换算）
+    std::optional<std::int64_t> dts_us_{};  ///< 解码时间戳（微秒，已从 time_base 换算）
+    std::uint64_t epoch_{0};  ///< Seek 世代号（从 SyncContext 同步，用于作废旧包）
+    MediaDataFlag flags_{MediaDataFlag::kNone};  ///< 标志位
 };
 
-} // namespace mediacore
+}  // namespace mediacore

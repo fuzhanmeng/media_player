@@ -9,6 +9,7 @@ set(MEDIACORE_SOURCES
     src/utils/logger.cpp
     src/config/player_config.cpp
     src/core/media_error.cpp
+    src/demux/ffmpeg_demuxer_node.cpp
 )
 
 # ============ 定义静态库 ============
@@ -41,4 +42,5 @@ target_link_libraries(mediacore PUBLIC
     ffmpeg::avutil    # av_malloc / av_free 等内存与工具函数
     ffmpeg::avcodec   # AVPacket 相关函数
     spdlog::spdlog    # LOG_* 宏和 logger 实现都依赖 spdlog
+    ffmpeg::avformat  # ffmpeg 解复用
 )

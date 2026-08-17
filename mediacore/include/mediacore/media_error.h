@@ -100,7 +100,7 @@ public:
 
     /**
      * @brief 判断一个对象是否保存了一个真实错误
-     * @return true 表示错误，false 表示没有错误
+     * @return true 表示有错误，false 表示没有错误
      */
     bool HasError() const { return category_ != MediaErrorCategory::kNone; }
 

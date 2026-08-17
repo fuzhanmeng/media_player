@@ -20,7 +20,7 @@
 #include <new>  // std::bad_alloc
 
 #include "frame_size.h"
-#include "mediacore/av_types/av_frame_flag.h"
+#include "mediacore/av_types/media_data_flag.h"
 #include "mediacore/logger.h"
 
 extern "C" {
@@ -61,7 +61,7 @@ struct VideoFrame {
     uint64_t epoch_{0};
 
     ///< 随帧传递的控制标志，例如 kFlush / kEOF / kKeyFrame
-    AVFrameFlag flags_{AVFrameFlag::kNone};
+    MediaDataFlag flags_{MediaDataFlag::kNone};
 
     /**
      * @brief 构造一个空视频帧
@@ -117,16 +117,16 @@ struct VideoFrame {
 
     /**
      * @brief 追加一个带内标志
-     * @param flag 要追加的标志，例如 AVFrameFlag::kEOF
+     * @param flag 要追加的标志，例如 MediaDataFlag::kEOF
      */
-    void AddFlag(AVFrameFlag flag) { flags_ |= flag; };
+    void AddFlag(MediaDataFlag flag) { flags_ |= flag; };
 
     /**
      * @brief 检查当前帧是否携带指定控制标志。
      * @param flag 要检查的标志。
      * @return true 表示包含该标志，false 表示不包含。
      */
-    bool HasFlag(AVFrameFlag flag) const { return (flags_ & flag) != AVFrameFlag::kNone; }
+    bool HasFlag(MediaDataFlag flag) const { return (flags_ & flag) != MediaDataFlag::kNone; }
 
     /**
      * @brief 校验本帧是否为可安全渲染的有效数据帧

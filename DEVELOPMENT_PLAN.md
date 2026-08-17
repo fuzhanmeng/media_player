@@ -400,15 +400,15 @@ Day 08。
 定义在 Node 之间流动的基础数据对象，并建立当前阶段会用到的配置和错误表达。
 
 ### Tasks
-- `av_frame_flag.h`：`AVFrameFlag` 位掩码（`kKeyFrame`/`kEOF`/`kFlush`）+ `constexpr` 位运算重载。
+- `media_data_flag.h`：`MediaDataFlag` 位掩码（`kKeyFrame`/`kEOF`/`kFlush`）+ `constexpr` 位运算重载。
 - `packet.h/.cpp`：RAII 封装 `AVPacket*`，构造 `av_packet_alloc()`，析构 `av_packet_free()`。
 - 禁拷贝，实现移动构造与移动赋值：窃取指针后源对象置空，移动赋值先释放自身资源并做自赋值检查。
 - 携带 `pts_us_`/`dts_us_`/`epoch_`/`flags_` 及读写接口，`IsEmpty()` 判断是否已被移动或分配失败。
 - `player_config.h/.cpp`：先定义近期会用到的 `demux` / `decode` / `audio` 三组参数，提供 `Default()` 和 `Validate()`；后续网络、录制和 Jitter Buffer 开始实现时再扩展对应分组。
 - `media_error.h/.cpp`：定义结构化错误对象，能保存错误类别、模块名、原始错误码、可读错误文本和是否可恢复；公共头文件不暴露 FFmpeg 类型。
 - `stream_info.h`：定义探测结果 DTO，包括 `Rational`、`VideoStreamInfo`、`AudioStreamInfo`、`MediaInfo`；只保存普通 C++ 字段，不保存 `AVFormatContext` / `AVStream` / `AVCodecParameters` 指针。
-- `audio_format.h` / `audio_frame.h`：定义解码后 packed PCM 的格式和音频帧对象，与 `Packet` / `VideoFrame` 共用 `AVFrameFlag`。
-- `VideoFrame` 改用与 `Packet` 相同的 `AVFrameFlag`，删掉重复的 `FrameFlag`；统一 `pts_us` 与 `epoch` 语义。
+- `audio_format.h` / `audio_frame.h`：定义解码后 packed PCM 的格式和音频帧对象，与 `Packet` / `VideoFrame` 共用 `MediaDataFlag`。
+- `VideoFrame` 改用与 `Packet` 相同的 `MediaDataFlag`，删掉重复的 `FrameFlag`；统一 `pts_us` 与 `epoch` 语义。
 - 本 Day 只定义基础 DTO 和校验规则，各模块接线在各自的 Day 完成。
 - CMake 链接 `avutil` 与 `avcodec`。
 
@@ -420,7 +420,7 @@ Day 01。
 - 时间戳单位在注释和接口命名上明确为微秒。
 - 不提供任何配置时能拿到一份完整可用的默认配置。
 - 配置字段非法时返回明确错误，不静默夹取。
-- 全仓库只有一套帧标志枚举，`Packet`、`VideoFrame`、`AudioFrame` 都使用 `AVFrameFlag`。
+- 全仓库只有一套帧标志枚举，`Packet`、`VideoFrame`、`AudioFrame` 都使用 `MediaDataFlag`。
 - 错误对象能同时表达 FFmpeg 负错误码与系统 errno，且不依赖 Qt。
 - `MediaInfo` 能表达视频-only、音频-only、音视频都有三种组合，并且不泄漏 FFmpeg 类型。
 
