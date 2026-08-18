@@ -10,7 +10,6 @@
 
 UI 层用 Qt 6 + OpenGL 实现，通过 `IPlayer` / `IVideoSink` 两个接口与媒体内核完全解耦：UI 不知道 Demuxer、Decoder、Pipeline 的存在，媒体内核也不认识 Qt。
 
-仓库中另有 `legacy/`，是重构前的旧实现，仅作问题参考，不是新架构的设计依据或迁移来源。
 
 ---
 
@@ -68,7 +67,7 @@ ai-media-player/
 │   │       └── video_frame.h           视频帧（Software / Hardware 两种形态）
 │   │
 │   └── src/                            PRIVATE：仅库自身可见
-│       ├── dag/                        DAG 框架：图所有权、线程生命周期、数据边、运行门控
+│       ├── core/                        DAG 框架：图所有权、线程生命周期、数据边、运行门控
 │       │   ├── pipeline.h
 │       │   ├── inode.h
 │       │   ├── link.h
@@ -159,7 +158,6 @@ ai-media-player/
 │   └── color/                          色彩管线参考比对
 │
 ├── resource/                           测试媒体与资源文件
-└── legacy/                             旧实现归档（只读参考）
 ```
 
 各目录职责：
@@ -167,7 +165,7 @@ ai-media-player/
 | 目录 | 职责 |
 |---|---|
 | `mediacore/include/` | 公共契约。`app` 层唯一能 include 的内容，边界由 CMake 的 PUBLIC/PRIVATE 强制 |
-| `mediacore/src/dag/` | DAG 框架：图的所有权、线程生命周期、数据边、运行门控 |
+| `mediacore/src/core/` | DAG 框架：图的所有权、线程生命周期、数据边、运行门控 |
 | `mediacore/src/player/` | 播放器门面、状态机与工厂：命令校验、状态维护 |
 | `mediacore/src/config/` | 配置系统：全部可调参数的唯一来源 |
 | `mediacore/src/av_types/` | 内部 DTO，只在 Node 之间流动，UI 不可见 |
@@ -281,7 +279,7 @@ StubPlayer  ──生成渐变测试帧──►  IVideoSink  ──►  OpenGLV
 | 媒体框架 | FFmpeg 6.1（libavutil / libavcodec 已链接） | 部分接入 |
 | 测试 | CTest | 使用中 |
 | 动态检查 | ASan / UBSan / TSan | 使用中 |
-| 日志 | spdlog | 已声明依赖，尚未接入代码 |
+| 日志 | spdlog | 使用中 |
 | 数学 / 图像工具 | glm、stb | 已声明依赖，尚未接入代码 |
 | 音频后端 | ALSA（libasound） | Planned |
 | 硬件解码 | VA-API | Planned |
@@ -326,8 +324,9 @@ ctest --test-dir build-dag --output-on-failure
 | D1–D5 | Qt 外壳、公共契约、OpenGL 渲染闭环、StubPlayer | 完成 |
 | D6–D9 | DAG 核心：Queue / Link / Node / SyncContext / Pipeline | 完成 |
 | D10 | `Packet` RAII、微秒时间戳、epoch、flags | 完成 |
-| D11 | StreamInfo + FfmpegDemuxerNode | 下一步 |
-| D12 及之后 | 解码、音频、同步、Seek、录制、硬解、色彩、网络 | 未开始 |
+| D11 | StreamInfo 转换（FFmpeg 对象 → `MediaInfo`） | 完成 |
+| D12 | `FfmpegDemuxerNode` 打开、探测与读包 | 下一步（实现待审，见 `_review_temp/`） |
+| D13 及之后 | FFmpeg 生命周期规则、解码、音频、同步、Seek、录制、硬解、色彩、网络 | 未开始 |
 
 真实媒体解封装、解码、音画同步、录制、硬解和网络能力**均未实现**，当前画面来自 `StubPlayer` 的测试帧。
 
