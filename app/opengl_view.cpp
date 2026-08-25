@@ -1,7 +1,9 @@
 /**
  * @file opengl_view.cpp
- * @brief OpenGLView 实现：YUV420P 三平面纹理上传 + 片段着色器 YUV->RGB + 全屏矩形渲染
- * @details 全部 GL 调用集中在 GUI 线程（initializeGL/resizeGL/paintGL），后台线程只负责把帧投进信箱
+ * @brief OpenGLView 实现：YUV420P 三平面纹理上传 + 片段着色器 YUV->RGB 转换 + 全屏矩形渲染
+ * @details
+ * 所有 GL 调用集中在 initializeGL/resizeGL/paintGL 中，均在 GUI 线程执行，后台线程只通过
+ * OnReceiveVideoFrame 把帧写入信箱，不直接触碰任何 GL 状态
  */
 #include "opengl_view.h"
 
@@ -17,10 +19,11 @@ namespace {
 
 /**
  * @brief 顶点着色器源码（GLSL 3.30 Core）
- * @details 顶点着色器在 GPU 上对"每个顶点"执行一次
- *          主要职责：
- *          1. 把 CPU 传入的顶点位置输出为裁剪空间坐标 gl_Position
- *          2. 把纹理坐标 aTexCoord 透传给片段着色器，GPU 会在三角形内部自动插值
+ * @details
+ * 顶点着色器对每个顶点执行一次，职责有两点：
+ * 主要职责：
+ * 1. 把 CPU 传入的顶点位置输出为裁剪空间坐标 gl_Position
+ * 2. 把纹理坐标 aTexCoord 透传给片段着色器，GPU 会在三角形内部自动插值
  */
 constexpr auto kVertexShaderSource = R"(#version 330 core
 
@@ -40,10 +43,10 @@ void main() {
 )";
 
 /**
- * @brief 片段着色器源码（GLSL 3.30 Core）- 高性能矩阵版
- * @details 片段着色器在 GPU 上对"每个像素（片元）"并行执行一次
- *          这里是 YUV420P 到 RGB 转换发生地从 3 张单通道纹理采样，
- *          再使用 3x3 矩阵乘法瞬间算出 RGB，彻底解放 CPU
+ * @brief 片段着色器源码（GLSL 3.30 Core）
+ * @details
+ * 片段着色器在 GPU 上对每个像素（片元）并执行一次，这里从 3 张单通道纹理采样出 YUV，再用 3x3 矩阵乘法
+ * 一次性算出 RGB
  */
 constexpr auto kFragmentShaderSource = R"(#version 330 core
 
@@ -82,35 +85,35 @@ void main() {
 /**
  * @brief 全屏矩形顶点数据：4 个顶点 × (2维位置 + 2维纹理坐标)
  * @details
- *   1. 位置 (NDC坐标)：范围 -1.0 ~ 1.0。(-1,-1)为左下角，(1,1)为右上角，撑满整个屏幕。
- *   2. 纹理 (UV坐标)：由于视频内存的第一行(V=0)是人头(画面顶部)，而屏幕Y=1才是顶部。
- *      【核心修复】这里将 V 轴进行了倒置映射，防止画面倒立！
+ * 1. 位置（NDC 坐标）：范围 -1.0 ~ 1.0，(-1,-1) 为左下角，(1,1) 为右上角，撑满整个视口。
+ * 2. 纹理（UV 坐标）：视频数据里第一行（V=0）对应画面顶部，而纹理坐标 V=0 在 OpenGL 里
+ * 对应贴图底部，因此这里对 V 轴做了倒置映射，避免画面上下颠倒
  */
 constexpr std::array<float, 16> kVertices = {
     // 顶点位置 NDC (X, Y)  // 纹理挂钩 (U, V) -> V轴已倒置！
     -1.0f,
     -1.0f,
     0.0f,
-    1.0f,  // 屏幕左下角 -> 绑定画面最底端 (脚)
+    1.0f,  // 屏幕左下角 -> 画面底部
     1.0f,
     -1.0f,
     1.0f,
-    1.0f,  // 屏幕右下角 -> 绑定画面最底端
+    1.0f,  // 屏幕右下角 -> 画面底部
     1.0f,
     1.0f,
     1.0f,
-    0.0f,  // 屏幕右上角 -> 绑定画面最顶端 (人头)
+    0.0f,  // 屏幕右上角 -> 画面顶部
     -1.0f,
     1.0f,
     0.0f,
-    0.0f  // 屏幕左上角 -> 绑定画面最顶端 (人头)
+    0.0f  // 屏幕左上角 -> 画面顶部
 };
 
 /**
  * @brief 索引数组：指示 GPU 如何用三角形拼成矩形
  * @details
- *   GPU 只能绘制三角形。这里复用上面的 4 个顶点，通过索引连线，将其分割为 2 个三角形。
- *   - 逆时针绕序 (CCW)：OpenGL 默认认为逆时针连线的是正面。
+ * OpenGL 只能绘制三角形，这里复用上面 4 个顶点，按索引连线拆分为 2 个三角形
+ * 逆时针绕序（CCW）：OpenGL 默认将逆时针连线的三角形视为正面
  */
 constexpr std::array<unsigned int, 6> kIndices = {
     0,
@@ -128,13 +131,13 @@ constexpr std::array<unsigned int, 6> kIndices = {
 constexpr std::array<float, 9> kMatrixBt709 = {
     1.0f,
     1.0f,
-    1.0f,  // 第 1 列 (对应 Y 的系数)
+    1.0f,  // 第 1 列（Y 的系数）
     0.0f,
     -0.1873f,
-    1.8556f,  // 第 2 列 (对应 U 的系数)
+    1.8556f,  // 第 2 列（U 的系数）
     1.5748f,
     -0.4681f,
-    0.0f  // 第 3 列 (对应 V 的系数)
+    0.0f  // 第 3 列（V 的系数）
 };
 
 }  // namespace
@@ -143,8 +146,9 @@ constexpr std::array<float, 9> kMatrixBt709 = {
 
 /**
  * @brief 构造函数
- * @details 跨线程投递的核心连接：FrameArrived 信号 -> update() 槽 Qt::QueuedConnection：
- *          无论 emit 发生在哪个线程，都是异步投递
+ * @details
+ * 把 FrameArrived 信号连接到自身的 update()，连接类型为 Qt::QueueConnection，无论 emit 发生在
+ * 哪个线程，update() 调用都会被投递到本对象所在的 GUI 线程执行，这是后台线程通知 GUI 线程重绘的关键
  */
 OpenGLView::OpenGLView(QWidget* parent) : QOpenGLWidget(parent) {
     connect(this, &OpenGLView::FrameArrived, this, QOverload<>::of(&QOpenGLWidget::update), Qt::QueuedConnection);
@@ -154,15 +158,15 @@ OpenGLView::OpenGLView(QWidget* parent) : QOpenGLWidget(parent) {
  * @brief 析构函数
  */
 OpenGLView::~OpenGLView() {
-    // 释放 GPU 资源之前，必须先 makeCurrent：把本控件的 GL 上下文绑定到当前线程
-    // 否则 glDeleteTextures 等调用无上下文可作用，导致显存泄露或者崩溃
+    // 释放 GPU 资源前必须先 makeCurrent，把本控件的 GL 上下文绑定到当前线程
+    // 否则 glDeleteTextures 等调用没有上下文可作用，会导致显存泄漏或崩溃
     makeCurrent();
 
-    // glDeleteTextures：删除 SetupTextures 创建的 Y/U/V 三平面对应的纹理句柄，归还显存
+    // 删除 SetupTextures 创建的 Y/U/V 三张纹理句柄，归还显存
     glDeleteTextures(static_cast<GLsizei>(texture_ids_.size()), texture_ids_.data());
 
-    // vbo_/ebo_/vao_ 是 Qt 封装对象，析构时会自动 destroy()，无需手动删除
-    // QOpenGLShaderProgram 同理，RAII自动释放着色器程序
+    // vbo_/ebo_/vao_ 是 Qt 封装对象，析构时会自动 destroy()，无需手动释放
+    // QOpenGLShaderProgram 同理，由 RAII 自动释放着色器程序
 
     // 解绑上下文，与 makeCurrent 配对
     doneCurrent();
@@ -183,27 +187,26 @@ void OpenGLView::OnReceiveVideoFrame(std::shared_ptr<mediacore::VideoFrame> vide
 
     {
         // 信箱写入：加锁，新帧直接覆盖旧帧（旧 shared_ptr 引用计数减一，可能触发释放）
-        // 宁可丢掉来不及渲染的旧帧，也不堆积延迟
+        // 宁可丢弃来不及渲染的旧帧，也不让未渲染的帧堆积造成延迟
         std::lock_guard<std::mutex> lock(frame_mutex_);
         current_frame_ = std::move(video_frame);
     }
 
-    // 通知 GUI 线程，信箱中有新的一帧到来，该重绘了
-    // 因为是 QueuedConnection，此处 emit 立即返回，不阻塞后台生产线程
+    // 通知 GUI 线程信箱中有新帧、需要重绘
+    // 由于是 Qt::QueuedConnection，emit 在这里立即返回，不会阻塞当前的后台生产线程
     emit FrameArrived();
 }
 
 /**
- * @brief GL 生命周期回调（全部在 GUI 线程、上下文已 makeCurrent）
+ * @brief GL 生命周期回调（均在 GUI 线程执行，上下文已由 Qt 完成 makeCurrent）
  */
 void OpenGLView::initializeGL() {
     LOG_INFO("OpenGL initialization started");
 
-    // initializeOpenGLFunctions：加载当前上下文对应的 OpenGL 3.3 函数指针
-    // 必须在任何 gl* 调用前执行一次，由 OpenGLFunctions_3_3_Core 提供
+    // 加载当前上下文对应的 OpenGL 3.3 函数指针，必须在任何 gl* 调用之前执行一次
     initializeOpenGLFunctions();
 
-    // glClearColor：设置清屏颜色（RGBA），此处深灰色后续 glClear 用此颜色填充
+    // 设置清屏颜色（RGBA），后续 glClear 会用这个颜色填充缓冲区
     glClearColor(0.1f, 0.1f, 0.15f, 1.0f);
 
     shader_ready_ = BuildShader();  // 编译链接着色器
@@ -218,7 +221,7 @@ void OpenGLView::initializeGL() {
 }
 
 /**
- * @brief 窗口大小调整：窗口大小变化时更新 glViewport
+ * @brief 窗口大小调整：更新 glViewport 以匹配新的物理尺寸
  */
 void OpenGLView::resizeGL(int width, int height) {
     // glViewport：定义 NDC（-1，1）映射到窗口的哪块像素区域
@@ -227,7 +230,7 @@ void OpenGLView::resizeGL(int width, int height) {
 }
 
 /**
- * @brief 渲染一帧：从信箱取最新帧，上传三平面纹理，着色器绘制到屏幕
+ * @brief 渲染一帧：从信箱取最新帧，上传三平面纹理，用着色器绘制到屏幕
  */
 void OpenGLView::paintGL() {
     // 用 initializeGL 设的颜色填充后缓冲
@@ -238,14 +241,14 @@ void OpenGLView::paintGL() {
         return;
     }
 
-    // 1. 从信箱取最新帧的副本
+    // 1. 从信箱取出最新帧的一份引用
     std::shared_ptr<mediacore::VideoFrame> frame;
     {
         std::lock_guard<std::mutex> lock(frame_mutex_);
         frame = current_frame_;
     }
 
-    // 如果信箱空了、或者帧无效（空帧/Flush/EOF信令帧），只清屏，不渲染纹理
+    // 信箱为空，或帧无效（例如空帧、Flush/EOF 控制信令帧），只清屏不渲染纹理
     if (frame == nullptr || !frame->IsValid()) {
         LOG_TRACE("Paint skipped because no valid frame is available");
         return;
@@ -283,7 +286,7 @@ void OpenGLView::paintGL() {
 }
 
 /**
- * @brief 编译链接 YUV -> RGB 的顶点 + 片段着色器
+ * @brief 编译链接 YUV -> RGB 的顶点着色器与片段着色器
  */
 bool OpenGLView::BuildShader() {
     if (!shader_program_.addShaderFromSourceCode(QOpenGLShader::Vertex, kVertexShaderSource)) {
@@ -330,16 +333,16 @@ void OpenGLView::SetupGeometry() {
     ebo_.bind();
     ebo_.allocate(kIndices.data(), static_cast<int>(sizeof(unsigned int) * kIndices.size()));
 
-    // 每个顶点 4 个 float：前 2 个是位置，后 2 个是纹理坐标
+    // 每个顶点占 4 个 float：前 2 个是位置，后 2 个是纹理坐标
     const int stride = 4 * static_cast<int>(sizeof(float));
 
     // 属性槽 0 = 位置
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(0));
     glEnableVertexAttribArray(0);
 
-    // 属性槽 1 = 纹理坐标 (偏移 2*float)
-    // 修复了原写法的 bug：GL_FALSE 应该是 GL_FLOAT
-    // VBO 绑定状态下，OpenGL 把最后一个参数解释为“顶点内字节偏移”而不是普通 CPU 指针
+    // 属性槽 1 = 纹理坐标（偏移 2 个 float）
+    // 在 VBO 已绑定的状态下，glVertexAttribPointer 的最后一个参数会被解释为顶点内的
+    // 字节偏移，而不是普通的 CPU 指针
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(2 * sizeof(float)));  // NOLINT
 
     glEnableVertexAttribArray(1);
@@ -378,7 +381,7 @@ void OpenGLView::UploadFrameTextures(const mediacore::VideoFrame& frame) {
     const int frame_width = frame.width_;
     const int frame_height = frame.height_;
 
-    // 1. 检测分辨率变化：若变了，需重新分配显存；否则只更新池水
+    // 检测分辨率是否变化：变化时需要重新分配显存，否则只更新已有纹理的内容
     const bool need_realloc =
         !texture_allocated_ || frame_width != last_frame_width_ || frame_height != last_frame_height_;
 
@@ -387,12 +390,11 @@ void OpenGLView::UploadFrameTextures(const mediacore::VideoFrame& frame) {
     }
 
     // 2. 内存对齐保护
-    // 强制 OpenGL 读取 CPU 内存时按 1 字节逐个紧凑读取
-    // 防止宽度不为 4 的倍数时产生画面倾斜或斜切条纹
+    // 强制 OpenGL 按 1 字节对齐读取 CPU 内存，防止宽度不是 4 的倍数时出现行错位、画面倾斜
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
-    // 3. 计算三平面尺寸：Y 全分辨率，U/V 宽高减半 (YUV420P 特性)
-    // 计算半区宽度必须用当前帧的 kFrameWidth，不能用上一帧的
+    // 3. 计算三平面尺寸：Y 平面与视频帧同分辨率；YUV420P 的 U/V 平面宽高分别为 Y 平面的 1/2
+    // 使用当前帧的宽高计算，确保分辨率变化后 U/V 尺寸也同步更新
     const int uv_width = (frame_width + 1) / 2;
     const int uv_height = (frame_height + 1) / 2;
 
@@ -404,8 +406,8 @@ void OpenGLView::UploadFrameTextures(const mediacore::VideoFrame& frame) {
         glBindTexture(GL_TEXTURE_2D, texture_ids_[i]);
 
         if (need_realloc) {
-            // [情况 A] 重新开辟显存并填入第一帧数据
-            // GL_R8: GPU内部单通道8位; GL_RED: CPU数据也是单通道
+            // 情况 A：分辨率变化，重新分配显存并写入当前帧数据
+            // GL_R8: GPU 内部存储格式为单通道 8 位；GL_RED：CPU 侧数据同样是单通道
             glTexImage2D(GL_TEXTURE_2D,
                          0,
                          GL_R8,
@@ -416,14 +418,13 @@ void OpenGLView::UploadFrameTextures(const mediacore::VideoFrame& frame) {
                          GL_UNSIGNED_BYTE,
                          frame.data_[i]);
         } else {
-            // [情况 B] 仅更新已有显存的内容（省去分配开销，性能极高）
-            // 直接从坐标 (0,0) 开始覆盖 WxH 的数据块
+            // 情况 B：分辨率未变，仅更新已有显存内容，省去重新分配的开销
             glTexSubImage2D(
                 GL_TEXTURE_2D, 0, 0, 0, plane_widths[i], plane_heights[i], GL_RED, GL_UNSIGNED_BYTE, frame.data_[i]);
         }
     }
 
-    // 5. 更新状态与历史记录
+    // 5. 更新分配状态和分辨率历史记录，供下一帧判断是否需要重新分配
     if (need_realloc) {
         texture_allocated_ = true;
         last_frame_width_ = frame_width;

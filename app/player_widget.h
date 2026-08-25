@@ -1,8 +1,9 @@
 /**
  * @file player_widget.h
  * @brief 连接 UI 和 Iplayer
- * @details 持有一个非拥有的 IPlayer* 指针， 只是调用但是不拥有其管理权限
-            PlayerWidget 把 ControllerWidget 发出的纯 UI 信号翻译成对 IPlayer 的业务调用
+ * @details
+ * 持有一个非拥有的 IPlayer* 指针，只调用不管理其生命周期
+ * PlayerWidget 把 ControllerWidget 发出的纯 UI 信号翻译成对 IPlayer 的业务调用
  */
 
 #pragma once

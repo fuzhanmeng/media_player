@@ -1,8 +1,8 @@
 /**
  * @file controller_widget.h
- * @brief 播放控制条 UI：播放/暂停按钮 + 进度条
- * @details 只关心 用户操作 -> 发出信号，完全不知道 IPlayer 的存在，信号驱动 IPlayer 是 PlayerWidget
-            要做的
+ * @brief 播放控制条 UI：播放/暂停按钮和进度条
+ * @details
+ * 只负责把用户操作转成信号发出，不直接调用 IPlayer；信号到 IPlayer 调用的转发由 PlayerWidget 完成
  */
 
 #pragma once
@@ -13,14 +13,14 @@ class QPushButton;
 class QSlider;
 
 /**
- * @brief 播放控制条：纯 UI 控件，不持有任何业务对象
+ * @brief 播放控制条：纯 UI 控件，不持有 IPlayer 或其他业务对象
  */
 class ControllerWidget : public QWidget {
     Q_OBJECT
 
 public:
     /**
-     * @brief 显示构造函数
+     * @brief 构造函数
      */
     explicit ControllerWidget(QWidget* parent = nullptr);
 
