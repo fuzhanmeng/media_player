@@ -8,9 +8,9 @@
 #include "mediacore/media_error.h"
 
 #include <array>
-#include <system_error>
 #include <sstream>
 #include <string_view>
+#include <system_error>
 #include <utility>
 
 extern "C" {
@@ -24,7 +24,7 @@ namespace {
 /**
  * @brief 把 FFmpeg 负数错误码转换为可读文本
  * @param code FFmpeg API 返回的错误码
- * @return std::string 可读错误文本，转换失败时返回 fallback 文本
+ * @return 可读错误文本，转换失败时返回 fallback 文本
  */
 std::string FfmpegErrorToString(int code) {
     std::array<char, AV_ERROR_MAX_STRING_SIZE> buffer{};
@@ -38,7 +38,7 @@ std::string FfmpegErrorToString(int code) {
 }
 
 /**
- * @brief 把系统错误码转成可读文本
+ * @brief 把系统错误码转换为可读文本
  * @param code errno 或类似系统错误码
  * @return 可读错误文本
  */
@@ -52,8 +52,8 @@ std::string SystemErrorToString(int code) {
 
 /**
  * @brief 拼接调用方补充说明和底层错误文本
- * @param message 调用方自己写的说明，比如 "open input failed"
- * @param detail 底层库返回的可读错误文本，比如 "No such file or directory"
+ * @param message 调用方自己写的说明，例如 "open input failed"
+ * @param detail 底层库返回的可读错误文本，例如 "No such file or directory"
  * @return 合并后的错误说明
  */
 std::string JoinMessageAndDetail(std::string_view message, const std::string& detail) {
@@ -72,10 +72,10 @@ std::string JoinMessageAndDetail(std::string_view message, const std::string& de
 
 /**
  * @brief 把错误类别转换为日志可读的字符串
- * @param category  要转换的错误类别
+ * @param category 要转换的错误类别
  * @return 静态字符串，调用方不需要释放
  * @details
- * 此函数处理错误类别到字符串的转换，日志输出时不需要在重写switch，返回的是静态字符串，不会产生额外的动态内存
+ * 用 switch 逐一列出类别，返回值是静态字符串常量，不产生额外的动态内存分配
  */
 const char* MediaErrorCategoryToString(MediaErrorCategory category) {
     switch (category) {
@@ -100,12 +100,12 @@ const char* MediaErrorCategoryToString(MediaErrorCategory category) {
  * @param module 发生错误的模块名
  * @param code FFmpeg API 返回的错误码
  * @param message 调用方补充的错误信息
- * @param recoverable true 表示上层可以尝试恢复错误，false 表示此错误无法恢复
- * @return FFmpeg 错误文本的 MediaError 对象
+ * @param recoverable true 表示上层可以尝试恢复，false 表示此错误无法恢复
+ * @return 携带 FFmpeg 错误文本的 MediaError 对象
  *
  * @details
- * FFmpeg 的错误码通常是负数，单独保存数字不方便排查问题
- * 这里在创建错误对象时调用 FfmpegErrorToString()，把数字错误码转换成可读文本，
+ * FFmpeg 的错误码通常是负数，单独保存数字不便于排查问题
+ * 这里在创建错误对象时调用 FfmpegErrorToString()，把数字错误码转换成可读文本
  */
 MediaError MediaError::FromFfmpeg(std::string module, int code, std::string_view message, bool recoverable) {
     return MediaError(MediaErrorCategory::kFfmpeg,
@@ -120,8 +120,8 @@ MediaError MediaError::FromFfmpeg(std::string module, int code, std::string_view
  * @param module 发生错误的模块名
  * @param code errno 或类似系统错误码
  * @param message 可读错误说明
- * @param recoverable true 表示上层可以尝试恢复错误，false 表示此错误无法恢复
- * @return 系统错误MediaError 对象
+ * @param recoverable true 表示上层可以尝试恢复，false 表示此错误无法恢复
+ * @return 携带系统错误文本的 MediaError 对象
  */
 MediaError MediaError::FromSystem(std::string module, int code, std::string_view message, bool recoverable) {
     return MediaError(MediaErrorCategory::kSystem,
@@ -136,8 +136,8 @@ MediaError MediaError::FromSystem(std::string module, int code, std::string_view
  * @param module 发生错误的模块名
  * @param code 原始错误码；没有错误码时可以传 0
  * @param message 可读错误说明
- * @param recoverable true 表示上层可以尝试恢复错误，false 表示此错误无法恢复
- * @return IO 错误文本的 MediaError 对象
+ * @param recoverable true 表示上层可以尝试恢复，false 表示此错误无法恢复
+ * @return 携带 IO 错误文本的 MediaError 对象
  */
 MediaError MediaError::FromIo(std::string module, int code, std::string_view message, bool recoverable) {
     return MediaError(MediaErrorCategory::kIo,
@@ -161,7 +161,7 @@ MediaError MediaError::FromState(std::string module, std::string message) {
  * @brief 创建内部错误
  * @param module 发生错误的模块名
  * @param message 可读错误说明
- * @return MediaError
+ * @return 内部错误的 MediaError 对象
  */
 MediaError MediaError::FromInternal(std::string module, std::string message) {
     return MediaError(MediaErrorCategory::kInternal, std::move(module), 0, std::move(message), false);
@@ -171,8 +171,7 @@ MediaError MediaError::FromInternal(std::string module, std::string message) {
  * @brief 拼接适合日志输出的完整错误文本
  * @return 包含类别、模块、错误码和说明的字符串
  * @details
- * 该函数只负责组装文本，不负责写日志
- * 这样调用方可以根据需要写入日志、测试输出，或者显示给上层界面
+ * 该函数只负责组装文本，不负责写日志，调用方可以自行决定写入日志、测试输出或展示给界面
  */
 std::string MediaError::ToString() const {
     if (!HasError()) {
@@ -195,8 +194,8 @@ std::string MediaError::ToString() const {
  * @param recoverable 该错误是否可恢复
  *
  * @details
- * 该构造函数只有在本类的工厂函数内部使用
- * 工厂函数负责选择正确的错误类别，避免调用方随意组合出不一致的字段
+ * 该构造函数只在本类的工厂函数内部使用，由工厂函数负责选择正确的错误类别，
+ * 避免调用方随意组合出不一致的字段
  */
 MediaError::MediaError(MediaErrorCategory category, std::string module, int code, std::string message, bool recoverable)
     : category_(category),

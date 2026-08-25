@@ -61,8 +61,6 @@ StubPlayer::~StubPlayer() {
     LOG_INFO("StubPlayer destroyed");
 }
 
-// ================= IPlayer：渲染出口注入 =================
-
 /**
  * @brief 绑定视频帧接收端
  * @param sink 非拥有观察者指针
@@ -96,7 +94,6 @@ void StubPlayer::DetachDisplayView(IVideoSink* sink) {
     }
 }
 
-// ================= IPlayer：播放控制 =================
 /**
  * @brief 打开媒体源（桩：仅记录 url 并跃迁到 kOpening → 就绪）
  * @param url 媒体地址（桩阶段不实际解析）
