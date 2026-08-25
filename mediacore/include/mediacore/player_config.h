@@ -2,15 +2,8 @@
  * @file player_config.h
  * @brief 播放器启动前需要先定好的参数
  * @details
- * PlayerConfig 保存会影响队列容量和音频缓冲时长的参数。
- * 这些值会在后续 Build Pipeline 时用于创建 Link、Node 或音频设备。
- *
- * 这里暂时不做配置文件解析，也不做环境变量覆盖；先保证代码里有一份清楚、可校验的默认配置。
- *
- * 生命周期：
- * - 在创建 Pipeline 之前先准备一份 PlayerConfig
- * - Build / Open 时读取这些值
- * - 配置构建完成后就按只读值对象使用
+ * PlayerConfig 用于存储队列容量和音频缓冲参数，这些值会在后续 Build Pipeline 时用于创建
+ * Link / Node 或音频设备，使用方需要在创建 Pipeline 之前准备好一份配置，构建时直接使用
  */
 
 #pragma once
@@ -61,7 +54,7 @@ struct DecodeConfig {
  * @struct AudioConfig
  * @brief 音频输出设备和音频总缓冲
  * @details
- * 音频通常会比视频更敏感：缓冲太少容易爆音、卡顿，缓冲太多又会让暂停和 Seek 变慢
+ * 音频通常比视频更敏感：缓冲太少容易出现爆音和卡顿，缓冲太多又会让 Pause 和 Seek 的响应变慢
  */
 struct AudioConfig {
     int device_buffer_ms_{200};  ///< 音频设备里先预留多少毫秒的数据
@@ -70,10 +63,10 @@ struct AudioConfig {
 
 /**
  * @struct PlayerConfig
- * @brief 播放器当前阶段真正会用到的配置
+ * @brief Pipeline 会用到的配置
  * @details
- * 当前只保留 Demuxer、Decoder、Audio 近期会用到的字段。
- * 网络、录制、Jitter Buffer 等后期模块的配置等对应模块开始实现时再加入。
+ * 当前只保留 Demuxer、Decoder、Audio 近期会用到的字段
+ * 网络、录制、Jitter Buffer 等后期模块的配置等对应模块开始实现时再加入
  */
 struct PlayerConfig {
     DemuxConfig demux_{};  ///< 解封装相关配置

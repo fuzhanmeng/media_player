@@ -2,7 +2,7 @@
  * @file media_error.h
  * @brief 播放器内部使用的错误码及其对应错误信息
  * @details
- * MediaError 用来说明本次操作为什么失败，用于替代 bool，更清晰的知道错误类别，原始错误码，错误原因
+ * MediaError 用来说明一次操作失败的原因，用来替代 bool 返回值，携带错误类别、原始错误码和错误说明
  */
 
 #pragma once
@@ -17,7 +17,8 @@ namespace mediacore {
  * @enum MediaErrorCategory
  * @brief 错误来源分类
  * @details
- * 分类的目的是让上层分清是哪个模块出的问题，FFmpeg 打不开文件和播放状态不允许 Seek 处理方式通常不一样
+ * 分类的目的是让上层区分是哪个模块出的问题，例如 FFmpeg 打不开文件和当前播放状态不允许 Seek，
+ * 上层的处理方式通常不一样
  */
 enum class MediaErrorCategory : std::uint8_t {
     kNone,  ///< 没有错误
@@ -40,15 +41,11 @@ const char* MediaErrorCategoryToString(MediaErrorCategory category);
  * @brief 保存一次媒体操作失败的原因
  * @details 默认构造的 MediaError 表示没有错误
  * 真正失败时，通过 FromFfmpeg / FromSystem / FromIo / FromState / FromInternal 创建
- *
- * 线程安全：
- * MediaError 创建完成后按值传递和只读访问是安全的；
- * 多个线程不要同时修改同一个 MediaError 对象
  */
 class MediaError {
 public:
     /**
-     * @brief 构造一个 "没有错误" 对象
+     * @brief 构造一个"没有错误"对象
      */
     MediaError() = default;
 
@@ -57,8 +54,8 @@ public:
      * @param module 发生错误的模块名
      * @param code FFmpeg API 返回的错误码
      * @param message 调用方补充的错误信息
-     * @param recoverable true 表示上层可以尝试恢复错误，false 表示此错误无法恢复
-     * @return FFmpeg 错误文本的 MediaError 对象
+     * @param recoverable true 表示上层可以尝试恢复，false 表示此错误无法恢复
+     * @return 携带 FFmpeg 错误文本的 MediaError 对象
      */
     static MediaError FromFfmpeg(std::string module, int code, std::string_view message, bool recoverable = false);
 
@@ -67,8 +64,8 @@ public:
      * @param module 发生错误的模块名
      * @param code errno 或类似系统错误码
      * @param message 可读错误说明
-     * @param recoverable true 表示上层可以尝试恢复错误，false 表示此错误无法恢复
-     * @return 系统错误MediaError 对象
+     * @param recoverable true 表示上层可以尝试恢复，false 表示此错误无法恢复
+     * @return 携带系统错误文本的 MediaError 对象
      */
     static MediaError FromSystem(std::string module, int code, std::string_view message, bool recoverable = false);
 
@@ -77,8 +74,8 @@ public:
      * @param module 发生错误的模块名
      * @param code 原始错误码；没有错误码时可以传 0
      * @param message 可读错误说明
-     * @param recoverable true 表示上层可以尝试恢复错误，false 表示此错误无法恢复
-     * @return IO 错误文本的 MediaError 对象
+     * @param recoverable true 表示上层可以尝试恢复，false 表示此错误无法恢复
+     * @return 携带 IO 错误文本的 MediaError 对象
      */
     static MediaError FromIo(std::string module, int code, std::string_view message, bool recoverable = false);
 
@@ -94,12 +91,12 @@ public:
      * @brief 创建内部错误
      * @param module 发生错误的模块名
      * @param message 可读错误说明
-     * @return MediaError
+     * @return 内部错误的 MediaError 对象
      */
     static MediaError FromInternal(std::string module, std::string message);
 
     /**
-     * @brief 判断一个对象是否保存了一个真实错误
+     * @brief 判断该对象是否保存了一个真实错误
      * @return true 表示有错误，false 表示没有错误
      */
     bool HasError() const { return category_ != MediaErrorCategory::kNone; }
@@ -113,11 +110,10 @@ public:
     /**
      * @brief 获取原始错误码
      * @details
-     * FFmpeg 错误：avformat_open_input 返回的负数错误码
+     * FFmpeg 错误：avformat_open_input 等 API 返回的负数错误码
      * 系统错误：errno，例如 ENOENT
-     * 状态错误：没有底层错误码，所以用 0
-     * 内部错误：通常也没有底层错误码，所以用 0
-     * @return FFmpeg 错误码 / errno， 或者 0
+     * 状态错误、内部错误：没有底层错误码，统一用 0
+     * @return FFmpeg 错误码 / errno，或者 0
      */
     int Code() const { return code_; }
 
@@ -135,7 +131,7 @@ public:
 
     /**
      * @brief 判断这个错误是否可恢复
-     * @return true 这个错误可以恢复，false 这个错误无法恢复
+     * @return true 表示可以恢复，false 表示无法恢复
      */
     bool IsRecoverable() const { return recoverable_; }
 

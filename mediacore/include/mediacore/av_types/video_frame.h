@@ -1,14 +1,6 @@
 /**
  * @file video_frame.h
- * @brief 视频帧数据对象，保存一帧 YUV420P 图像和随帧传递的时间戳/世代号/控制标志
- * @details
- * VideoFrame 是 Decoder 的输出给音画同步、渲染的原始帧，即 YUV420P
- * 数据流
- * Demuxer 读取 AVPacket -> Decoder 解码 -> VideoFrame -> Renderer / Sync / Filter
- *
- * 生命周期
- * - 构造时按 YUV420P 布局分配一块连续内存
- * - data_ 里的三个裸指针指向 buffer_ 内部的 Y / U / V 平面，不单独拥有内存
+ * @brief 解码后的单帧 YUV420P 图像数据对象，随帧携带时间戳、Seek 世代号和控制标志
  */
 
 #pragma once
@@ -34,8 +26,7 @@ namespace mediacore {
 /**
  * @struct VideoFrame
  * @brief 解码后的单帧 YUV420P 视频帧 DTO
- * @details
- * 当前渲染器 按照 YUV420P 三平面上传 OpenGL 纹理，所以 VideoFrame 固定保存 Y/U/V 三个平面
+ * @details 渲染器按 YUV420P 三平面上传 OpenGL 纹理，因此固定保存 Y/U/V 三个平面
  */
 struct VideoFrame {
     int width_{0};  ///< 画面宽度（像素）
@@ -48,9 +39,9 @@ struct VideoFrame {
     std::array<int, 3> linesize_{{0, 0, 0}};
 
     /**
-     * @brief buffer_ 是存储图像的实际的内存
-     * @details data_ 只是指向这块内存中的三个便宜位置，data_不实际拥有内存，buffer_ 还活着，指针就有效
-     * 当最后一个 std::shared_ptr 引用释放时，这块内存也随之释放
+     * @brief buffer_ 是存储图像的实际内存
+     * @details data_ 只是指向这块内存中的三个偏移位置，不单独拥有内存；buffer_ 还活着，指针就
+     * 有效，最后一个 std::shared_ptr 引用释放时，这块内存也随之释放
      */
     std::shared_ptr<uint8_t> buffer_{nullptr};
 
@@ -60,7 +51,7 @@ struct VideoFrame {
     /// Seek 世代号（带外信令），用于丢弃旧帧、清空历史缓存、重置解码器参考帧
     uint64_t epoch_{0};
 
-    ///< 随帧传递的控制标志，例如 kFlush / kEOF / kKeyFrame
+    ///< 随帧传递的控制标志，例如 kFlush / kKeyFrame
     MediaDataFlag flags_{MediaDataFlag::kNone};
 
     /**
@@ -71,14 +62,13 @@ struct VideoFrame {
 
     /**
      * @brief 含参构造函数，按 YUV420P 布局一次性分配连续内存，并切分为 Y/U/V 三平面
-     * @param width 视频宽度（像素）
-     * @param height 视频高度（像素）
+     * @param size 画面尺寸（宽、高，像素）
      * @throws std::bad_alloc 底层内存分配失败时抛出
      * @details
      * YUV420P 有三个平面：
      * - Y 平面保存亮度，大小约为 width * height；
      * - U/V 平面保存色度，水平方向和垂直方向都是 2:1 下采样；
-     * - 奇数宽高需要向上取整，否则最后一列或最后一行色度数据会越界。
+     * - 奇数宽高需要向上取整，否则最后一列或最后一行色度数据会越界
      */
     explicit VideoFrame(FrameSize size) : width_(size.width_), height_(size.height_) {
         const int uv_width = (size.width_ + 1) / 2;  ///< UV 平面宽度（色度水平 2:1 下采样，向上取整）
@@ -97,19 +87,19 @@ struct VideoFrame {
             throw std::bad_alloc();
         }
 
-        // 交给 shared_ptr 托管，自定义删除器保证 av_free 释放
+        // 交给 shared_ptr 托管，自定义删除器保证用 av_free 释放
         buffer_ = std::shared_ptr<uint8_t>(raw_buffer, [](uint8_t* p) {
             LOG_TRACE("VideoFrame buffer released: {}", static_cast<const void*>(p));
 
             av_free(p);
         });
 
-        // 在同一块连续内存上切除三平面首地址（指针语义为 "引用块内存偏移"，不额外拥有内存）
+        // 在同一块连续内存上切出三平面首地址（指针语义为"引用块内存偏移"，不额外拥有内存）
         data_[0] = raw_buffer;  ///< Y 平面
         data_[1] = raw_buffer + y_size;  ///< U 平面
         data_[2] = raw_buffer + y_size + uv_size;  ///< V 平面
 
-        // 紧凑布局： Y行跨距=宽， UV 行跨距 = UV平面宽
+        // 紧凑布局：Y 行跨距=宽，UV 行跨距 = UV 平面宽
         linesize_[0] = size.width_;
         linesize_[1] = uv_width;
         linesize_[2] = uv_width;
@@ -117,14 +107,14 @@ struct VideoFrame {
 
     /**
      * @brief 追加一个带内标志
-     * @param flag 要追加的标志，例如 MediaDataFlag::kEOF
+     * @param flag 要追加的标志，例如 MediaDataFlag::kFlush
      */
     void AddFlag(MediaDataFlag flag) { flags_ |= flag; };
 
     /**
-     * @brief 检查当前帧是否携带指定控制标志。
-     * @param flag 要检查的标志。
-     * @return true 表示包含该标志，false 表示不包含。
+     * @brief 检查当前帧是否携带指定控制标志
+     * @param flag 要检查的标志
+     * @return true 表示包含该标志，false 表示不包含
      */
     bool HasFlag(MediaDataFlag flag) const { return (flags_ & flag) != MediaDataFlag::kNone; }
 
@@ -132,7 +122,7 @@ struct VideoFrame {
      * @brief 校验本帧是否为可安全渲染的有效数据帧
      * @return true结构完整、可安全上传 GPU， false 为空帧或者不符合需求
      * @details
-     * 控制信令帧 Flush/EOF 通常是空帧， IsValid() 返回 false 属于是预期行为，调用方如果关心控制信令，应
+     * Flush 等控制信令帧通常是空帧，IsValid() 返回 false 属于预期行为，调用方如果关心控制信令，应
      * 先调用 HasFlag()，再决定是否渲染
      */
     bool IsValid() const {

@@ -1,19 +1,9 @@
 /**
  * @file media_data_flag.h
  * @brief packet 以及 frame 的标志位封装函数
- * @details 定义帧级别的元信息标志（kKeyFrame/Flush），被 Packet/VideoFrame/AudioFrame共享
- *  使用 enum class 强类型 + 位运算重载，支持标志组合（如 kKeyFrame | kFlush）
- *
- * @par 为什么用 enum class 而非 enum？
- *  - 强类型：防止隐式转换为 int，编译期捕获错误
- *  - 需要显式重载位运算符（|、&、~），使用更安全
- *
- * @par 带内信令设计
- *  EOF/Flush 通过数据流本身传递（带内），无需额外控制通道。优势：
- *  - 自然保序：信令与数据包在同一队列中，顺序可靠
- *  - 简化设计：避免额外的控制队列和同步逻辑
- *  - 世代隔离：Flush 携带新 epoch，旧数据自然被丢弃
-
+ * @details
+ * 定义帧级别的元信息标志（kKeyFrame/Flush），被 Packet/VideoFrame/AudioFrame共享
+ * 使用 enum class 而非普通 enum，避免隐式转换为 int
  */
 
 #pragma once

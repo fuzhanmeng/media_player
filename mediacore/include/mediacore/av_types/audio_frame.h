@@ -1,8 +1,6 @@
 /**
  * @file audio_frame.h
- * @brief 音频帧数据对象，保存一段 packed（多声道音频数据的 交错排列（Interleaved）方式 ）
- * PCM 数据和随帧传递的时间戳、世代号、MediaDataFlag
- *
+ * @brief 解码后的单帧 packed PCM 音频数据对象，随帧携带时间戳、Seek 世代号和控制标志
  * @details
  * AudioFrame 是 Decoder 的输出，后续会流向音画同步和音频输出设备和录制分支
  *
@@ -37,7 +35,7 @@ struct AudioFrame {
     std::size_t byte_size_{0};  ///< 整帧 PCM 数据总字节数
 
     /**
-     * @brief 原始 PCM 内存的唯一生命周期入口
+     * @brief PCM 内存的持有者
      * @details
      * data_ 只是保存指向这块 buffer_ 内存的起始地址，不拥有这块内存也不负责释放内存
      * buffer_ 通过自定义删除器调用 delete[] 管理数组生命周期
@@ -66,9 +64,6 @@ struct AudioFrame {
      * @brief 按 packed PCM 分配一段连续音频内存
      * @param format 音频帧的布局
      * @param sample_count 每个声道的样本数量
-     * @details
-     * packed PCM 的总字节数 byte_size_ = sample_count * channel_count_ * bytes_per_sample
-     * 每个声道的样本数量 * 声道数量 * 单个采样点占用的字节数量
      */
     explicit AudioFrame(AudioFormat format, std::size_t sample_count) : format_(format), sample_count_(sample_count) {
         if (!format_.IsValid()) {
@@ -82,7 +77,7 @@ struct AudioFrame {
             return;
         }
 
-        // 计算 一帧 packed PCM 的总字节数
+        // PCM 总字节数 = 声道数 * 每个声道样本数 * 单个采样点字节数
         byte_size_ = sample_count_ * static_cast<std::size_t>(format_.channel_count_) *
             static_cast<std::size_t>(format_.bytes_per_sample_);
 

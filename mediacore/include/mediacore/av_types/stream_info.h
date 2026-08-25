@@ -1,7 +1,9 @@
 /**
  * @file stream_info.h
- * @brief 保存媒体容器和音视频流基本信息的纯 C++ 数据结构
- * @details 这里的数据结构保存的是探测阶段从媒体文件或网络流中读取出来的结果
+ * @brief 探测阶段读取到的媒体容器和音视频流基本信息
+ * @details
+ * 数据来自 avformat_open_input() / avformat_find_stream_info() 读取到的 AVStream
+ * AVCodecParameters，可以实现与 FFmpeg 的解耦
  *
  * 数据来源：
  * 文件 / URL
@@ -24,18 +26,15 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace mediacore {
 
 /**
  * @struct Rational
- * @brief 分数（有理数）数据结构，分子和分母表示的一个比例值
+ * @brief 分数（有理数），用于表示时间基和帧率等非整数比例值
  * @details
- * 时间基和帧率都不是普通的整数
- * 1 / 90000 常见于视频时间基
- * 30000 / 1001 约等于 29.97 帧/秒
- *
- * 这里使用自己的结构，不直接使用 FFmpeg 的 AVRational
+ * 不直接使用 FFmpeg 的 AVRational，避免对外暴露 FFmpeg 类型
  */
 struct Rational {
     std::uint64_t numerator_{0};  ///< 分子
@@ -65,8 +64,7 @@ struct Rational {
 /**
  * @enum VideoPixelFormat
  * @brief 视频流的像素格式
- * @details
- * 使用项目自己的枚举，不直接暴露 FFmpeg 的 AVPixelFormat
+ * @details 使用项目自己的枚举，不直接暴露 FFmpeg 的 AVPixelFormat
  */
 enum class VideoPixelFormat : std::uint8_t {
     kUnknown,  ///< 尚未识别或当前项目不支持的像素格式
@@ -82,7 +80,7 @@ enum class VideoPixelFormat : std::uint8_t {
  * @brief 音频流的样本格式
  * @details
  * 使用项目自己的枚举，不直接暴露 FFmpeg 的 AVSampleFormat
- * planar 表示左右声道分开存储，packed 表示左右声道交错存储
+ * planar 表示各声道分开存储，packed 表示各声道交错存储
  */
 enum class AudioSampleFormat {
     kUnknown,  ///< 尚未识别或当前项目不支持的格式
@@ -104,8 +102,8 @@ enum class AudioSampleFormat {
  * @struct VideoStreamInfo
  * @brief 一条视频流的基本信息
  * @details
- * 这些字段用于保存探测阶段探测到的视频流信息，不保存解码对象
- * Decoder 后续可以直接使用这些值创建 AVCodecContext，但 AVCodecContext 本身不属于此结构体
+ * 保存探测阶段得到的视频流描述，不持有解码对象；Decoder 可用这些值创建 AVCodecContext
+ * 但 AVCodecContext 本身不属于此结构体
  */
 struct VideoStreamInfo {
     int stream_index_{-1};  ///< 在容器中的视频流索引编号，不能用负数表示有效流
@@ -119,11 +117,20 @@ struct VideoStreamInfo {
     std::optional<std::int64_t> duration_us_{};  ///< 此视频流的时长，单位微秒，未知时没有值
 
     /**
+     * @brief 解码器初始化所需的私有数据，例如 H.264/HEVC 的 SPS/PPS
+     * @details
+     * 数据来源于 AVCodecParameters::extradata
+     * MediaInfo 对该数据进行值拷贝并自行管理生命周期，避免依赖 FFmpeg 对象
+     * Decoder 创建 AVCodecContext 时根据需要将其复制到 codec context
+     * 空 vector 表示当前媒体没有提供 extradata
+     */
+    std::vector<std::uint8_t> extradata_{};
+
+    /**
      * @brief 判断此视频流的基本字段是否可用
      * @return stream index / width / height 和 time_base 有效时都返回 true
-     * @details
-     * 帧率和像素格式有时候可能探测不到，所以它们不是当前判断的核心
-     * codec_id_ 为 0 时表示还没有写入真实编码格式，不认为是有效流
+     * @details 帧率和像素格式有时探测不到，因此不作为判断的核心；
+     * codec_id_ 为 0 表示尚未写入真实编码格式，不认为是有效流
      */
     bool IsValid() const {
         if (stream_index_ < 0 || codec_id_ <= 0) {
@@ -149,9 +156,7 @@ struct VideoStreamInfo {
 /**
  * @struct AudioStreamInfo
  * @brief 一条音频流的基本信息
- * @details
- * 这里描述的是输入媒体中的音频流信息，通常是 AAC / MP3 等压缩格式
- * 它和 AudioFrame 不同，AudioFrame 描述的是解码后的音频帧信息，这里保存的是探测阶段拿到的流信息
+ * @details 描述输入媒体中的压缩音频流（如 AAC / MP3），与解码后的 AudioFrame 是不同的概念
  */
 struct AudioStreamInfo {
     int stream_index_{-1};  ///< 在容器中的音流编号，不能用负数表示有效流
@@ -159,16 +164,26 @@ struct AudioStreamInfo {
     int sample_rate_hz_{0};  ///< 采样率，单位 Hz
     int channel_count_{0};  ///< 声道数量
 
-    std::string channel_layout_{};  ///< 声道布局方式，如mono / stereo 5.1
+    std::string channel_layout_{};  ///< 声道布局方式，如 mono / stereo / 5.1
     AudioSampleFormat sample_format_{AudioSampleFormat::kUnknown};  ///< 输入音频的格式
     Rational time_base_{};  ///< 音频流的时间基
     std::optional<std::int64_t> duration_us_{};  ///< 音频流的时长，单位微秒，直播流等无时长显示
 
     /**
+     * @brief 解码器初始化需要的私有数据
+     * @details
+     * 数据来源于 AVCodecParameters::extradata
+     * MediaInfo 对该数据进行拷贝并管理其生命周期，避免对 FFmpeg 的依赖
+     * Docoder 创建 AVCodecContext 时根据需要将其复制到 codec context，
+     * 空 vector 表示当前音频流没有提供 extradata
+     */
+    std::vector<uint8_t*> extradata_{};
+
+    /**
      * @brief 判断音频流的基本字段是否可用
      * @return stream_index / codec_id / sample_rate_hz / channel_count / time_base 有效时返回 true
-     * 声道布局名称和样本格式在某些输入中可能缺失，因此当前不把它们作为必填项
-     * AudioDecoder 如果需要重采样，应在创建 SwrContext 前再次检查完整格式
+     * @details 声道布局名称和样本格式在部分输入中可能缺失，因此不作为必填项；
+     * AudioDecoder 如需重采样，应在创建 SwrContext 前再次检查完整格式
      */
     bool IsValid() const {
         if (stream_index_ < 0 || codec_id_ <= 0) {
@@ -193,9 +208,9 @@ struct AudioStreamInfo {
 
 /**
  * @struct MediaInfo
- * @brief 保存整个媒体输入的基本信息
+ * @brief 一次 Open / 探测得到的整个媒体输入的基本信息
  * @details
- * MediaInfo 不是某一帧的信息，是一次 Open / 探测到的媒体描述
+ * video_stream_ / audio_stream_ 用 optional 表示对应轨道是否存在：
  * optional 用来表示输入媒体中是存在音频流 / 视频流
  * - 没有视频轨时 video_stream_ 没有值；
  * - 没有音频轨时 audio_stream_ 没有值；
@@ -209,7 +224,7 @@ struct MediaInfo {
     std::optional<AudioStreamInfo> audio_stream_{};
 
     /**
-     * @brief 判断媒体信息是否至少包含有一条可用的音视频流
+     * @brief 判断媒体信息是否至少包含一条可用的音视频流
      * @return 至少有一条有效的音频流或者视频流时，返回 true
      */
     bool IsValid() const {

@@ -2,12 +2,9 @@
 /**
  * @file frame_size.h
  * @brief 基础值类型：画面尺寸（宽 x 高）
- * @details 用于消除 "相邻同类型 int 参数易被调用方写反" 的隐患（clang-tidy
- *          easily-swappable-parameters）把 (width, height) 打包成一个具名聚合，
- *          调用点以字段名显式赋值，宽高不再可能被静默交换
- *
- *          这是一个可跨 DTO 复用的基础类型：VideoFrame / StreamInfo、编码器分辨率、
- *          纹理尺寸等均可持有它，避免到处裸传 (w, h)零成本抽象——编译后与裸传两个 int 等价，无运行时开销
+ * @details
+ * 把 (width, height) 打包成具名字段，调用点必须按字段名显式赋值，避免两个
+ * 相邻 int 参数被调用方误传颠倒（对应 clang-tidy easily-swappable-parameters 检查）
  */
 
 #pragma once
@@ -16,8 +13,7 @@ namespace mediacore {
 
 /**
  * @brief 画面尺寸（像素）
- * @details 纯被动数据聚合（struct + 公开成员），无复杂不变量合法性（>0）由使用方
- *          在需要时校验，本类型不强制约束，保持 "零成本值语义"
+ * @details 纯数据聚合，构造时不做合法性校验，宽高是否 > 0 由使用方按需调用 IsValid() 检查
  */
 struct FrameSize {
     int width_{0};  ///< 画面宽度（像素）

@@ -1,9 +1,9 @@
 /**
  * @file logger.h
- * @brief 封装的 spdlog 的全局共享的一个日志接口
+ * @brief 基于 spdlog 封装的进程级日志接口
  * @details
- * Logger 是进程级服务，main 函数入口会进行初始化，UI 模块和 mediacore 模块通过 LOG_* 宏记录日志
- * spdlog 负责记录源码文件、行号、函数名、线程id、日志级别以及日志消息
+ * Logger 是进程级服务，由 main 函数入口负责初始化，UI 模块和 mediacore 模块统一通过 LOG_* 宏记录日志
+ * spdlog 负责记录源码文件、行号、函数名、线程 id、日志级别以及日志正文
  */
 #pragma once
 
@@ -15,9 +15,10 @@ namespace mediacore {
 
 /**
  * @class Logger
- * @brief app and mediacore 共享的 log
- *
- * 该类不可实例化，Init() 和 Shutdown() 在实现中由内部互斥锁保护，实际写日志由 spdlog 的多线程 sink 负责
+ * @brief app 与 mediacore 共享的日志入口
+ * @details
+ * 该类不可实例化，只提供静态接口；Init() 和 Shutdown() 内部由互斥锁保护，
+ * 真正写日志由 spdlog 的多线程 sink 负责，Logger 本身不持有可写状态
  */
 class Logger final {
 public:
@@ -30,32 +31,33 @@ public:
     /**
      * @brief 初始化控制台日志和滚动日志文件
      * @details
-     * 该函数是幂等的，如果初始化失败，需要回到控制台输出，不让应用启动因为日志失败而直接中断
+     * 该函数是幂等的，重复调用直接返回；文件 sink 创建失败时会回退为只输出到控制台，
+     * 不让应用启动因为日志初始化失败而中断
      */
     static void Init();
 
     /**
      * @brief 刷新并关闭日志系统
      * @details
-     * 该函数是幂等的，如果析构函数需要写日志，需要在对象被销毁后调用
+     * 该函数是幂等的，需要在其他对象析构、可能还会写日志的最后阶段调用
      */
     static void Shutdown();
 
     /**
-     * @brief 返回当前可用的 logger，如果尚未初始化，则返回空操作
+     * @brief 返回当前可用的 logger
      * @details
-     * 如果 Init() 已经成功调用，返回真正写到控制台/文件的核心 logger；
-     * 如果尚未初始化或已经 Shutdown()，返回空操作兜底 logger
+     * Init() 已成功调用时返回真正写到控制台/文件的核心 logger；
+     * 尚未初始化或已经 Shutdown() 时返回只接收不输出的兜底 logger
      *
-     * 返回 shared_ptr 的原因是让一次日志调用期间保持 logger 存活：
-     * 调用线程拿到返回值后，即使另一个线程马上 Shutdown()，当前这次写日志也不会悬空
+     * 返回 shared_ptr 而不是裸指针，是为了让调用线程在一次日志写入期间保持 logger 存活：
+     * 即使写入过程中另一个线程执行了 Shutdown()，当前这次调用也不会访问已销毁的对象
      */
     static std::shared_ptr<spdlog::logger> GetLogger();
 };
 
 }  // namespace mediacore
 
-// 使用 spdlog 的官方宏，保证源码位置捕获和编译期级别裁剪都能正常工作
+// 使用 spdlog 官方宏，保证源码位置捕获和编译期级别裁剪都能正常工作
 // LOG_INFO(...) -> SPDLOG_LOGGER_INFO(...) -> Logger::GetLogger() -> spdlog::logger -> sinks
 // TRACE/DEBUG 是否参与编译由 CMake 里的 SPDLOG_ACTIVE_LEVEL 决定
 #define LOG_TRACE(...) SPDLOG_LOGGER_TRACE(::mediacore::Logger::GetLogger(), __VA_ARGS__)

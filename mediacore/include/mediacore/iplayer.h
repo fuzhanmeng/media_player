@@ -1,8 +1,8 @@
 /**
  * @file iplayer.h
- * @brief 播放器的 Facade 接口 UI层和mediacore 内核唯一的边界契约
- * @details UI(IPlayerWidget/ControllerWidget)依赖此接口，不感知 Demuxer/Decoder/Pipeline 等
- *          任何底层实现细节
+ * @brief 播放器的 Facade 接口，UI 层和 mediacore 内核之间唯一的边界契约
+ * @details UI（IPlayerWidget / ControllerWidget）只依赖此接口，不感知 Demuxer、Decoder、
+ *          Pipeline 等任何底层实现细节
  */
 
 #pragma once
@@ -17,7 +17,7 @@ namespace mediacore {
 class IVideoSink;
 
 /**
- * @brief 播放器统一操作契约入口，定义"打开/ 播放 /暂停 /停止/ 跳转/ 状态查询"等 UI 可见的全部能力
+ * @brief 播放器统一操作契约，定义打开、播放、暂停、停止、跳转、状态查询等 UI 可见的全部能力
  */
 class IPlayer {
 public:
@@ -25,8 +25,6 @@ public:
      * @brief 虚析构函数
      */
     virtual ~IPlayer() = default;
-
-    // ================= 渲染出口注入 =================
 
     /**
      * @brief 绑定视频渲染槽，将底层管线输出的视频帧推送到指定的接收端
@@ -39,8 +37,6 @@ public:
      * @param sink 之前通过 AttachDisplayView 绑定的接收器
      */
     virtual void DetachDisplayView(IVideoSink* sink) = 0;
-
-    // ================= 播放控制指令 =================
 
     /**
      * @brief 打开媒体源，异步进入 kOpening 状态
@@ -65,14 +61,12 @@ public:
 
     /**
      * @brief 跳转到指定时间点
-     * @param timestamp_us，跳转的目标时间戳，单位-微秒
+     * @param timestamp_us 跳转的目标时间戳，单位微秒
      */
     virtual void Seek(int64_t timestamp_us) = 0;
 
-    //  ================= 状态查询 =================
-
     /**
-     * @brief 查询当前播放转装
+     * @brief 查询当前播放状态
      */
     virtual PlaybackState GetState() const = 0;
 

@@ -13,8 +13,8 @@ namespace mediacore {
 class VideoFrame;
 /**
  * @brief 视频帧的消费接口
- * @details 任何想要 "接收视频帧并显示/处理" 的对象都实现此接口,生产者只需要把视频帧推送过来
- *          不关心接收方是谁在接收
+ * @details
+ * 任何想要接收视频帧并显示/处理的对象都实现此接口，生产者只需要把视频帧推送过来，不关心接收方是谁
  */
 class IVideoSink {
 public:
@@ -25,7 +25,7 @@ public:
 
     /**
      * @brief 接收一帧待显示/处理的视频帧
-     * @param video_frame 共享所有权的视频帧 接收方可安全持有以跨调用使用
+     * @param video_frame 共享所有权的视频帧，接收方可安全持有以跨调用使用
      */
     virtual void OnReceiveVideoFrame(std::shared_ptr<VideoFrame> video_frame) = 0;
 };
