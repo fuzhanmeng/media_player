@@ -6,8 +6,9 @@
  * 所有共享数据都由 mutex_ 保护，两个 condition_variable 分别等待“未满”和“非空”
  *
  * 关闭方式分为两种：
- * 1. Close() 表示正常 EOF，禁止 Push()，但允许 Pop() 排空已有数据
- * 2. Abort() 表示立即停止，Push() / Pop() 都返回失败，并清空尚未处理的数据
+ * 1. Close() 表示正常 EOF，禁止 Push()，但允许 Pop() 排空已有数据，若排空后又有新的 Push()
+ * 队列会自动重新打开
+ * 2. Abort() 表示立即停止，Push() / Pop() 都返回失败，并清空尚未处理的数据，且不可恢复
  */
 #pragma once
 
@@ -66,8 +67,21 @@ public:
     bool Push(T value) {
         std::unique_lock<std::mutex> lock(mutex_);
 
+        // 1. 如果 Abort 了，直接返回
+        if (aborted_) {
+            return false;
+        }
+
+        // 2. 如果队列已 close 并且队列中的数据被排空，那么就重新打开队列
+        if (closed_ && queue_.empty()) {
+            closed_ = false;
+            LOG_DEBUG("ThreadSafeQueue auto-reopened: closed + empty -> accepting new data");
+        }
+
         // 队列有空位时可以入队；Close/Abort 也会使等待结束
-        not_full_cv_.wait(lock, [this]() { return queue_.size() < capacity_ || closed_ || aborted_; });
+        if (capacity_ > 0) {
+            not_full_cv_.wait(lock, [this]() { return queue_.size() < capacity_ || closed_ || aborted_; });
+        }
 
         // 被唤醒不等于可以写入：Close/Abort 的通知同样会唤醒本线程
         if (closed_ || aborted_) {
@@ -125,7 +139,9 @@ public:
 
     /**
      * @brief 正常关闭：禁止再 Push，但保留存量供消费者排空，排空后 Pop 返回 std::nullopt
-     * @details 后续的 Push() 返回 false，Pop() 继续排空队列内的数据，排空后返回 std::nullopt
+     * @details
+     * 后续的 Push() 返回 false，Pop() 继续排空队列内的数据，排空后返回 std::nullopt
+     * 若排空之后又调用 Push()，会按上面所述的自动重新打开逻辑恢复生产
      * @note 幂等，用于正常 EOF，不用于用户点击停止或错误退出
      */
     void Close() {
@@ -146,7 +162,7 @@ public:
     /**
      * @brief 强制终止：立即唤醒所有等待者， Push/Pop 一律返回失败，未处理数据按 "丢弃" 语义处理
      * @details Push()/Pop() 在看到 aborted_ 后立即失败，不再处理缓存数据
-     * @note 幂等；Abort 后队列不可恢复，只用于立即停止
+     * @note 幂等；Abort 后队列不可恢复，只用于立即停止，不参与 Close 之后的自动重新打开
      */
     void Abort() {
         std::size_t discarded_count = 0;
@@ -183,7 +199,7 @@ public:
 
     /**
      * @brief 查询队列是否已经正常关闭 Close()
-     * @return Close() 已调用返回 true
+     * @return Close() 已调用返回 true；若之后被自动重新打开，则返回 false
      */
     bool IsClosed() const {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -215,10 +231,10 @@ private:
     /// 构造后不再变化的容量上限
     const std::size_t capacity_;
 
-    /// 正常关闭标志；为 true 时拒绝 Push，但允许 Pop 排空缓存
+    /// 正常关闭标志为 true 时拒绝 Push，但允许 Pop 排空缓存；队列排空后下一次 Push 会自动复位为 false
     bool closed_{false};
 
-    /// 立即中止标志；为 true 时 Push 和 Pop 都立即失败
+    /// 立即中止标志；为 true 时 Push 和 Pop 都立即失败，且不会被自动复位
     bool aborted_{false};
 };
 }  // namespace mediacore

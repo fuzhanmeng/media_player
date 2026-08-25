@@ -1,19 +1,10 @@
 /**
  * @file packet.h
- * @brief RAII 封装的 AVPacket，携带时间戳/世代号/标志位
- * @details Demuxer 从容器中读出压缩数据包，通过 Link<Packet> 传递给 Decoder 消费
- *  时间戳统一换算为微秒，epoch_ 用于 Seek 时抛弃旧世代包，flags 扩展带内信令
- *
- * @par 职责边界
- *  - Packet 只负责把 Demuxer 读到的压缩数据和少量随包信息一起带着走
- *  - AVPacket*：FFmpeg 真实包体
- *  - pts/dts：微秒时间戳，区分“有值”和“没有值”
- *  - epoch：Seek 世代号，用来丢掉旧数据
- *  - flags：关键帧、刷新等随包标记
- *  - 不负责解封装逻辑（由 DemuxerNode 完成）
- *  - 不负责解码逻辑（由 DecoderNode 完成）
- *
- * 正常播放结束不要再给 Packet 单独塞 EOF 包，统一交给 Link::Close() 传播
+ * @brief RAII 封装的 AVPacket，携带微秒时间戳、Seek 世代号和控制标志
+ * @details
+ * Demuxer 从容器中读出压缩数据包，通过 Link<Packet> 传递给 Decoder 消费
+ * pts/dts 统一换算为微秒，epoch_ 用于 Seek 后丢弃旧世代包，flags_ 承载关键帧/刷新等带内信令
+ * 正常播放结束不需要给 Packet 单独塞 EOF 标志，交由 Link::Close() 传播
  */
 
 #pragma once
@@ -29,9 +20,8 @@ namespace mediacore {
 
 /**
  * @brief 压缩数据包 DTO， RAII 封装的 AVPacket*
- *
  * @details
- * - 独占所有权：禁止拷贝，支持移动
+ * - 独占所有权：禁止拷贝，仅支持移动
  * - 时间戳统一微秒：下游无需关心 time_base
  * - epoch 字段：Seek 时递增，下游丢弃旧世代包
  * - 带内信令：通过 flags 传递 kKeyFrame/Flush，无需额外通道
@@ -51,8 +41,7 @@ class Packet {
 public:
     /**
      * @brief 默认构造函数：分配空的 AVPacket
-     * @details
-     * 会先分配一个 FFmpeg 的 AVPacket 结构体；如果分配失败，pkt_ 保持为空，调用方需要用 IsEmpty() 判断
+     * @details 分配失败时 pkt_ 保持为 nullptr，调用方需要用 IsEmpty() 判断
      */
     Packet();
 
@@ -100,8 +89,8 @@ public:
     bool HasDts() const noexcept { return dts_us_.has_value(); }
 
     /**
-     * @brief 获取展示时间戳（微秒）
-     * @return int64_t 已换算为微秒的 PTS（Presentation Time Stamp）
+     * @brief 获取展示时间戳
+     * @return 有值时返回微秒时间戳（PTS，Presentation Time Stamp），没有时返回空值
      */
     std::optional<std::int64_t> GetPtsUs() const { return pts_us_; }
 

@@ -16,8 +16,8 @@ namespace mediacore {
 /**
  * @brief 构造 Packet 并分配一个空的 AVPacket
  * @details
- * av_packet_alloc() 只分配结构体，不分配 data 缓冲,data 缓冲由 Demuxer 调用 av_read_frame 时分配，
- * 失败时返回 nullptr，调用时需要检查 IsEmpty()
+ * av_packet_alloc() 只分配结构体，不分配 data 缓冲,data 缓冲由 Demuxer 调用 av_read_frame 时分
+ * 配，失败时返回 nullptr，调用时需要检查 IsEmpty()
  */
 Packet::Packet() : pkt_(av_packet_alloc()) {
     if (pkt_ == nullptr) {
@@ -64,19 +64,9 @@ Packet::Packet(Packet&& other) noexcept
 
 /**
  * @brief 移动赋值运算函数
- * @details 移动赋值分三步：
- *
- * 1. 释放当前持有的资源（避免内存泄漏）
- *    - 当前对象可能已持有一个有效的 AVPacket*
- *    - 必须先释放，否则转移源对象的指针后，旧指针丢失，内存泄漏
- *
- * 2. 转移源对象的所有权
- *    - 窃取源对象的 pkt_ 和元信息
- *    - 此时当前对象接管了源对象的内存
- *
- * 3. 清空源对象
- *    - 源对象不再拥有 pkt_，置空防止析构时 double free
- *    - 其他字段置 0，语义清晰
+ * @details
+ * 先释放当前对象已持有的 AVPacket（否则会在接管 other 的指针后造成内存泄漏）
+ * 再转移 other 的所有权，最后将 other 清空以防止其析构时重复释放
  */
 Packet& Packet::operator=(Packet&& other) noexcept {
     // 1. 先判断是不是自赋值
