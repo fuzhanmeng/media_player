@@ -22,8 +22,7 @@ ControllerWidget::ControllerWidget(QWidget* parent)
     layout->addWidget(play_pause_button_);
     layout->addWidget(progress_slider_);
 
-    // QPushButton::clicked 带一个 checked 参数，这里始终不需要
-    // 用 lambda 是因为只需转发点击动作本身，不做任何业务判断
+    // QPushButton::clicked 带一个 checked 参数
     connect(play_pause_button_, &QPushButton::clicked, this, [this]() {
         LOG_INFO("Play / Pause button clicked");
         emit PlayPauseClicked();

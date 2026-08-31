@@ -1,4 +1,3 @@
-// mediacore/include/mediacore/av_types/frame_size.h
 /**
  * @file frame_size.h
  * @brief 基础值类型：画面尺寸（宽 x 高）

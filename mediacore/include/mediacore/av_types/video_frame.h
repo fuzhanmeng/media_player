@@ -12,7 +12,6 @@
 #include <new>  // std::bad_alloc
 
 #include "frame_size.h"
-#include "mediacore/av_types/media_data_flag.h"
 #include "mediacore/logger.h"
 
 extern "C" {

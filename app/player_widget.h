@@ -23,25 +23,25 @@ class PlayerWidget : public QWidget {
     Q_OBJECT
 public:
     /**
-     * @brief 构造函数，通过依赖注入接收 IPlayer 实例
+     * @brief 创建播放窗口
      * @param player 非拥有指针：生命周期由调用方管理，PlayerWidget 不负责释放
      * @param parent Qt 父子对象树的父指针
      */
     explicit PlayerWidget(mediacore::IPlayer* player, QWidget* parent = nullptr);
 
     /**
-     * @brief 析构函数
+     * @brief 解除显示绑定并销毁窗口子控件
      */
     ~PlayerWidget() override;
 
 private slots:
     /**
-     * @brief 响应 ControllerWidget::PlayPauseClicked，按当前状态决定 Playing 还是 Pause
+     * @brief 转发播放/暂停操作
      */
     void OnPlayPauseClicked();
 
     /**
-     * @brief 响应 ControllerWidget::Seek
+     * @brief 将滑块位置换算为媒体时间并请求 Seek
      * @param position 进度条位置 [0, 1000]
      */
     void OnSeek(int position);
@@ -49,5 +49,5 @@ private slots:
 private:
     mediacore::IPlayer* player_;  ///< IPlayer 实例
     ControllerWidget* controller_;  ///< 子控件，Qt 父子对象树会自动管理其生命周期
-    OpenGLView* gl_view_;  ///< 视频渲染画布
+    OpenGLView* gl_view_;  ///< 视频输出控件
 };

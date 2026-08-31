@@ -1,8 +1,7 @@
 /**
  * @file iplayer.h
- * @brief 播放器的 Facade 接口，UI 层和 mediacore 内核之间唯一的边界契约
- * @details UI（IPlayerWidget / ControllerWidget）只依赖此接口，不感知 Demuxer、Decoder、
- *          Pipeline 等任何底层实现细节
+ * @brief 播放器的接口，UI 层和 mediacore 内核之间唯一的边界契约
+ * @details UI（IPlayerWidget / ControllerWidget）只依赖此接口
  */
 
 #pragma once

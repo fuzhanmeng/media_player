@@ -1,5 +1,6 @@
 # 1. 编译输出与构建目录
 build/
+_example/build/
 
 # 2. Conan 生成的本地预设文件
 CMakeUserPresets.json

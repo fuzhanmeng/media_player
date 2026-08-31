@@ -13,7 +13,7 @@ class QPushButton;
 class QSlider;
 
 /**
- * @brief 播放控制条：纯 UI 控件，不持有 IPlayer 或其他业务对象
+ * @brief 播放控制条：纯 UI 控件，提供播放/暂停和进度跳转输入
  */
 class ControllerWidget : public QWidget {
     Q_OBJECT
@@ -21,6 +21,7 @@ class ControllerWidget : public QWidget {
 public:
     /**
      * @brief 构造函数
+     * @param parent Qt 父对象
      */
     explicit ControllerWidget(QWidget* parent = nullptr);
 
