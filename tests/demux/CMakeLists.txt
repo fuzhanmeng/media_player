@@ -17,8 +17,6 @@ target_include_directories(ffmpeg_demuxer_node_test PRIVATE
     ${PROJECT_SOURCE_DIR}/mediacore/src
 )
 
-find_package(ffmpeg REQUIRED)
-
 target_link_libraries(ffmpeg_demuxer_node_test PRIVATE
     mediacore
     ffmpeg::avformat

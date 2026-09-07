@@ -29,9 +29,6 @@ target_include_directories(mediacore
 # FFmpeg：video_frame.h 用到 av_malloc / av_free（<libavutil/mem.h>）
 # 因为 video_frame.h 是【公共头】，凡 include 它的目标（含 app 层 opengl_view.cpp）
 # 都需要 FFmpeg 头路径与 avutil 符号，故用 PUBLIC 让依赖随头文件一起传播
-find_package(ffmpeg REQUIRED)
-find_package(spdlog REQUIRED)
-
 # SPDLOG_ACTIVE_LEVEL 必须在任何源码包含 spdlog 头文件之前生效
 # 放在 target_compile_definitions 里会进入编译命令行，比在公共头文件中更好
 target_compile_definitions(mediacore PUBLIC 
@@ -41,6 +38,8 @@ target_compile_definitions(mediacore PUBLIC
 target_link_libraries(mediacore PUBLIC
     ffmpeg::avutil    # av_malloc / av_free 等内存与工具函数
     ffmpeg::avcodec   # AVPacket 相关函数
+    ffmpeg::swresample # 音频解码后的统一 PCM 重采样
+    ffmpeg::swscale    # 视频解码后的像素格式转换
     spdlog::spdlog    # LOG_* 宏和 logger 实现都依赖 spdlog
     ffmpeg::avformat  # ffmpeg 解复用
 )

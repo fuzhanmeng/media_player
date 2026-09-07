@@ -1,9 +1,18 @@
 
 # 当前测试入口直接包含 mediacore/src 下的正式头文件，不链接 mediacore 静态库。
-# 这样核心测试不会被 FFmpeg、Qt 或真实媒体节点依赖阻塞。
+# 这样核心测试不会被 FFmpeg、Qt 或真实媒体节点依赖阻塞；日志仍使用 Conan
+# 管理的 spdlog。
 
 find_package(Threads REQUIRED)
-find_package(spdlog REQUIRED)
+if(NOT AI_MEDIA_PLAYER_BUILD_MEDIACORE)
+    # DAG-only mode still uses the project's Conan-managed logger, but does
+    # not need the full Qt/FFmpeg graph.
+    find_package(spdlog 1.15.3 EXACT CONFIG REQUIRED
+        PATHS "${AI_MEDIA_PLAYER_CONAN_GENERATORS_DIR}"
+        NO_DEFAULT_PATH
+    )
+    ai_media_player_assert_conan_package(spdlog)
+endif()
 
 add_executable(all_tests
     all_tests.cpp

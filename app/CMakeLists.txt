@@ -1,14 +1,5 @@
 # app/CMakeLists.txt —— Qt 应用程序
 
-# 查找 Qt 依赖
-find_package(Qt6 REQUIRED COMPONENTS
-    Core
-    Gui
-    Widgets
-    OpenGL
-    OpenGLWidgets
-)
-
 # 创建播放器应用程序
 add_executable(ai_media_player
     main.cpp

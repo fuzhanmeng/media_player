@@ -276,18 +276,52 @@ StubPlayer  ──生成渐变测试帧──►  IVideoSink  ──►  OpenGLV
 | 依赖管理 | Conan 2 | 使用中 |
 | GUI | Qt 6.7 | 使用中 |
 | 渲染 | OpenGL 3.3 Core（QOpenGLWidget） | 使用中 |
-| 媒体框架 | FFmpeg 6.1（libavutil / libavcodec 已链接） | 部分接入 |
+| 媒体框架 | FFmpeg 8.0.1（Conan 管理的 libav*，项目不链接系统 FFmpeg） | 部分接入 |
 | 测试 | CTest | 使用中 |
 | 动态检查 | ASan / UBSan / TSan | 使用中 |
 | 日志 | spdlog | 使用中 |
-| 数学 / 图像工具 | glm、stb | 已声明依赖，尚未接入代码 |
+| 数学工具 | glm | 已声明依赖，尚未接入代码 |
 | 音频后端 | ALSA（libasound） | Planned |
 | 硬件解码 | VA-API | Planned |
 | 零拷贝 | DMA-BUF / EGLImage | Planned |
 | 色彩管线 | GLSL 矩阵切换 + Tone Mapping | Planned |
 | 网络 | FFmpeg HTTP、原生 UDP + RTP | Planned |
 
-主开发环境：Ubuntu 24.04。
+主开发环境：Ubuntu 26.04.1。
+
+项目采用“两层依赖”模型：项目链接的 FFmpeg 8.0.1、Qt 6.7.3、spdlog
+和 glm 来自 Conan；系统 apt 只提供主机能力和可选的命令行验收工具。
+Conan 的 FFmpeg 配置为 `with_programs=False`，因此它不会安装
+`ffmpeg`/`ffprobe` 可执行文件，也不会让 CMake 链接 `/usr/lib` 中的系统
+`libav*`。完整构建必须使用 Conan 生成的 CMake preset，这样 CMake 才会从
+`build/<配置>/generators/` 读取项目依赖。
+
+| 层 | 由谁提供 | 作用 |
+|---|---|---|
+| 系统 apt / 主机 | `ffmpeg`（含 `ffprobe`，可选）、`libva-dev`、VA-API 驱动与运行时、GPU 驱动、`/dev/dri/renderD*` | CLI/样本验收、VA-API 设备和驱动；这些不属于 Conan 的 FFmpeg 库 |
+| 项目 Conan | FFmpeg 8.0.1（静态 `libav*`，含 VA-API + libdrm PRIME 支持）、Qt 6.7.3、spdlog 1.15.3、glm | 项目编译与链接的唯一依赖来源 |
+| 项目源码的系统接口 | ALSA、EGL/OpenGL、X11/Wayland、DRM 设备 API（按对应阶段安装开发包） | 音频、窗口系统和 Day 31–35 零拷贝路径 |
+
+在 Ubuntu 上准备基础开发环境和本机 Intel VA-API 验证工具时，可执行：
+
+```bash
+sudo apt install build-essential cmake pkg-config pipx curl \
+      libva-dev libdrm-dev libasound2-dev libegl-dev libgl-dev \
+      ffmpeg vainfo intel-media-va-driver
+pipx install conan
+conan profile detect --force
+```
+
+`ffmpeg` 仅用于 `/usr/bin/ffmpeg`、`/usr/bin/ffprobe` 对照测试；项目不会链接
+它的库。`libva-dev` 由 Conan 的 `vaapi/system` 依赖在构建 FFmpeg 时使用；
+FFmpeg 的 `libdrm` 构建依赖由 Conan 锁定，`libdrm-dev` 主要供后续源码直接
+包含 DRM 头文件的零拷贝阶段使用。VA-API 驱动、Intel/其他 GPU 用户态驱动和
+`/dev/dri` 必须在运行主机上存在。Qt 还会通过 Conan 的 `xorg/system`、
+`opengl/system` 等 recipe 检查窗口系统开发包；缺少的具体 apt 包会在首次
+`conan install` 时列出。非 Intel GPU 应将上述 VA 驱动换成对应硬件的驱动。
+当前开发机已检测到 Ubuntu 26.04.1、x86_64 和 Intel `i915`，但尚未安装
+`ffmpeg`/`ffprobe` 命令，也没有可见的 `/dev/dri`，因此目前只能验证依赖图和
+DAG-only 测试构建，不能宣称完整播放器或硬解运行时已验收。
 
 ---
 
@@ -297,18 +331,40 @@ StubPlayer  ──生成渐变测试帧──►  IVideoSink  ──►  OpenGLV
 
 ```bash
 ./build.sh                  # 默认 RelWithDebInfo，可传 Release / Debug
+source build/RelWithDebInfo/generators/conanrun.sh
 ./build/RelWithDebInfo/app/ai_media_player
 ```
 
-`build.sh` 依次执行 `conan install`、`cmake --preset` 和 `cmake --build`，每次运行会先清空 `build/`。
-
-### 只构建并运行 DAG 测试（不需要 Qt 与 FFmpeg）
+`build.sh` 依次执行带 `conan.lock` 的 `conan install`、`cmake --preset` 和
+`cmake --build`，每次运行会先清空 `build/`。锁文件固定 FFmpeg 8.0.1 的
+recipe revision 和传递依赖；如果修改 `conanfile.py`，应重新生成并审阅锁文件。
+由于 fontconfig 官方下载站会对非浏览器请求返回 HTTP 418，脚本会从 Debian 或
+MacPorts 镜像预取内容完全相同的 2.15.0 归档，校验 recipe 指定的 SHA-256 后存入
+`cache/conan-sources/`。这不会改变 Conan 锁定的 recipe、版本或源码内容。
+从当前 recipe 重新生成（不消费旧锁）可执行：
 
 ```bash
+conan lock create . --lockfile="" --lockfile-out=conan.lock \
+      -s build_type=RelWithDebInfo
+```
+
+当前配置关闭了外部 GPL/nonfree 编码器，因为本轮只实现播放和硬解路径；开发
+计划中的录制分支（H.264/AAC/MP4）未来需要单独选择编码器、许可证和对应 Conan
+profile，不能把当前裁剪配置当作完整录制配置。
+
+### 只构建并运行 DAG 测试（只需要 Conan 的 spdlog，不需要 Qt 与 FFmpeg）
+
+```bash
+conan install --requires=spdlog/1.15.3 --lockfile=conan.lock \
+      --output-folder=build-dag/generators \
+      --generator=CMakeDeps --generator=CMakeToolchain \
+      --build=missing -s build_type=RelWithDebInfo
 cmake -S . -B build-dag \
       -DAI_MEDIA_PLAYER_BUILD_MEDIACORE=OFF \
       -DAI_MEDIA_PLAYER_BUILD_APP=OFF \
-      -DBUILD_TESTING=ON
+      -DBUILD_TESTING=ON \
+      -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DCMAKE_TOOLCHAIN_FILE=build-dag/generators/conan_toolchain.cmake
 cmake --build build-dag -j
 ctest --test-dir build-dag --output-on-failure
 ```
