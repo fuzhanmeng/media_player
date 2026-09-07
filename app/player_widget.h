@@ -41,7 +41,8 @@ private slots:
     void OnPlayPauseClicked();
 
     /**
-     * @brief 将滑块位置换算为媒体时间并请求 Seek
+     * @brief 将滑块位置作为临时时间戳转发给播放器
+     * @details IPlayer 目前不提供媒体时长，百分比到微秒的正确换算将在时长元数据接口加入后实现。
      * @param position 进度条位置 [0, 1000]
      */
     void OnSeek(int position);

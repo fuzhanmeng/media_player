@@ -6,8 +6,10 @@
  */
 #include "player_widget.h"
 
-#include <QVBoxLayout>
 #include <algorithm>
+#include <cstdint>
+
+#include <QVBoxLayout>
 
 #include "controller_widget.h"
 #include "mediacore/logger.h"
@@ -107,7 +109,9 @@ void PlayerWidget::OnPlayPauseClicked() {
 }
 
 /**
- * @brief 将进度滑块位置换算为微秒并请求 Seek
+ * @brief 将进度滑块值作为临时时间戳转发给播放器
+ * @details 当前 IPlayer 尚未公开媒体时长，因此无法将 [0, 1000] 的百分比刻度正确换算为
+ * 微秒。待时长元数据接口可用后，再在这里完成比例换算。
  */
 void PlayerWidget::OnSeek(int position) {
     if (player_ == nullptr) {
@@ -115,7 +119,6 @@ void PlayerWidget::OnSeek(int position) {
         return;
     }
 
-    const std::uint64_t duration_us = player_
     LOG_INFO("Seek request sent to player, slider position {}", position);
-    player_->Seek(position);
+    player_->Seek(static_cast<std::int64_t>(position));
 }
