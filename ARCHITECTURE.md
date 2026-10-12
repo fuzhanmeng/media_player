@@ -146,7 +146,7 @@ void WaitWhilePaused(StopPredicate should_stop);
 
 ### 4.3 epoch
 
-`epoch_` 是 `atomic<uint64_t>`，初值 0。`INodeBase::ShouldDropStaleItem(item_epoch)` 比较 `item_epoch < GetEpoch()`，小于说明是 Seek 之前产生的陈旧数据。
+`epoch_` 是 `atomic<uint64_t>`，初值 0。`INodeBase::IsCurrentEpoch(item_epoch)` 比较 `item_epoch < GetEpoch()`，小于说明是 Seek 之前产生的陈旧数据。
 
 **当前 epoch 只是一个计数器。** `BumpEpoch()` 已实现，但没有任何调用方 —— Seek 流程尚未实现。epoch 本身不清空队列、不刷新解码器、不定位媒体，这些是后续 Seek 里程碑的工作。
 

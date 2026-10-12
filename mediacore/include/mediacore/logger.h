@@ -1,10 +1,15 @@
 /**
  * @file logger.h
- * @brief 基于 spdlog 封装的进程级日志接口
+ * @brief 基于 spdlog 高性能异步库封装的进程级日志系统接口
  * @details
- * Logger 是进程级服务，由 main 函数入口负责初始化，UI 模块和 mediacore 模块统一通过 LOG_* 宏记录日志
- * spdlog 负责记录源码文件、行号、函数名、线程 id、日志级别以及日志正文
+ * 负责为整个 mediacore 核心引擎与 UI 表现层提供统一的日志门面：
+ * 1. 进程级单例服务：在 main() 入口最先完成引导，退出时统筹刷新并关闭；
+ * 2. 线程安全与生命周期保障：GetLogger() 返回 std::shared_ptr<spdlog::logger> 快照，
+ *    确保即使在写入中途触发了 Shutdown()，正在执行的日志写入任务仍能安全完成；
+ * 3. 宏展开零开销抽象：通过包装 SPDLOG_LOGGER_* 系列宏，保证文件名、代码行号、
+ *    函数名的编译期无损捕获，并支持通过 SPDLOG_ACTIVE_LEVEL 在 Release 编译期彻底裁剪低优先级日志。
  */
+
 #pragma once
 
 #include <spdlog/spdlog.h>
@@ -15,54 +20,63 @@ namespace mediacore {
 
 /**
  * @class Logger
- * @brief app 与 mediacore 共享的日志入口
- * @details
- * 该类不可实例化，只提供静态接口；Init() 和 Shutdown() 内部由互斥锁保护，
- * 真正写日志由 spdlog 的多线程 sink 负责，Logger 本身不持有可写状态
+ * @brief 进程级共享日志核心静态服务门面
+ * @details 该类为纯静态工具类，不可实例化或被继承；底层的多线程安全由 spdlog 的线程安全 Sink 机制保证。
  */
 class Logger final {
 public:
+    // 纯静态类：严禁构造、析构、拷贝与移动
     Logger() = delete;
     ~Logger() = delete;
 
     Logger(const Logger&) = delete;
     Logger& operator=(const Logger&) = delete;
+    Logger(Logger&&) = delete;
+    Logger& operator=(Logger&&) = delete;
 
     /**
-     * @brief 初始化控制台日志和滚动日志文件
+     * @brief 初始化全局日志核心配置（控制台彩色输出与滚动日志文件落盘）
      * @details
-     * 该函数是幂等的，重复调用直接返回；文件 sink 创建失败时会回退为只输出到控制台，
-     * 不让应用启动因为日志初始化失败而中断
+     * 1. 具备幂等性（Idempotent），多次重复调用直接安全返回；
+     * 2. 具备自动降级容错机制：当磁盘文件 Sink 因权限或路径原因创建失败时，
+     *    自动回退至仅控制台输出，确保上层应用不会因日志故障引发崩溃。
      */
     static void Init();
 
     /**
-     * @brief 刷新并关闭日志系统
+     * @brief 强制刷新所有 Sink 缓冲区并优雅关闭日志子系统
      * @details
-     * 该函数是幂等的，需要在其他对象析构、可能还会写日志的最后阶段调用
+     * 1. 具备幂等性，通常在 main() 退出前的最终资源回收阶段显式调用；
+     * 2. 关闭后内部切换为兜底空实现（Null Sink），后续遗留的日志写入不会产生崩溃或异常。
      */
     static void Shutdown();
 
     /**
-     * @brief 返回当前可用的 logger
+     * @brief 获取当前可用的核心 spdlog::logger 实例
+     * @return 托管日志器生命周期的共享智能指针
      * @details
-     * Init() 已成功调用时返回真正写到控制台/文件的核心 logger；
-     * 尚未初始化或已经 Shutdown() 时返回只接收不输出的兜底 logger
-     *
-     * 返回 shared_ptr 而不是裸指针，是为了让调用线程在一次日志写入期间保持 logger 存活：
-     * 即使写入过程中另一个线程执行了 Shutdown()，当前这次调用也不会访问已销毁的对象
+     * 生命周期保护设计：
+     * - 当 Init() 成功时，返回配置有多 Sink 输出的核心实例；
+     * - 当尚未初始化或处于已注销状态时，返回兜底的空 Sink 日志器；
+     * - 通过返回值拷贝递增引用计数，规避跨线程并发 Shutdown 时访问已析构对象的悬空风险。
      */
     static std::shared_ptr<spdlog::logger> GetLogger();
 };
 
 }  // namespace mediacore
 
-// 使用 spdlog 官方宏，保证源码位置捕获和编译期级别裁剪都能正常工作
-// LOG_INFO(...) -> SPDLOG_LOGGER_INFO(...) -> Logger::GetLogger() -> spdlog::logger -> sinks
-// TRACE/DEBUG 是否参与编译由 CMake 里的 SPDLOG_ACTIVE_LEVEL 决定
+/**
+ * @name 日志格式化宏定义
+ * @brief 映射至 spdlog 官方核心宏，保障代码位置自动捕获与编译期静态剥离
+ * @details
+ * 展开路径：LOG_INFO(...) -> SPDLOG_LOGGER_INFO(Logger::GetLogger(), __VA_ARGS__)
+ * 若编译期 SPDLOG_ACTIVE_LEVEL 高于对应级别，对应宏将在预处理阶段展开为空，实现运行期零开销。
+ * @{
+ */
 #define LOG_TRACE(...) SPDLOG_LOGGER_TRACE(::mediacore::Logger::GetLogger(), __VA_ARGS__)
 #define LOG_DEBUG(...) SPDLOG_LOGGER_DEBUG(::mediacore::Logger::GetLogger(), __VA_ARGS__)
 #define LOG_INFO(...) SPDLOG_LOGGER_INFO(::mediacore::Logger::GetLogger(), __VA_ARGS__)
 #define LOG_WARN(...) SPDLOG_LOGGER_WARN(::mediacore::Logger::GetLogger(), __VA_ARGS__)
 #define LOG_ERROR(...) SPDLOG_LOGGER_ERROR(::mediacore::Logger::GetLogger(), __VA_ARGS__)
 #define LOG_FATAL(...) SPDLOG_LOGGER_CRITICAL(::mediacore::Logger::GetLogger(), __VA_ARGS__)
+/** @} */

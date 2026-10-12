@@ -18,24 +18,26 @@
 
 ```text
 工程基础 → DAG 核心 → 基础 DTO
-  → 解封装 → 解码 → 视频输出 → 最小 Pipeline
-  → 音频 → A/V 同步 → 控制闭环 → Seek/EOF/错误
+  → 解封装（视频/音频双输出）→ 视频软解 → StreamReset 协议 → 最小 Pipeline
+  → 音频解码与重采样 → 音频输出 → 音频主时钟 → AVSync
+  → 双路控制闭环（Pause/Seek/EOS/错误）
   → 录制
-  → VA-API 与零拷贝 → 色彩管理
+  → Software/Hardware VideoFrame → VA-API → DMA-BUF → EGLImage/OpenGL 零拷贝
+  → 色彩管理
   → HTTP → RTP + Jitter Buffer → 弱网验证
   → 系统收口
 ```
 
 播放主链和录制链路要分开看：
 
-- **播放主链**：解封装读出压缩 `Packet`，解码把 `Packet` 变成 `VideoFrame` / `AudioFrame`，然后进入视频输出、音频输出和音画同步。
+- **播放主链**：Demuxer 将压缩数据分成视频和音频两条 `Packet` 输出；解码后，音频写入设备并提供主时钟，视频先经过 `AVSyncNode` 再交给 `VideoSinkNode`。Seek 的跨节点控制不伪装成帧标志，而是沿每条媒体分支发送带 `epoch` 和目标时间的 `StreamReset`；各模块内部仍可调用 FFmpeg/设备的 flush API 清理缓存。
 - **录制链路**：编码和 MP4 封装只在录制分支使用，等本地播放、Seek、EOF 和错误闭环稳定后再接入。
 
 | 阶段 | Day | 交付 | 冲刺优先级 |
 |---|---|---|---|
 | A | 01–10 | 工程基础与 DAG 核心 | 必须扎实（已完成） |
-| B | 11–18 | 本地视频最小闭环 | 必须扎实 |
-| C | 19–26 | 音频、同步与控制闭环 | 必须扎实 |
+| B | 11–18.5 | 本地视频最小闭环与统一流重置协议 | 必须扎实 |
+| C | 19–26 | 音频、主时钟、AVSync 与双路控制闭环 | 必须扎实 |
 | D | 27–30 | 录制分支与优雅排空 | **放弃实现，仅口头设计** |
 | E | 31–38 | VA-API、零拷贝与色彩 | 部分必须扎实（见下），部分视时间富余 |
 | F | 39–43 | 网络播放与抗弱网 | 部分必须扎实（见下），部分视时间富余 |
@@ -43,17 +45,18 @@
 
 ### 1.2 冲刺优先级（实际执行顺序，覆盖上表按 Day 编号的默认顺序）
 
-一个月时间窗口，不追求 45 天全部走完。以下按"面试知识点性价比"重排了执行顺序：网络传输（弱网、丢包、抖动）和线程/并发设计是音视频面试的高频考点，被提前到硬解之前一起打磨；录制模块知识点密度低（大头是 MP4 封装的工程量，不是编码算法本身），整体放弃实现。**各 Day 之间原有的功能依赖关系不变**（例如 Day 42 依赖 Day 41 和 Day 22，Day 33 依赖 Day 32），冲刺优先级只决定"先做哪一段依赖链、每段做到多深"，不改变段内顺序。
+短期目标是先完成本地音视频同步与双路控制闭环；之后再按依赖顺序实现硬件和网络专项。录制模块知识点密度相对低且工程量大，本轮只保留设计说明，不实现代码。**各 Day 之间原有的功能依赖关系不变**（例如 Day 42 依赖 Day 41 和 Day 22，Day 33 依赖 Day 32），本节只说明优先顺序，不改变模块依赖。
 
 **第一档：必须扎实（面试高频，且是本项目的核心差异点）**
 
 | 执行顺序 | 内容 | 对应 Day | 说明 |
 |---|---|---|---|
 | 1 | 工程基础与 DAG 核心 | Day 01–10 | 已完成，线程生命周期、Abort/Close 语义、五阶段停止协议是本项目最扎实的部分，保持现状 |
-| 2 | 本地视频最小闭环 | Day 11–18 | 解封装、软解、Pipeline 组图与 FSM，播放器能跑起来的最低要求 |
-| 3 | 音频、同步与控制闭环 | Day 19–26 | 音频主时钟、A/V 同步、Seek、EOF、错误闭环——音视频岗位面试必考区 |
-| 4 | RTP 解析 + Jitter Buffer | Day 41–42 | **从原顺序的阶段 F 提前到阶段 E 之前**；只需要 Day 22（AVSync）和 Day 26（错误闭环）已完成，不依赖 Day 27–40，可以提前做 |
-| 5 | VA-API 硬解正确性 + DMA-BUF/EGLImage 零拷贝 | Day 31–35 | 硬解不放弃；做到能讲清楚硬解路径、硬件帧所有权和零拷贝证据链即可，不强求下一档的性能调优 |
+| 2 | 本地视频最小闭环与协议 | Day 11–18.5 | 解封装、软解、StreamReset、Pipeline 组图与 FSM，播放器能跑起来的最低要求 |
+| 3 | 音频、同步与控制闭环 | Day 19–26 | 音频解码、ALSA、音频主时钟、AVSync、双路 Seek/EOS/Pause/错误闭环——音视频岗位面试必考区 |
+| 4 | Software/Hardware VideoFrame + VA-API 正确性 | Day 31–33 | 核心音视频闭环稳定后再做；先保证硬解可回退，不把硬件路径反向耦合到软解主链 |
+| 5 | DMA-BUF/EGLImage 零拷贝 | Day 34–35 | 硬件环境具备时做；验证正常渲染不下载到 CPU，不强求下一档的性能调优 |
+| 6 | RTP 解析 + Jitter Buffer | Day 41–42 | 网络专项，核心本地播放与同步闭环完成后再做 |
 
 **第二档：时间富余再做，否则跳过（不影响面试基本盘）**
 
@@ -127,7 +130,8 @@ Qt UI
 
 **冲刺范围（按 1.2 节优先级裁剪，本轮实际执行边界）：**
 
-- **纳入冲刺目标：** 本地文件播放、音视频同步、Seek/EOF/错误闭环、RTP 接收与 Jitter Buffer、VA-API 硬解正确性与 DMA-BUF/EGLImage 零拷贝路径（讲清楚路径和证据链即可，不强求性能调优）。
+- **纳入短期冲刺目标：** 本地文件播放、音视频同步、Seek/EOF/错误闭环、音频主时钟、双路 StreamReset/EOS/Pause 控制，以及正式目录接入和回归测试。
+- **后续专项目标：** RTP 接收与 Jitter Buffer、VA-API 硬解正确性、DMA-BUF/EGLImage 零拷贝。它们仍属于完整路线，但不阻塞短期可演示版本。
 - **时间富余才做，否则跳过且不计入验收：** HTTP 拉流基线、双路径集成与性能收敛、SDR/HDR 色彩管理、Jitter 自适应与弱网量化验证。
 - **不纳入本轮范围，仅口头设计说明：** 录制成 MP4（Tee、编码、Mux、Drain，见阶段 D）。上面"目标能力"里的"录制成 MP4"和"非目标"清单，仍然是项目的完整原始边界，不因冲刺裁剪而改写；冲刺范围只决定这一个月内实际写不写代码。
 
@@ -330,7 +334,7 @@ Day 04。
 - `sync_context.h`：`PipelineRunState` 枚举与 atomic 状态。
 - `WaitWhilePaused(should_stop)`：模板接收谓词，先无锁快速检查，再加锁进谓词版 `wait`。
 - `SetRunning` / `SetPaused` / `WakeAllPausedThreads` / `BumpEpoch` 全部 private + `friend Pipeline`；`GetState` / `GetEpoch` 公开只读。
-- `INodeBase` 增加 `ShouldDropStaleItem()` 与 `GetCurrentEpoch()`。
+- `INodeBase` 增加 `IsCurrentEpoch()` 与 `GetCurrentEpoch()`。
 - Node 停止标志留在各自的 `INodeBase`，不进 `SyncContext`。
 
 ### Dependencies
@@ -420,15 +424,16 @@ Day 08。
 定义在 Node 之间流动的基础数据对象，并建立当前阶段会用到的配置和错误表达。
 
 ### Tasks
-- `media_data_flag.h`：`MediaDataFlag` 位掩码（`kKeyFrame`/`kEOF`/`kFlush`）+ `constexpr` 位运算重载。
+- `media_data_flag.h`：`MediaDataFlag` 只表达帧自身元数据（例如 `kKeyFrame`），不承载 Seek、Flush 或 EOS 控制事件；提供 `constexpr` 位运算重载。
 - `packet.h/.cpp`：RAII 封装 `AVPacket*`，构造 `av_packet_alloc()`，析构 `av_packet_free()`。
 - 禁拷贝，实现移动构造与移动赋值：窃取指针后源对象置空，移动赋值先释放自身资源并做自赋值检查。
 - 携带 `pts_us_`/`dts_us_`/`epoch_`/`flags_` 及读写接口，`IsEmpty()` 判断是否已被移动或分配失败。
 - `player_config.h/.cpp`：先定义近期会用到的 `demux` / `decode` / `audio` 三组参数，提供 `Default()` 和 `Validate()`；后续网络、录制和 Jitter Buffer 开始实现时再扩展对应分组。
 - `media_error.h/.cpp`：定义结构化错误对象，能保存错误类别、模块名、原始错误码、可读错误文本和是否可恢复；公共头文件不暴露 FFmpeg 类型。
 - `stream_info.h`：定义探测结果 DTO，包括 `Rational`、`VideoStreamInfo`、`AudioStreamInfo`、`MediaInfo`；只保存普通 C++ 字段，不保存 `AVFormatContext` / `AVStream` / `AVCodecParameters` 指针。
-- `audio_format.h` / `audio_frame.h`：定义解码后 packed PCM 的格式和音频帧对象，与 `Packet` / `VideoFrame` 共用 `MediaDataFlag`。
-- `VideoFrame` 改用与 `Packet` 相同的 `MediaDataFlag`，删掉重复的 `FrameFlag`；统一 `pts_us` 与 `epoch` 语义。
+- `stream_item.h`：定义 `StreamReset{epoch, target_us}` 和 `EndOfStream`。`StreamReset` 是唯一的跨节点 Seek/世代重置控制事件，必须沿视频、音频两条分支按 FIFO 顺序传播；`EndOfStream` 表达一条分支的输入结束。
+- `audio_format.h` / `audio_frame.h`：定义解码后 packed PCM 的格式和音频帧对象，与 `Packet` / `VideoFrame` 共用只描述帧元数据的 `MediaDataFlag`。
+- `VideoFrame` 改用与 `Packet` 相同的 `MediaDataFlag`，删掉重复的 `FrameFlag`；统一 `pts_us` 与 `epoch` 语义。EOS 和 StreamReset 不放进 flags，而作为 `StreamItem` 的独立变体。
 - 本 Day 只定义基础 DTO 和校验规则，各模块接线在各自的 Day 完成。
 - CMake 链接 `avutil` 与 `avcodec`。
 
@@ -440,13 +445,13 @@ Day 01。
 - 时间戳单位在注释和接口命名上明确为微秒。
 - 不提供任何配置时能拿到一份完整可用的默认配置。
 - 配置字段非法时返回明确错误，不静默夹取。
-- 全仓库只有一套帧标志枚举，`Packet`、`VideoFrame`、`AudioFrame` 都使用 `MediaDataFlag`。
+- 全仓库只有一套帧标志枚举，`Packet`、`VideoFrame`、`AudioFrame` 都使用 `MediaDataFlag`；该枚举不包含控制协议。
 - 错误对象能同时表达 FFmpeg 负错误码与系统 errno，且不依赖 Qt。
 - `MediaInfo` 能表达视频-only、音频-only、音视频都有三种组合，并且不泄漏 FFmpeg 类型。
 
 ---
 
-# 阶段 B：本地视频最小闭环（Day 11–18）【冲刺优先级：必须扎实】
+# 阶段 B：本地视频最小闭环与统一协议（Day 11–18.5）【冲刺优先级：必须扎实】
 
 ## Day 11 — 流信息转换与测试
 
@@ -477,11 +482,11 @@ Day 10。
 实现可取消的媒体打开，并把容器数据变成带完整元信息的 Packet 流。
 
 ### Tasks
-- `ffmpeg_demuxer_node.h/.cpp`：双输出，直接继承 `INodeBase`，自持两条 `Link<Packet>`，自己实现 `CloseOutputs()`。
+- `ffmpeg_demuxer_node.h/.cpp`：双输出，直接继承 `INodeBase`，自持视频和音频两条 `Link<Packet>`，自己实现 `CloseOutputs()`。
 - `Open(path)`：`avformat_open_input` + `avformat_find_stream_info` + `av_find_best_stream`；挂 `interrupt_callback` 读取本 Node 的取消标志；`OnInterruptBlockingIo()` 置该标志；设 Open/Read 超时选项。
 - 打开失败返回结构化错误：模块名 + 错误码 + `av_strerror` 文本。
 - Open/Read 超时先使用 Demuxer 当前阶段的默认值或 `PlayerConfig` 中已有字段；网络播放阶段再扩展 `config.network`。
-- `Tick()`：一次 `av_read_frame`，按 `stream_index` 分发到 video 或 audio 输出 Link。
+- `Tick()`：一次 `av_read_frame`，按 `stream_index` 分发到 video 或 audio 输出 Link。每次 Seek 先定位并刷新 Demuxer，再向两条已连接分支发送同一个 `StreamReset{epoch, target_us}`，之后才发送新世代 Packet；EOF 分别向两条分支发送 `EndOfStream`，Link Close/Abort 只用于 Pipeline 停止，不把 EOF 与链路关闭混为一谈。
 - 时间戳一次换算成微秒（`pts * num * 1000000 / den`），`AV_NOPTS_VALUE` 单独处理；epoch 从 `GetCurrentEpoch()` 读取写入每个 Packet；关键帧映射到 `kKeyFrame`。
 - 三种返回严格区分：`AVERROR_EOF` → `kEndOfStream`，取消标志生效 → `kStopped`，其他负值 → `kError`。
 - 只有一条轨道时另一条 Link 保持未连接，`SendOutput` 安全跳过。
@@ -525,10 +530,10 @@ Day 10、Day 12。
 把视频 Packet 解成可渲染的帧。
 
 ### Tasks
-- `video_decoder_node.h/.cpp`：`INode<Packet, VideoFrame>`，用 `VideoStreamInfo` 初始化 `AVCodecContext` 并 `avcodec_open2`。
+- `video_decoder_node.h/.cpp`：消费 `StreamItem<Packet>` 并输出 `StreamItem<VideoFrame>`，用 `VideoStreamInfo` 初始化 `AVCodecContext` 并 `avcodec_open2`。
 - send/receive 循环：`avcodec_send_packet` + 循环 `avcodec_receive_frame`，正确处理 `AVERROR(EAGAIN)`。
 - 用 `best_effort_timestamp` 换算输出帧 `pts_us`，透传 epoch 与带内标志。
-- 收到 `kEOF` 送 nullptr 触发 drain，把解码器内缓存的 B 帧全部取出后再关输出。
+- 收到上游 `EndOfStream` 后送 nullptr 触发 drain，把解码器内缓存的 B 帧全部取出后再关输出；收到 `StreamReset` 时调用 `avcodec_flush_buffers()` 清理旧状态，更新本地 epoch，并按原顺序向下游转发 Reset。
 
 ### Dependencies
 Day 12、Day 13。
@@ -567,9 +572,9 @@ Day 14。
 把解码帧安全地交到 GUI 线程。
 
 ### Tasks
-- `video_sink_node.h/.cpp`：`INode<VideoFrame, NoPort>`，持 `IVideoSink*`（非拥有）。
-- `Tick()` 取帧 → 按 epoch 丢弃陈旧帧 → 调 `OnReceiveVideoFrame`。
-- 识别带内 `kEOF`，上报播放完成而不是当作错误。
+- `video_sink_node.h/.cpp`：消费 `StreamItem<VideoFrame>`，持非拥有的显示端/`VideoSinkDispatcher`。
+- `Tick()` 取帧 → 按 epoch 丢弃陈旧帧 → 处理 Seek 目标帧 → 调 `OnReceiveVideoFrame`。普通播放的 PTS 等待、追赶和丢帧由后续 `AVSyncNode` 负责。
+- 处理 `StreamItem::EndOfStream`，上报本路结束而不是把 EOS 当作解码错误。
 - Node 只调接口，不碰任何 GL 对象。
 
 ### Dependencies
@@ -610,7 +615,7 @@ Day 16。
 形成第一个真实的端到端垂直闭环。
 
 ### Tasks
-- `Pipeline` 增加 `Open(url)` 与 `Build()`：探测流信息后按视频轨道自动组图（Demuxer → Decoder → VideoSink）。
+- `Pipeline` 增加 `Open(url)` 与 `Build()`：探测流信息后按是否存在视频/音频轨道组图；先完成视频-only 的最小闭环，再接入双输出和音频分支。所有图都预留并遵守 `StreamReset`/`EndOfStream` 顺序。
 - `fsm.h/.cpp`：显式状态机，定义 `PlaybackState` 合法跃迁表，非法跃迁拒绝并记录。
 - `player_facade.h/.cpp`：实现 `IPlayer`，持 `unique_ptr<Pipeline>` 和 FSM。
 - 串行控制执行器：UI 命令入队后由单一控制线程顺序执行；IO 取消路径可与控制队列并发触发，Stop 不必等队列中的 Open 完成。
@@ -628,6 +633,26 @@ Day 17。
 
 ---
 
+## Day 18.5 — 统一 StreamReset 协议
+
+### Objective
+把 Seek 后的世代切换定义成所有媒体分支都能理解的带内事件，移除 `kFlush` 作为跨节点控制标志的歧义。
+
+### Tasks
+- `StreamReset{epoch, target_us}` 是唯一的跨节点世代切换事件；`MediaDataFlag` 只保留关键帧等帧元数据，`EndOfStream` 是独立的流结束事件。
+- Demuxer 完成 `av_seek_frame` 和 `avformat_flush` 后，向每条已连接的媒体分支发送同一个 epoch/target 的 `StreamReset`；同一分支内保证 `StreamReset → 新 epoch Packet → 新 epoch Frame/EOS` 的 FIFO 顺序。
+- VideoDecoder、AudioDecoder、AudioSink、AVSyncNode、VideoSinkNode 都必须处理 Reset：清理自己的旧状态、更新 epoch 或同步基准，并按拓扑顺序向下游转发。
+- 旧 epoch 的在途数据只能丢弃，不能触发当前 epoch 的错误；新 epoch 的 Packet/EOS 在对应 Reset 之前到达属于协议错误。
+- 补充初始播放、连续快速 Seek、暂停态 Seek、EOF 后 Seek、`Reset→Packet→EOS` 顺序和双路广播测试。
+
+### Dependencies
+Day 12、Day 14、Day 16、Day 18。
+
+### Acceptance Criteria
+- 全仓库不再使用 `MediaDataFlag::kFlush` 表达跨节点控制。
+- 视频和音频分支都能观察到对应的 `StreamReset`，不会混入旧 epoch 帧或 EOS。
+- 连续 Seek 不丢失最新 Reset、不死锁，且每个分支的顺序可由日志或测试验证。
+
 # 阶段 C：音频、同步与控制闭环（Day 19–26）【冲刺优先级：必须扎实】
 
 ## Day 19 — 音频解码
@@ -636,7 +661,7 @@ Day 17。
 把音频 Packet 解成统一格式的 PCM。
 
 ### Tasks
-- `audio_decoder_node.h/.cpp`：`INode<Packet, AudioFrame>`，send/receive 与 EAGAIN 处理同视频。
+- `audio_decoder_node.h/.cpp`：消费 `StreamItem<Packet>` 并输出 `StreamItem<AudioFrame>`，send/receive 与视频相同。
 - `libswresample` 重采样到统一输出格式（固定采样率、声道布局、采样格式）。
 - 正确处理可变 `nb_samples`，按 `swr_get_out_samples` 分配输出缓冲。
 - EOF 时先 drain 解码器，再 `swr_convert` 冲刷重采样器残留样本。
@@ -658,7 +683,7 @@ Day 13、Day 14。
 实现可中断的 PCM 输出。
 
 ### Tasks
-- `iaudio_sink.h`：Open/Write/Drain/Flush/Close/GetDelay 接口，不暴露 ALSA 类型。
+- `iaudio_sink.h`：Open/Write/Drain/Flush/Close/GetDelay 接口，不暴露 ALSA 类型。这里的 `Flush()` 只是清理音频设备内部缓冲，不是跨节点控制协议；Seek 的协议事件统一使用 `StreamReset`。
 - `alsa_audio_sink.h/.cpp`：`snd_pcm_open` + `snd_pcm_hw_params` 参数协商，失败时按优先级回退；设备缓冲大小取自 `config.audio.device_buffer_ms`。
 - `snd_pcm_writei` 循环写入并处理部分写。
 - `-EPIPE`（xrun）：`snd_pcm_prepare` 后重试并计数；`-ESTRPIPE`（suspend）：`snd_pcm_resume` 或回退到 prepare。
@@ -682,9 +707,9 @@ Day 19。
 
 ### Tasks
 - `iclock_source.h`：`GetCurrentTimeUs()`、可用性查询，以及 `IsAnchored()` —— 时钟是否已经和真实播放位置对齐。
-- `audio_sink_node.h/.cpp`：`INode<AudioFrame, NoPort>`，同时实现 `IClockSource`。
+- `audio_sink_node.h/.cpp`：消费 `StreamItem<AudioFrame>`，同时实现 `IClockSource`。
 - 用 `snd_pcm_delay` 算出已写入但尚未播出的样本，据此推算真实播放位置；播放位置用 atomic 或加锁保护。
-- 锚定语义：起播和 Flush 之后时钟处于未锚定状态，`GetCurrentTimeUs()` 返回待锚定的目标位置且不推进；写入第一个音频帧时用该帧 PTS 完成锚定，之后正常推进。这样 UI 进度条不会在 Seek 后跳回旧位置。
+- 锚定语义：起播和收到 `StreamReset` 后时钟处于未锚定状态，`GetCurrentTimeUs()` 返回待锚定的目标位置且不推进；写入第一个音频帧时用该帧 PTS 完成锚定，之后正常推进。这样 UI 进度条不会在 Seek 后跳回旧位置。
 - 暂停时停止写入并让时钟停止推进，恢复后从当前位置继续。
 - 按 epoch 丢弃陈旧音频帧；队列与设备缓冲的合计不超过 `audio.max_buffered_ms`。
 - 参数取自 `config.audio`，不写魔数。
@@ -707,13 +732,15 @@ Day 20。
 让视频跟随音频主时钟播放，并在时钟未锚定时不阻塞出画。
 
 ### Tasks
-- `av_sync_node.h/.cpp`：`INode<VideoFrame, VideoFrame>`，构造时注入 `IClockSource*`。
+- `av_sync_node.h/.cpp`：消费并输出 `StreamItem<VideoFrame>`，构造时注入 `IClockSource*`；Reset 清同步状态并转发，EOS 有序转发，普通 VideoFrame 才按主时钟调度。
 - 算帧 `pts_us` 与主时钟差值：超前等待，落后小于阈值立即送出，落后超阈值丢帧并计数。
 - 时钟未锚定时不等待也不丢帧，直接放行 —— 起播和 Seek 后第一帧不被音频阻塞。
 - 等待用可中断的 `wait_until`，Stop 或 Pause 时立即返回。
 - 视频-only 时 fallback 到单调墙钟，起播时刻对齐首帧 PTS。
 - 音频存在但超过 `sync.reanchor_timeout_ms` 仍未锚定（设备卡住、音频轨已结束），退化到墙钟并记 WARN，不永久等待。
 - 暴露同步偏差统计：平均偏差、最大偏差、丢帧数、退化到墙钟的次数。
+
+同步职责边界：普通播放的 PTS 等待、落后丢帧和追赶只在 `AVSyncNode` 实现；`VideoSinkNode` 只做 epoch 过滤、Seek 目标帧处理和显示端交付，不再重复实现墙钟调度。
 
 ### Dependencies
 Day 18、Day 21。
@@ -756,7 +783,8 @@ Day 22。
 
 ### Tasks
 - 明确 Pause 的三处语义：ALSA 停止写入但不丢弃已排队样本；时钟停止推进并记录暂停时刻；AVSync 中断当前等待、恢复后重新计算。统一写进注释。
-- Demuxer EOF 后经 `CloseOutputs()` 向两条链传播；Decoder 收到输入 EOF 先 drain 再关自己的输出；Sink 排空后判定本路结束。
+- Demuxer EOF 后分别向视频、音频两条链发送 `EndOfStream`；两个 Decoder 各自先 drain，再发送下游 EOS 并结束本路。Pipeline 停止时才使用 Link Close/Abort。两个 Sink 排空后分别判定本路结束；不存在的轨道视为已完成，单轨媒体不能等待一条不存在的分支。
+- `StreamReset{epoch,target_us}` 必须同时广播到两条分支。Pipeline 只有在视频 Sink 和音频 Sink 都完成当前 epoch 后才上报一次 `MediaEnded`。
 - Pipeline 汇聚全部 Sink 的结束状态，全部结束才判定播放完成；音频 Sink 结束前调 Drain 让设备缓冲播完。
 - 播放完成事件经 Facade 上报，FSM 跃迁到对应状态。
 
@@ -776,11 +804,11 @@ Day 23。
 实现无残留的跳转，并明确 Seek 之后由谁、在什么时刻重新建立音画同步基准。
 
 ### Tasks
-- `Pipeline::Seek(timestamp_us)`：递增 epoch → Demuxer 物理定位 → 注入带内 `kFlush` → 恢复读包。
-- Demuxer 用 `av_seek_frame` 定位到目标前最近关键帧并 `avformat_flush`。
-- Decoder 收到 `kFlush` 调 `avcodec_flush_buffers` 清参考帧。
-- AudioSink 收到 `kFlush`：`snd_pcm_drop` 丢设备缓冲 → 时钟转为未锚定并把 seek 目标记为待锚定值 → 写入 flush 后第一个音频帧时用该帧 PTS 完成锚定。
-- AVSync 收到 `kFlush` 清内部状态；未锚定期间直接放行第一帧，Seek 立即出画，不等音频。
+- `Pipeline::Seek(timestamp_us)`：递增 epoch → Demuxer 用 `av_seek_frame` 物理定位并 `avformat_flush` → 向视频和音频两条分支发送 `StreamReset{epoch, target_us}` → 恢复读包。
+- Demuxer 负责用 `av_seek_frame` 定位到目标前最近关键帧并调用 `avformat_flush`；Pipeline 只负责生成 epoch、发起请求并等待两条分支按序传播 Reset。
+- Decoder 收到 `StreamReset` 调 `avcodec_flush_buffers` 清参考帧，更新本地 epoch，并把 Reset 原样转发到下游。
+- AudioSink 收到 `StreamReset`：`snd_pcm_drop` 丢设备缓冲 → 时钟转为未锚定并记录 seek 目标 → 写入 Reset 后第一个音频帧时用该帧 PTS 完成锚定。
+- AVSync 收到 `StreamReset` 清内部状态；未锚定期间直接放行第一帧，Seek 立即出画，不等音频。
 - 各节点在 Tick 中比较 `item.epoch` 与全局 epoch，小于则丢弃 —— 这是丢弃 pre-seek 数据的唯一手段，队列存量和"在飞"数据都覆盖。
 - 兜底：超过 `sync.reanchor_timeout_ms` 未等到音频，或视频-only，AVSync 用墙钟锚定到第一帧 PTS。
 - 暂停态 Seek：渲染目标帧后停在暂停态，时钟保持未锚定，Resume 时才锚定。
@@ -1028,11 +1056,11 @@ Day 34。
 - 按 Day 31 的支持矩阵决定默认路径，实现运行中回退：硬解失败切回软解且不中断播放。
 - 硬解开关进配置（`auto` / 强制软解 / 强制硬解），`auto` 时按支持矩阵决定；强制硬解在不支持的环境下报明确错误而不是静默回退。
 - 性能基准：1080p 与 4K 各测 CPU 占用、GPU 占用、内存、掉帧数、首帧时间。
-- 用 `av_hwframe_transfer_data` 调用计数、DMA-BUF fd 存在性、CPU/GPU 数据共同证明零拷贝生效，不以"代码里没有 memcpy"作为证据。
-- 明确硬解开启时的录制策略：硬件帧下载后软件编码、加硬件编码器、或暂时禁用录制，三选一并写明。
+- `av_hwframe_transfer_data` 只允许在 Day 33 的正确性回退路径用于硬件帧下载；正常零拷贝渲染路径的调用次数必须为 0。用 DMA-BUF fd → EGLImage → GL 纹理的导入记录、CPU 纹理上传次数为 0、fd/fence 生命周期和 CPU/GPU 测量共同证明路径成立，不以“代码里没有 memcpy”作为证据。
+- 录制本轮不纳入；硬件帧交给录制分支时的下载/硬件编码策略留到录制阶段单独定义。
 
 ### Dependencies
-Day 35、Day 30。
+Day 35。
 
 ### Acceptance Criteria
 - 性能数据附完整输入、环境、时间源和测量方法。
@@ -1085,9 +1113,9 @@ Day 37。
 
 ---
 
-# 阶段 F：网络播放与抗弱网（Day 39–43）【冲刺优先级：拆分 —— Day 41–42 必须扎实且提前执行，Day 39、43 时间富余再做】
+# 阶段 F：网络播放与抗弱网（Day 39–43）【核心闭环后的后续专项】
 
-> 本阶段内部按冲刺优先级拆成两段：Day 41–42（RTP 解析、H.264 解包、Jitter Buffer）属于第一档，必须扎实，且在实际执行顺序上提前到 Day 31–35（VA-API）之前，因为 RTP/Jitter Buffer 是覆盖面更广的面试考点。Day 39（HTTP 播放基线）与 Day 43（Jitter 自适应与弱网量化验证）属于第二档，时间富余再做，否则跳过且不计入本轮验收。Day 40 的 FFmpeg 能力决策门仍按原顺序在 Day 39 之后执行，只在决定实际推进 HTTP 播放时才需要。
+> 本阶段属于核心闭环完成后的网络专项。短期冲刺不实现网络模块；若核心闭环已稳定且时间充足，再按 Day 41–42、Day 39、Day 43 的依赖顺序推进。Day 40 的 FFmpeg 能力决策门只在决定实际推进 HTTP 播放时执行。
 
 ## Day 39 — HTTP 播放基线与缓冲恢复
 
@@ -1163,7 +1191,7 @@ Day 26。
 - `jitter_buffer_node.h/.cpp`：`INode<RtpPacket, RtpPacket>`，按扩展序列号排序，窗口深度取自 `config.jitter.target_delay_ms`。
 - 重复包丢弃并计数；迟到包（已越过输出位置）丢弃并计数；空洞按 deadline 判丢；容量按 `config.jitter.packet_capacity` 封顶，超限按策略丢最旧数据。
 - 时钟抽象为可注入接口，测试用确定性虚拟时钟。
-- 组图：`RtpSourceNode → JitterBufferNode → H264DepacketizerNode → VideoDecoderNode → VideoSinkNode`。
+- 组图：`RtpSourceNode → JitterBufferNode → H264DepacketizerNode → VideoDecoderNode → AVSyncNode → VideoSinkNode`；无音频时 AVSync 使用墙钟，有音频时复用音频主时钟。
 - 冷启动等首个可解码 IDR，之前数据丢弃；从带内 SPS/PPS 或带外配置初始化解码器。
 - 网络路径与本地路径复用同一套解码、同步和输出节点。
 
@@ -1213,8 +1241,8 @@ Day 42、Day 39。
 在完整能力集上做一次关键路径回归，确认主要功能没有互相破坏。
 
 ### Tasks
-- 建回归矩阵，维度：输入源（本地 / HTTP / RTP）、轨道组合（音频-only / 视频-only / 音视频）、解码路径（软解 / 硬解）、控制操作（播放 / 暂停 / Seek / Stop / Reopen）、录制开关。
-- 按风险挑选关键组合执行并记录结果：本地音视频软解、视频-only、音频-only、Seek/Stop/Reopen、录制 Drain、一个网络弱网样本、一个硬解样本。
+- 建回归矩阵，维度：输入源（已实现的本地/网络源）、轨道组合（音频-only / 视频-only / 音视频）、解码路径（软解 / 已实现的硬解）、控制操作（播放 / 暂停 / Seek / Stop / Reopen）、双路 StreamReset/EOS 顺序。
+- 按风险挑选关键组合执行并记录结果：本地音视频软解、视频-only、音频-only、Seek/Stop/Reopen、双路 EOS 汇聚、一个已实现的硬解样本。录制、HTTP、RTP 仅在对应模块实际完成后加入矩阵。
 - 对改动过的高风险模块跑 Sanitizer，不要求全矩阵都跑 ASan/UBSan/TSan。
 - 记录各组合的常驻内存、峰值内存和队列深度峰值，与预算表比对，超出的项要么修代码要么修预算并写明理由。
 
@@ -1251,6 +1279,51 @@ Day 44。
 
 ---
 
+# 后续工期与短期冲刺
+
+> 以下按单人每天 6–8 小时有效开发时间估算。当前正式 `mediacore` 仍需把 `_example` 的视频能力迁入，并补齐音频、同步和硬件路径；不能把 `_example` 已有代码直接当成正式产品已完成能力。
+
+## 完整主线工期
+
+按本次确定的顺序（StreamReset → Demuxer 双输出 → AudioDecoder/重采样 → ALSA → 音频主时钟 → AVSync → 双路控制 → Software/Hardware VideoFrame → VA-API → DMA-BUF → EGLImage/OpenGL 零拷贝）估算：
+
+| 工作包 | 有效工作日 |
+|---|---:|
+| StreamReset 协议、正式目录/CMake 接入与协议测试 | 2–3 |
+| Demuxer 双输出及自动组图 | 2–3 |
+| AudioDecoder + `libswresample` | 3–4 |
+| AudioSink/ALSA（xrun、可中断写入、Drain、设备清理） | 3–5 |
+| 音频主时钟与锚定/暂停语义 | 2–3 |
+| AVSync（等待、丢帧、追赶、墙钟回退和指标） | 3–4 |
+| 双路 Seek/Pause/Stop/EOS/错误闭环 | 4–6 |
+| 正式 Player/Pipeline 接线、回归测试和 Sanitizer | 3–4 |
+| **核心本地音视频闭环** | **25–35** |
+| Software/Hardware `VideoFrame` 契约 | 2–4 |
+| VA-API 正确性与软解回退 | 3–5 |
+| DMA-BUF 导出与生命周期 | 2–3 |
+| EGLImage/OpenGL 零拷贝渲染 | 3–5 |
+| 软硬路径集成、资源泄漏和性能验证 | 2–4 |
+| **核心闭环 + 硬解/零拷贝** | **38–50** |
+
+表中各工作包的基础相加约为 22–32 天，综合估算的 25–35 天包含正式目录迁移、接口返工和集成缓冲；硬件专项同样包含资源生命周期和环境排障，因此按 **38–50 天**作为可执行总预算。该预算不包含录制、HDR、HTTP、RTP/Jitter 和弱网量化。若要求把原始目标能力全部实现，应在此基础上再增加约 20–35 个有效工作日，整体约 60–85 天；驱动、ALSA 设备和测试媒体不可用时还需另留排障时间。
+
+## 短期冲刺计划
+
+目标是尽快得到一个可演示、可面试的本地音视频版本：软件视频解码 + 音频解码/ALSA + 音频主时钟 + 基础 AVSync + 双路 Seek/Pause/Stop/EOS/错误闭环 + 正式目录接入。预计 **26–28 个有效工作日**。
+
+| 冲刺日 | 交付 |
+|---|---|
+| 1–2 | 统一 `StreamReset{epoch,target_us}`，移除 `kFlush` 的控制语义，补协议测试 |
+| 3–5 | Demuxer 视频/音频双输出、双路 Reset/EOS 顺序 |
+| 6–9 | AudioDecoder + `libswresample` |
+| 10–13 | AudioSink 抽象、ALSA 基线、xrun 和可中断写入 |
+| 14–16 | 音频主时钟、锚定、暂停/恢复 |
+| 17–20 | AVSync：等待、丢帧、追赶、视频-only 墙钟回退 |
+| 21–25 | 双路 Seek/Pause/Stop/EOS/错误闭环、快速 Seek 回归 |
+| 26–28 | 正式 CMake/Player 接入、Sanitizer、固定样本回归和文档收口 |
+
+短期明确推迟：VA-API、DMA-BUF、EGLImage/OpenGL 零拷贝、HDR、HTTP、RTP/Jitter、录制和弱网量化。核心闭环稳定后，硬解与零拷贝专项再追加约 **10–15 个有效工作日**。
+
 # Final Project Acceptance
 
 全部 Day 完成后，项目应同时满足以下条件。下面"功能能力"表是**原始完整范围**的验收标准，不因本轮冲刺裁剪而改写；本轮实际要对照验收的范围见下方"冲刺版验收"。
@@ -1264,8 +1337,9 @@ Day 44。
 | 本地播放 | 必须达标，同完整版"本地播放"行 |
 | 音画同步 | 必须达标，同完整版"音画同步"行 |
 | Seek / EOF / 错误处理 | 必须达标，同完整版对应行 |
-| RTP 播放 | 必须达标：H.264 RTP 可播放，乱序、重复、丢包各有明确策略；断流重连若时间不够可降级为已知限制并说明 |
-| 硬件解码 | 降级标准：VA-API 解码正确、不支持时回退软解、零拷贝路径（DMA-BUF/EGLImage）有证据链能讲清楚；不要求达到完整版"数据证明收益"的性能调优深度 |
+| 双路控制协议 | 必须达标：视频/音频都能按序处理 `StreamReset` 和 `EndOfStream`，Seek/Pause/Stop 不死锁 |
+| 音频输出与主时钟 | 必须达标：音频设备输出可用，视频能跟随音频主时钟；无音频时使用墙钟 |
+| RTP / 硬件解码 | 本轮不验收；分别在网络专项和硬件专项中按对应验收标准验收 |
 | 录制 | **不验收。** 完整版"录制"行本轮不实现，仅要求能口头讲清楚 Tee 分支结构、编码 API 对称性和独立 Drain 协议设计 |
 | 色彩管理 / HTTP 播放 / 弱网验证 | 时间富余才做；做了按完整版对应行验收，没做则在收口文档中注明"本轮跳过"，不算未达标 |
 | 配置 / 资源控制 / 可观测性 | 必须达标，但预算表和回归范围只覆盖本轮实际实现的模块 |

@@ -52,7 +52,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 set(ALL_TEST_CASES
-    eof_close_and_drain
+    eos_propagation_and_drain
     stop_while_receiving
     stop_while_sending
     stop_while_paused

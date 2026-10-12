@@ -3,13 +3,18 @@
 # ============ 收集源文件 ============
 # 显式列出而非 GLOB：CMake 官方建议——GLOB 在增删文件时不会自动触发重新配置，易踩坑
 set(MEDIACORE_SOURCES
-    src/core/stub_player.cpp
     src/core/player_factory.cpp
     src/av_types/packet.cpp
     src/utils/logger.cpp
     src/config/player_config.cpp
     src/core/media_error.cpp
+    src/demux/ffmpeg_demuxer.cpp
     src/demux/ffmpeg_demuxer_node.cpp
+    src/video_decoder/ffmpeg_video_decoder.cpp
+    src/video_decoder/ffmpeg_video_decoder_node.cpp
+    src/av_types/video_codec_parameters.cpp
+    src/core/player.cpp
+    src/sink/video_sink_node.cpp
 )
 
 # ============ 定义静态库 ============

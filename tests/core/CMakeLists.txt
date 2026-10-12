@@ -31,3 +31,35 @@ add_test(
 )
 
 set_tests_properties(core.media_error PROPERTIES TIMEOUT 5)
+
+# Player 控制命令的端到端回归测试，不需要 GUI 或外部媒体文件。
+add_executable(player_control_test
+    player_control_test.cpp
+)
+
+target_compile_features(player_control_test PRIVATE cxx_std_17)
+
+set_target_properties(player_control_test PROPERTIES
+    AUTOMOC OFF
+    AUTOUIC OFF
+    AUTORCC OFF
+)
+
+target_link_libraries(player_control_test PRIVATE
+    mediacore
+)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(player_control_test PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
+endif()
+
+add_test(
+    NAME core.player_controls
+    COMMAND player_control_test
+)
+
+set_tests_properties(core.player_controls PROPERTIES TIMEOUT 15)

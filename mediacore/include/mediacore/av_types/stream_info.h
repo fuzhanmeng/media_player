@@ -1,26 +1,28 @@
 /**
  * @file stream_info.h
- * @brief 探测阶段读取到的媒体容器和音视频流基本信息
+ * @brief 媒体容器与音视频流元数据自包含值类型定义
  * @details
- * 数据来自 avformat_open_input() / avformat_find_stream_info() 读取到的 AVStream
- * AVCodecParameters，可以实现与 FFmpeg 的解耦
+ * 本文件定义打开媒体资源后探测到的只读描述元数据结构：
  *
- * 数据来源：
- * 文件 / URL
+ * 数据链路来源：
+ * 本地文件 / 网络流 URI
  *    ↓
  * avformat_open_input()
  *    ↓
  * avformat_find_stream_info()
  *    ↓
- * Demuxer 读取 AVStream / AVCodecParameters
+ * Demuxer 提取 AVStream / AVCodecParameters
  *    ↓
- * 复制字段到 MediaInfo
+ * 深拷贝字段填充至 MediaInfo 结构体
  *    ↓
- * 开始正式 av_read_frame()
+ * 启动正式数据流驱动（av_read_frame）
  *
- * 本文件不包含 FFmpeg 头文件，也不保存 AVFormatContext / AVStream 或 AVCodecParameters 指针
- * FFmpeg 对象关闭以后，这些结构仍然可以继续使用
+ * 核心架构原则：
+ * 1. 强依赖隔离：本头文件纯基于 C++ 标准库构建，严禁引入 FFmpeg 头文件，亦不持有底层 AVFormatContext / AVStream 等 C
+ * 指针；
+ * 2. 独立生命周期：底层 FFmpeg 句柄关闭或发生错误析构后，本文件的只读值对象仍可被 Pipeline、UI 与业务层安全持有。
  */
+
 #pragma once
 
 #include <cstdint>
@@ -32,202 +34,227 @@ namespace mediacore {
 
 /**
  * @struct Rational
- * @brief 分数（有理数），用于表示时间基和帧率等非整数比例值
- * @details
- * 不直接使用 FFmpeg 的 AVRational，避免对外暴露 FFmpeg 类型
+ * @brief 表示时间基（TimeBase）或显示帧率（FrameRate）的有理数分数结构体
+ * @details 替代并隔离 FFmpeg 的 AVRational，避免直接对外暴露第三方底层类型。
  */
-struct Rational {
-    std::uint64_t numerator_{0};  ///< 分子
-    std::uint64_t denominator_{0};  ///< 分母，不能为 0
+struct Rational final {
+    std::int64_t numerator_{0};  ///< 分子（Numerator）
+    std::int64_t denominator_{0};  ///< 分母（Denominator，不可为 0）
 
     /**
-     * @brief 判断 Rational 是否合法
-     * @return 分子和分母都大于 0 返回 true，否则返回 false
+     * @brief 校验分子与分母是否构成有效的正有理数
+     * @return 分子与分母均大于 0 时返回 true，否则返回 false
      */
-    bool IsValid() const { return numerator_ > 0 && denominator_ > 0; }
+    bool IsValid() const noexcept { return numerator_ > 0 && denominator_ > 0; }
 
     /**
-     * @brief 把比例值转换为 double
-     * @return 分母不为 0 时返回计算结果，否则返回 0.0
-     * @details
-     * 这个函数主要用于帧率显示和测试，时间戳换算不可用
+     * @brief 将有理数计算转换为双精度浮点数
+     * @return 分母非 0 时返回浮点除法结果；分母为 0 时安全兜底返回 0.0
+     * @note 仅用于 UI 帧率展示与日志打印，严禁用于严苛的 PTS 时间戳基准换算（防止浮点精度丢失）。
      */
-    double ToDouble() const {
+    double ToDouble() const noexcept {
         if (denominator_ == 0) {
             return 0.0;
         }
-
         return static_cast<double>(numerator_) / static_cast<double>(denominator_);
     }
 };
 
 /**
  * @enum VideoPixelFormat
- * @brief 视频流的像素格式
- * @details 使用项目自己的枚举，不直接暴露 FFmpeg 的 AVPixelFormat
+ * @brief 视频流原生像素格式枚举
+ * @details 自定义项目独立枚举，解耦 FFmpeg 的 AVPixelFormat。
  */
 enum class VideoPixelFormat : std::uint8_t {
-    kUnknown,  ///< 尚未识别或当前项目不支持的像素格式
-    kYuv420p,  ///< YUV420P，三个平面
-    kNv12,  ///< NV12，Y 平面加交错 UV 平面
-    kYuv422p,  ///< YUV422P，三个平面
-    kYuv444p,  ///< YUV444P，三个平面
-    kRgba,  ///< RGBA packed 像素
+    kUnknown,  ///< 尚未识别或当前项目管线暂不支持的像素格式
+    kYuv420p,  ///< 平面型 YUV420P（Y/U/V 三个独立内存平面）
+    kNv12,  ///< 半平面型 NV12（连续 Y 平面 + UV 交叉打包平面）
+    kYuv422p,  ///< 平面型 YUV422P
+    kYuv444p,  ///< 平面型 YUV444P
+    kRgba,  ///< 打包型 RGBA（连续 32-bit packed 像素）
 };
+
+/**
+ * @brief 将视频像素格式枚举转换为日志可读字符串
+ * @param format 待转换的像素格式
+ * @return 对应的常量字符串指针
+ */
+inline const char* VideoPixelFormatToString(VideoPixelFormat format) noexcept {
+    switch (format) {
+        case VideoPixelFormat::kUnknown:
+            return "Unknown";
+        case VideoPixelFormat::kYuv420p:
+            return "YUV420P";
+        case VideoPixelFormat::kNv12:
+            return "NV12";
+        case VideoPixelFormat::kYuv422p:
+            return "YUV422P";
+        case VideoPixelFormat::kYuv444p:
+            return "YUV444P";
+        case VideoPixelFormat::kRgba:
+            return "RGBA";
+    }
+    return "Unknown";
+}
 
 /**
  * @enum AudioSampleFormat
- * @brief 音频流的样本格式
+ * @brief 音频流原生采样精度与排布格式枚举
  * @details
- * 使用项目自己的枚举，不直接暴露 FFmpeg 的 AVSampleFormat
- * planar 表示各声道分开存储，packed 表示各声道交错存储
+ * 自定义项目独立枚举，解耦 FFmpeg 的 AVSampleFormat：
+ * - Planar：各声道音频数据独立在不同内存块中排布；
+ * - Packed：各声道音频采样点按时序紧凑交错排布。
  */
-enum class AudioSampleFormat {
-    kUnknown,  ///< 尚未识别或当前项目不支持的格式
-    kU8,  ///< packed unsigned 8-bit
-    kS16,  ///< packed signed 16-bit
-    kS32,  ///< packed signed 32-bit
-    kS64,  ///< packed signed 64-bit
-    kFloat,  ///< packed 32-bit floating point
-    kDouble,  ///< packed 64-bit floating point
-    kU8Planar,  ///< planar unsigned 8-bit
-    kS16Planar,  ///< planar signed 16-bit
-    kS32Planar,  ///< planar signed 32-bit
-    kS64Planar,  ///< planar signed 64-bit
-    kFloatPlanar,  ///< planar 32-bit floating point
-    kDoublePlanar,  ///< planar 64-bit floating point
+enum class AudioSampleFormat : std::uint8_t {
+    kUnknown,  ///< 尚未识别或暂不支持的采样格式
+    kU8,  ///< Packed 无符号 8-bit 整数
+    kS16,  ///< Packed 有符号 16-bit 整数
+    kS32,  ///< Packed 有符号 32-bit 整数
+    kS64,  ///< Packed 有符号 64-bit 整数
+    kFloat,  ///< Packed 32-bit 单精度浮点数
+    kDouble,  ///< Packed 64-bit 双精度浮点数
+    kU8Planar,  ///< Planar 无符号 8-bit 整数
+    kS16Planar,  ///< Planar 有符号 16-bit 整数
+    kS32Planar,  ///< Planar 有符号 32-bit 整数
+    kS64Planar,  ///< Planar 有符号 64-bit 整数
+    kFloatPlanar,  ///< Planar 32-bit 单精度浮点数
+    kDoublePlanar,  ///< Planar 64-bit 双精度浮点数
 };
 
 /**
+ * @brief 将音频采样格式枚举转换为日志可读字符串
+ * @param format 待转换的音频采样格式
+ * @return 对应的常量字符串指针
+ */
+inline const char* AudioSampleFormatToString(AudioSampleFormat format) noexcept {
+    switch (format) {
+        case AudioSampleFormat::kUnknown:
+            return "Unknown";
+        case AudioSampleFormat::kU8:
+            return "U8";
+        case AudioSampleFormat::kS16:
+            return "S16";
+        case AudioSampleFormat::kS32:
+            return "S32";
+        case AudioSampleFormat::kS64:
+            return "S64";
+        case AudioSampleFormat::kFloat:
+            return "Float";
+        case AudioSampleFormat::kDouble:
+            return "Double";
+        case AudioSampleFormat::kU8Planar:
+            return "U8Planar";
+        case AudioSampleFormat::kS16Planar:
+            return "S16Planar";
+        case AudioSampleFormat::kS32Planar:
+            return "S32Planar";
+        case AudioSampleFormat::kS64Planar:
+            return "S64Planar";
+        case AudioSampleFormat::kFloatPlanar:
+            return "FloatPlanar";
+        case AudioSampleFormat::kDoublePlanar:
+            return "DoublePlanar";
+    }
+    return "Unknown";
+}
+
+/**
  * @struct VideoStreamInfo
- * @brief 一条视频流的基本信息
- * @details
- * 保存探测阶段得到的视频流描述，不持有解码对象；Decoder 可用这些值创建 AVCodecContext
- * 但 AVCodecContext 本身不属于此结构体
+ * @brief 单条视频流的核心元数据描述结构体
  */
 struct VideoStreamInfo {
-    int stream_index_{-1};  ///< 在容器中的视频流索引编号，不能用负数表示有效流
-    int codec_id_{0};  ///< 编码器编号，由 FFmpeg 适配层转换后写入
-    int width_{0};  ///< 视频流的宽度，单位像素
-    int height_{0};  ///< 视频流的高度，单位像素
+    int stream_index_{-1};  ///< 在多路复用容器中的流索引序号
+    int codec_id_{0};  ///< 编解码器代号（映射自 AVCodecID）
+    int width_{0};  ///< 图像画面物理宽度（像素）
+    int height_{0};  ///< 图像画面物理高度（像素）
 
-    VideoPixelFormat pixel_format_{VideoPixelFormat::kUnknown};  ///< 视频流的像素格式
-    Rational frame_rate_{};  ///< 此视频流的帧率
-    Rational time_base_{};  ///< 此视频流的时间基
-    std::optional<std::int64_t> duration_us_{};  ///< 此视频流的时长，单位微秒，未知时没有值
+    VideoPixelFormat pixel_format_{VideoPixelFormat::kUnknown};  ///< 视频像素格式
+    Rational frame_rate_{};  ///< 标称平均显示帧率（FPS）
+    Rational time_base_{};  ///< 容器层时间基准（用于微秒 PTS 转换）
+    std::optional<std::int64_t> duration_us_{};  ///< 视频流总时长（微秒）；未知或无界流时为空
 
-    /**
-     * @brief 解码器初始化所需的私有数据，例如 H.264/HEVC 的 SPS/PPS
-     * @details
-     * 数据来源于 AVCodecParameters::extradata
-     * MediaInfo 对该数据进行值拷贝并自行管理生命周期，避免依赖 FFmpeg 对象
-     * Decoder 创建 AVCodecContext 时根据需要将其复制到 codec context
-     * 空 vector 表示当前媒体没有提供 extradata
-     */
-    std::vector<std::uint8_t> extradata_{};
+    std::vector<std::uint8_t> extradata_{};  ///< 解码器头部私有数据（如 H.264 SPS/PPS、HEVC VPS）
 
     /**
-     * @brief 判断此视频流的基本字段是否可用
-     * @return stream index / width / height 和 time_base 有效时都返回 true
-     * @details 帧率和像素格式有时探测不到，因此不作为判断的核心；
-     * codec_id_ 为 0 表示尚未写入真实编码格式，不认为是有效流
+     * @brief 校验视频流的基础关键元数据是否完备有效
+     * @return 关键参数满足起播条件时返回 true，否则返回 false
      */
-    bool IsValid() const {
+    bool IsValid() const noexcept {
         if (stream_index_ < 0 || codec_id_ <= 0) {
             return false;
         }
-
         if (width_ <= 0 || height_ <= 0) {
             return false;
         }
-
         if (!time_base_.IsValid()) {
             return false;
         }
-
         if (duration_us_.has_value() && duration_us_.value() < 0) {
             return false;
         }
-
         return true;
     }
 };
 
 /**
  * @struct AudioStreamInfo
- * @brief 一条音频流的基本信息
- * @details 描述输入媒体中的压缩音频流（如 AAC / MP3），与解码后的 AudioFrame 是不同的概念
+ * @brief 单条音频流的核心元数据描述结构体
  */
 struct AudioStreamInfo {
-    int stream_index_{-1};  ///< 在容器中的音流编号，不能用负数表示有效流
-    int codec_id_{0};  ///< 编码器编号，由 FFmpeg 适配层转换后写入
-    int sample_rate_hz_{0};  ///< 采样率，单位 Hz
-    int channel_count_{0};  ///< 声道数量
+    int stream_index_{-1};  ///< 在多路复用容器中的流索引序号
+    int codec_id_{0};  ///< 编解码器代号（映射自 AVCodecID）
+    int sample_rate_hz_{0};  ///< 采样频率（Hz，例如 44100、48000）
+    int channel_count_{0};  ///< 物理声道总数（如 1、2、6）
 
-    std::string channel_layout_{};  ///< 声道布局方式，如 mono / stereo / 5.1
-    AudioSampleFormat sample_format_{AudioSampleFormat::kUnknown};  ///< 输入音频的格式
-    Rational time_base_{};  ///< 音频流的时间基
-    std::optional<std::int64_t> duration_us_{};  ///< 音频流的时长，单位微秒，直播流等无时长显示
+    std::string channel_layout_{};  ///< 声道布局描述（如 "mono"、"stereo"、"5.1"）
+    AudioSampleFormat sample_format_{AudioSampleFormat::kUnknown};  ///< 原始音频采样量化格式
+    Rational time_base_{};  ///< 容器层时间基准
+    std::optional<std::int64_t> duration_us_{};  ///< 音频流总时长（微秒）；未知或直播流时为空
 
-    /**
-     * @brief 解码器初始化需要的私有数据
-     * @details
-     * 数据来源于 AVCodecParameters::extradata
-     * MediaInfo 对该数据进行拷贝并管理其生命周期，避免对 FFmpeg 的依赖
-     * Docoder 创建 AVCodecContext 时根据需要将其复制到 codec context，
-     * 空 vector 表示当前音频流没有提供 extradata
-     */
-    std::vector<uint8_t*> extradata_{};
+    std::vector<std::uint8_t> extradata_{};  ///< 解码器头部私有初始化数据（如 AAC AudioSpecificConfig）
 
     /**
-     * @brief 判断音频流的基本字段是否可用
-     * @return stream_index / codec_id / sample_rate_hz / channel_count / time_base 有效时返回 true
-     * @details 声道布局名称和样本格式在部分输入中可能缺失，因此不作为必填项；
-     * AudioDecoder 如需重采样，应在创建 SwrContext 前再次检查完整格式
+     * @brief 校验音频流的基础关键元数据是否完备有效
+     * @return 关键参数满足播放配置要求时返回 true，否则返回 false
      */
-    bool IsValid() const {
+    bool IsValid() const noexcept {
         if (stream_index_ < 0 || codec_id_ <= 0) {
             return false;
         }
-
         if (sample_rate_hz_ <= 0 || channel_count_ <= 0) {
             return false;
         }
-
         if (!time_base_.IsValid()) {
             return false;
         }
-
         if (duration_us_.has_value() && duration_us_.value() < 0) {
             return false;
         }
-
         return true;
     }
 };
 
 /**
  * @struct MediaInfo
- * @brief 一次 Open / 探测得到的整个媒体输入的基本信息
+ * @brief 解封装探测得到的完整媒体容器与轨道元数据聚合结构体
  * @details
- * video_stream_ / audio_stream_ 用 optional 表示对应轨道是否存在：
- * optional 用来表示输入媒体中是存在音频流 / 视频流
- * - 没有视频轨时 video_stream_ 没有值；
- * - 没有音频轨时 audio_stream_ 没有值；
- * - 音视频都有时两个字段都有值
+ * 使用 std::optional 表达音视频轨道的物理存在性：
+ * - 纯视频文件：video_stream_ 有值，audio_stream_ 为 std::nullopt；
+ * - 纯音频文件：audio_stream_ 有值，video_stream_ 为 std::nullopt；
+ * - 标准音视频流：两字段均有值。
  */
 struct MediaInfo {
-    std::string container_name_{};
-    std::optional<std::int64_t> duration_us_{};
-    bool can_seek_{false};
-    std::optional<VideoStreamInfo> video_stream_{};
-    std::optional<AudioStreamInfo> audio_stream_{};
+    std::string container_name_{};  ///< 封装容器格式标识（如 "mov,mp4,m4a,3gp"、"matroska,webm"）
+    std::optional<std::int64_t> duration_us_{};  ///< 全局总呈现时长（微秒）；无界直播流或未知时为空
+    bool can_seek_{false};  ///< 媒体源是否声明支持 Seek 定位
+    std::optional<VideoStreamInfo> video_stream_{};  ///< 选定激活的视频流；不存在视频轨时为空
+    std::optional<AudioStreamInfo> audio_stream_{};  ///< 选定激活的音频流；不存在音频轨时为空
 
     /**
-     * @brief 判断媒体信息是否至少包含一条可用的音视频流
-     * @return 至少有一条有效的音频流或者视频流时，返回 true
+     * @brief 校验媒体信息是否至少包含一条合法的可播放轨道
+     * @return 至少存在一条有效视频轨或有效音频轨且时长非负时返回 true
      */
-    bool IsValid() const {
+    bool IsValid() const noexcept {
         if (duration_us_.has_value() && duration_us_.value() < 0) {
             return false;
         }
@@ -238,4 +265,5 @@ struct MediaInfo {
         return has_valid_audio || has_valid_video;
     }
 };
+
 }  // namespace mediacore

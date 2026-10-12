@@ -1,8 +1,12 @@
 /**
  * @file media_error.h
- * @brief 播放器内部使用的错误码及其对应错误信息
+ * @brief 播放器核心流水线统一结构化错误类型定义
  * @details
- * MediaError 用来说明一次操作失败的原因，用来替代 bool 返回值，携带错误类别、原始错误码和错误说明
+ * MediaError 用于准确描述一次音视频媒体操作失败的完整上下文：
+ * 1. 结构化分类：涵盖错误类别（Category）、发生模块（Module）、底层原始错误码（Raw Code）、
+ *    人类可读的综合描述（Message）以及可恢复性标志（Recoverable）；
+ * 2. 跨模块通用契约：供 Demuxer、Decoder、VideoSink、AudioSink 以及 Pipeline 控制层统一传递；
+ * 3. 依赖解耦：本头文件纯基于标准库构建，严禁引入 FFmpeg 等具体依赖库的头文件。
  */
 
 #pragma once
@@ -15,142 +19,137 @@ namespace mediacore {
 
 /**
  * @enum MediaErrorCategory
- * @brief 错误来源分类
- * @details
- * 分类的目的是让上层区分是哪个模块出的问题，例如 FFmpeg 打不开文件和当前播放状态不允许 Seek，
- * 上层的处理方式通常不一样
+ * @brief 错误来源大类分类
  */
 enum class MediaErrorCategory : std::uint8_t {
-    kNone,  ///< 没有错误
-    kFfmpeg,  ///< FFmpeg API 返回的错误
-    kSystem,  ///< 系统调用或 C/C++ 标准库错误
-    kIo,  ///< 文件、URL、网络读写相关错误
-    kState,  ///< 当前对象状态不允许执行该操作
-    kInternal,  ///< 代码内部逻辑错误或不应发生的情况
+    kNone,  ///< 正常状态，无错误
+    kFfmpeg,  ///< FFmpeg 底层 API 返回的错误（如解封装、编解码、swscale 失败）
+    kSystem,  ///< 操作系统调用或 C/C++ 标准库引发的底层错误（基于 errno）
+    kIo,  ///< 本地文件读写、URL 解析或网络套接字 I/O 错误
+    kState,  ///< 状态机冲突：当前对象或管线运行状态不允许执行请求的操作
+    kInternal,  ///< 框架内部逻辑缺陷、防御性断言失败或不应出现的分支
 };
 
 /**
- * @brief 把错误类别转换为日志可读的字符串
- * @param category 错误类别
- * @return 静态字符串，不需要调用方释放
+ * @brief 将错误分类枚举转换为字符串常量
+ * @param category 错误类别枚举
+ * @return 静态字符串常量指针（无需释放）
  */
-const char* MediaErrorCategoryToString(MediaErrorCategory category);
+const char* MediaErrorCategoryToString(MediaErrorCategory category) noexcept;
 
 /**
  * @class MediaError
- * @brief 保存一次媒体操作失败的原因
- * @details 默认构造的 MediaError 表示没有错误
- * 真正失败时，通过 FromFfmpeg / FromSystem / FromIo / FromState / FromInternal 创建
+ * @brief 封装媒体操作失败原因的领域错误值对象
+ * @details
+ * 1. 默认构造表示无错误（kNone）；
+ * 2. 发生真实错误时，统一通过静态命名工厂方法（FromFfmpeg / FromSystem / FromIo / FromState / FromInternal）创建。
  */
-class MediaError {
+class MediaError final {
 public:
     /**
-     * @brief 构造一个"没有错误"对象
+     * @brief 默认构造函数：构造一个表示“无错误”的默认对象（HasError() == false）
      */
     MediaError() = default;
 
     /**
-     * @brief 根据 FFmpeg 错误码创建错误对象
-     * @param module 发生错误的模块名
-     * @param code FFmpeg API 返回的错误码
-     * @param message 调用方补充的错误信息
-     * @param recoverable true 表示上层可以尝试恢复，false 表示此错误无法恢复
-     * @return 携带 FFmpeg 错误文本的 MediaError 对象
+     * @brief 工厂方法：基于 FFmpeg 错误码构造 MediaError
+     * @param module 发生错误的子系统或组件模块名（如 "FfmpegDemuxer"、"FfmpegVideoDecoder"）
+     * @param code FFmpeg API 返回的原生负数错误码
+     * @param message 业务层补充上下文说明
+     * @param recoverable true 表示上层可尝试容错降级或重试，false 表示致命不可逆错误
+     * @return 携带格式化错误描述的 MediaError 实例
      */
     static MediaError FromFfmpeg(std::string module, int code, std::string_view message, bool recoverable = false);
 
     /**
-     * @brief 根据系统错误码创建错误对象
-     * @param module 发生错误的模块名
-     * @param code errno 或类似系统错误码
-     * @param message 可读错误说明
-     * @param recoverable true 表示上层可以尝试恢复，false 表示此错误无法恢复
-     * @return 携带系统错误文本的 MediaError 对象
+     * @brief 工厂方法：基于操作系统 errno 构造 MediaError
+     * @param module 发生错误的子系统或组件模块名
+     * @param code errno 或系统原生错误码
+     * @param message 可读业务错误说明
+     * @param recoverable 错误是否可恢复
+     * @return 携带系统错误文本的 MediaError 实例
      */
     static MediaError FromSystem(std::string module, int code, std::string_view message, bool recoverable = false);
 
     /**
-     * @brief 创建文件、URL 或网络读写错误
-     * @param module 发生错误的模块名
-     * @param code 原始错误码；没有错误码时可以传 0
-     * @param message 可读错误说明
-     * @param recoverable true 表示上层可以尝试恢复，false 表示此错误无法恢复
-     * @return 携带 IO 错误文本的 MediaError 对象
+     * @brief 工厂方法：构造文件、URL 或网络传输相关的 I/O 错误
+     * @param module 发生错误的子系统或组件模块名
+     * @param code 原始底层错误码（无底层错误码时传 0）
+     * @param message 错误上下文描述
+     * @param recoverable 错误是否可通过重试恢复
+     * @return 携带 I/O 错误文本的 MediaError 实例
      */
     static MediaError FromIo(std::string module, int code, std::string_view message, bool recoverable = false);
 
     /**
-     * @brief 创建状态错误
-     * @param module 发生错误的模块名
-     * @param message 调用方补充的错误信息
-     * @return 状态错误的 MediaError 对象
+     * @brief 工厂方法：构造管线或节点状态机流转冲突错误（默认不可恢复）
+     * @param module 发生错误的子系统或组件模块名
+     * @param message 状态冲突详细说明
+     * @return 状态错误的 MediaError 实例
      */
     static MediaError FromState(std::string module, std::string message);
 
     /**
-     * @brief 创建内部错误
-     * @param module 发生错误的模块名
-     * @param message 可读错误说明
-     * @return 内部错误的 MediaError 对象
+     * @brief 工厂方法：构造框架内部逻辑缺陷或断言失败错误（不可恢复）
+     * @param module 发生错误的子系统或组件模块名
+     * @param message 错误原因描述
+     * @return 内部错误的 MediaError 实例
      */
     static MediaError FromInternal(std::string module, std::string message);
 
     /**
-     * @brief 判断该对象是否保存了一个真实错误
-     * @return true 表示有错误，false 表示没有错误
+     * @brief 查询当前对象是否包含真实错误
+     * @return true 表示存在有效错误；false 表示无错误（kNone）
      */
-    bool HasError() const { return category_ != MediaErrorCategory::kNone; }
+    bool HasError() const noexcept { return category_ != MediaErrorCategory::kNone; }
 
     /**
-     * @brief 获取错误类别
-     * @return MediaErrorCategory
+     * @brief 获取错误的大类分类
      */
-    MediaErrorCategory GetCategory() const { return category_; }
+    MediaErrorCategory GetCategory() const noexcept { return category_; }
 
     /**
-     * @brief 获取原始错误码
+     * @brief 获取底层原生错误码
      * @details
-     * FFmpeg 错误：avformat_open_input 等 API 返回的负数错误码
-     * 系统错误：errno，例如 ENOENT
-     * 状态错误、内部错误：没有底层错误码，统一用 0
-     * @return FFmpeg 错误码 / errno，或者 0
+     * - FFmpeg 错误：返回 avformat/avcodec 返回的负数错误码；
+     * - 系统/IO 错误：返回标准 errno（例如 ENOENT、ECONNREFUSED）；
+     * - 状态/内部错误：无底层码，返回 0。
+     * @return 原生错误数值
      */
-    int Code() const { return code_; }
+    int Code() const noexcept { return code_; }
 
     /**
-     * @brief 获取发生错误的模块名
-     * @return 模块名字符串
+     * @brief 获取发生报错的组件模块名
      */
-    const std::string& Module() const { return module_; }
+    const std::string& Module() const noexcept { return module_; }
 
     /**
-     * @brief 获取可读错误说明
-     * @return 错误说明字符串引用
+     * @brief 获取详细错误描述文本
      */
-    const std::string& Message() const { return message_; }
+    const std::string& Message() const noexcept { return message_; }
 
     /**
-     * @brief 判断这个错误是否可恢复
-     * @return true 表示可以恢复，false 表示无法恢复
+     * @brief 查询该错误是否被标注为可恢复
      */
-    bool IsRecoverable() const { return recoverable_; }
+    bool IsRecoverable() const noexcept { return recoverable_; }
 
     /**
-     * @brief 拼接适合日志输出的完整错误文本
-     * @return 包含类别、模块、错误码和说明的字符串
+     * @brief 将错误信息序列化为便于日志追踪和诊断的结构化字符串
+     * @return 格式化后的错误全景文本
      */
     std::string ToString() const;
 
 private:
     /**
-     * @brief 工厂函数调用的私有构造函数
+     * @brief 私有核心构造函数，供工厂方法统一组装
      */
     MediaError(MediaErrorCategory category, std::string module, int code, std::string message, bool recoverable);
 
-    MediaErrorCategory category_{MediaErrorCategory::kNone};
-    std::string module_{};
-    int code_{};
-    std::string message_{};
-    bool recoverable_{};
+    MediaErrorCategory category_{MediaErrorCategory::kNone};  ///< 错误分类
+    std::string module_{};  ///< 触发错误的模块标识
+    int code_{0};  ///< 原始数字错误码
+    std::string message_{};  ///< 格式化后的综合错误描述
+    bool recoverable_{false};  ///< 是否属于可恢复类型错误
 };
+
 }  // namespace mediacore

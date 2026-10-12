@@ -1,419 +1,347 @@
 /**
  * @file ffmpeg_demuxer_node.cpp
- * @brief FFmpeg Decoder Node
+ * @brief FfmpegDemuxerNode 的读包、时间跳转（Seek）以及 EOF 挂起等待逻辑实现
+ * @details
+ * 作为 Pipeline 的数据源驱动节点，工作线程内部采用协作式循环驱动：
+ * 1. 优先处理控制流：在每次读包前检查 HasPendingControl()，确保 Seek 请求具备高于普通数据读取的响应优先级；
+ * 2. 数据流驱动：循环调用 FfmpegDemuxer::Read() 提取目标视频流 Packet，并通过 Link 阻塞推向下游；
+ * 3. 流末尾挂起（EOF Parking）：遇到流末尾并向下游发送 EndOfStream 信号后，使用条件变量挂起自身工作线程，
+ *    杜绝在文件末尾高频空转消耗 CPU，等待下一次 Seek 或 Stop 唤醒。
  */
 
 #include "demux/ffmpeg_demuxer_node.h"
 
-#include <array>
-#include <cstddef>  ///< 大小、内存、指针相关 size_t ptrdiff_t
-#include <cstdint>  ///< 固定宽度整数
-#include <optional>
+#include <stdexcept>
 #include <string>
-#include <string_view>
+#include <utility>
 
+#include "core/inode.h"
 #include "mediacore/logger.h"
-
-extern "C" {
-#include <libavcodec/codec_par.h>
-#include <libavformat/avformat.h>
-#include <libavutil/channel_layout.h>
-#include <libavutil/error.h>
-#include <libavutil/mathematics.h>
-#include <libavutil/pixfmt.h>
-#include <libavutil/samplefmt.h>
-}
 
 namespace mediacore {
 
-/**
- * @namespace 匿名命名空间
- * @brief 此匿名命名空间内函数只用于 ffmpeg_decoder_node 内部，不对外暴露
- */
 namespace {
-
-constexpr const char* kModuleName = "FfmpegDemuxerNode";
-constexpr std::size_t kChannelLayoutBufferSize = 256;
-
-/**
- * @brief 将 AVRational 转换为 自己封装的 Rational
- * @param value FFmpeg 返回的 AVRational，例如 1/90000 或者 30000/1001
- * @return 分子和分母都大于 0 时返回对应的 Rational，否则返回 0 / 0
- * @details 时间基 和 帧率 都用分数表示
- */
-Rational ConvertRational(AVRational value) {
-    if (value.num <= 0 || value.den <= 0) {
-        return {};
-    }
-
-    return {static_cast<std::uint64_t>(value.num), static_cast<std::uint64_t>(value.den)};
+constexpr const char* kNodeName = "Demuxer";
 }
 
 /**
- * @brief 从视频流中选择一个可用的帧率
- * @param stream ffmpeg video stream
- * @param codec_parameters 这条视频流的编码参数
- * @return 返回 视频流的帧率
- * @details FFmpeg 中可能有多个帧率，我们顺序是：先去找平均帧率 avg_frame_rate,再去找 FFmpeg 推测
- * 出来的r_frame_rate，最后找一编码参数中记录的帧率 framerate
+ * @brief 构造函数：初始化解复用节点并接管已打开的解复用器实例
+ * @param sync_ctx 跨节点共享的播放状态同步上下文
+ * @param event_callback 用于向 Pipeline 控制层汇报错误与状态事件的回调集合
+ * @param demuxer 已完成 Open 探测的解复用器对象
+ * @throws std::invalid_argument 当 demuxer 为空时抛出异常
  */
-Rational ConvertVideoFrameRate(const AVStream& stream, const AVCodecParameters& codec_parameters) {
-    Rational frame_rate;
-
-    // 1. find avg_frame_rate
-    frame_rate = ConvertRational(stream.avg_frame_rate);
-    if (frame_rate.IsValid()) {
-        return frame_rate;
+FfmpegDemuxerNode::FfmpegDemuxerNode(std::shared_ptr<SyncContext> sync_ctx,
+                                     PipelineEventCallbacks event_callback,
+                                     std::unique_ptr<FfmpegDemuxer> demuxer)
+    : INode(kNodeName, std::move(sync_ctx), std::move(event_callback)), demuxer_(std::move(demuxer)) {
+    if (!demuxer_) {
+        LOG_ERROR("FfmpegDemuxerNode requires an opened FfmpegDemuxer");
+        throw std::invalid_argument("FfmpegDemuxerNode requires an opened FfmpegDemuxer");
     }
 
-    // 2. find r_frame_rate
-    frame_rate = ConvertRational(stream.r_frame_rate);
-    if (frame_rate.IsValid()) {
-        return frame_rate;
-    }
-
-    // 3. find framerate
-    return ConvertRational(codec_parameters.framerate);
+    // 获取并锚定初始的全局数据流版本世代号（Epoch）
+    output_epoch_ = GetCurrentEpoch();
+    LOG_INFO("FfmpegDemuxerNode constructed, active epoch {}", output_epoch_);
 }
 
 /**
- * @brief 把 FFmpeg 流时长换算为微秒
- * @param duration AVStream::duration，表示这条流占用了多少个时间刻度，不是真实的秒数
- * 例如 duration = 450000，time_base = 1 / 90000，那么真实时间是 450000 * 1 / 90000 = 5 秒
- * @param time_base AVStream::time_base，表示的是一个时间刻度等于多少秒
- * @return 返回时长（微秒），FFmpeg 无时长、duration 为负数，time_base不合法时返回空值
+ * @brief 异步登记最新的 Seek 请求，触发协作中断并唤醒可能正在等待的工作线程
+ * @param epoch Pipeline 为本次 Seek 分配的新数据流世代号
+ * @param target_us 目标时间戳（微秒）
+ * @note 本函数仅快速记录控制参数并发送中断，不会阻塞执行耗时的底层跳转
  */
-std::optional<std::int64_t> ConvertDurationToMicroseconds(std::int64_t duration, AVRational time_base) {
-    // 1. AV_NOPTS_VALUE 表示 FFmpeg 没有拿到这个时间戳或时长，直播流、损坏文件或部分封装格式没有时长
-    if (duration == AV_NOPTS_VALUE || duration < 0) {
-        return std::nullopt;
+void FfmpegDemuxerNode::RequestSeek(std::uint64_t epoch, std::int64_t target_us) {
+    bool had_pending_seek = false;
+    {
+        std::lock_guard<std::mutex> lock(control_mutex_);
+
+        // 检查此前是否已有未消费的 Seek 请求（用于诊断高频连续拖动进度条场景）
+        had_pending_seek = pending_seek_.has_value();
+
+        // 覆盖式更新：同一时刻仅保留最新的单条 Seek 请求
+        pending_seek_ = PendingSeek{epoch, target_us};
+
+        // 协作式中断：促使正在底层阻塞的 FFmpeg Read/Seek 尽快放弃退出
+        demuxer_->RequestSeekInterrupt();
     }
 
-    // 2. 确认 time_base 可用
-    const Rational project_time_base = ConvertRational(time_base);
-    if (!project_time_base.IsValid()) {
-        return std::nullopt;
+    if (had_pending_seek) {
+        LOG_DEBUG("Demuxer replaced a pending seek with target {} us, epoch {}", target_us, epoch);
+    } else {
+        LOG_DEBUG("Demuxer queued seek to {} us, epoch {}", target_us, epoch);
     }
 
-    // 3. 将 duration 转化为 微秒后返回
-    return av_rescale_q(duration, time_base, AV_TIME_BASE_Q);
+    // 通知基类状态机有控制事件到来，并唤醒可能阻塞在 EOF 处的解复用工作线程
+    NotifyControlPending();
+    eof_cv_.notify_all();
 }
 
 /**
- * @brief 把 FFmpeg 视频像素格式映射到项目枚举
- * @param format AVCodecParameters::format，对视频流来讲，这个整数实际表示 AVPixelFormat
- * @return 项目支持的视频格式，位支持时返回 kUnknown。
- * @details
- * AV_PIX_FMT_YUV420P AV_PIX_FMT_NV12 是FFmpeg的枚举值，所以需要转化为自定义的VideoPixelFormat
+ * @brief 解复用工作线程的主循环单次步进逻辑（Tick）
+ * @return 执行状态结果：
+ * - kContinue：本轮读取成功或顺利跳过，继续下一轮 Tick 处理；
+ * - kStopped：因收到外部停止信号而正常退出线程；
+ * - kError：遭遇不可恢复的底层错误并触发 Pipeline 报错。
  */
-VideoPixelFormat ConvertVideoPixelFormat(int format) {
-    switch (static_cast<AVPixelFormat>(format)) {
-        case AV_PIX_FMT_YUV420P:
-            return VideoPixelFormat::kYuv420p;
-        case AV_PIX_FMT_NV12:
-            return VideoPixelFormat::kNv12;
-        case AV_PIX_FMT_YUV422P:
-            return VideoPixelFormat::kYuv422p;
-        case AV_PIX_FMT_YUV444P:
-            return VideoPixelFormat::kYuv444p;
-        case AV_PIX_FMT_RGBA:
-            return VideoPixelFormat::kRgba;
-        default:
-            return VideoPixelFormat::kUnknown;
-    }
-}
-
-/**
- * @brief 把 FFmpeg 音频样本格式映射到项目枚举
- * @param format AVCodecParameters::format，对音频流来说，这个整数实际上表示 AVSampleFormat
- * @return 项目支持的音频流样本格式，未支持的格式返 kUnknown
- * @details
- * packed 表示多个声道交错存储，如 LRLRLR
- * planar 表示多个声道分开存储，如 LLL...  RRR...
- */
-AudioSampleFormat ConvertAudioSampleFormat(int format) {
-    switch (static_cast<AVSampleFormat>(format)) {
-        case AV_SAMPLE_FMT_U8:
-            return AudioSampleFormat::kU8;
-        case AV_SAMPLE_FMT_S16:
-            return AudioSampleFormat::kS16;
-        case AV_SAMPLE_FMT_S32:
-            return AudioSampleFormat::kS32;
-        case AV_SAMPLE_FMT_S64:
-            return AudioSampleFormat::kS64;
-        case AV_SAMPLE_FMT_FLT:
-            return AudioSampleFormat::kFloat;
-        case AV_SAMPLE_FMT_DBL:
-            return AudioSampleFormat::kDouble;
-        case AV_SAMPLE_FMT_U8P:
-            return AudioSampleFormat::kU8Planar;
-        case AV_SAMPLE_FMT_S16P:
-            return AudioSampleFormat::kS16Planar;
-        case AV_SAMPLE_FMT_S32P:
-            return AudioSampleFormat::kS32Planar;
-        case AV_SAMPLE_FMT_S64P:
-            return AudioSampleFormat::kS64Planar;
-        case AV_SAMPLE_FMT_FLTP:
-            return AudioSampleFormat::kFloatPlanar;
-        case AV_SAMPLE_FMT_DBLP:
-            return AudioSampleFormat::kDoublePlanar;
-        default:
-            return AudioSampleFormat::kUnknown;
-    }
-}
-
-/**
- * @brief 读取 FFmpeg 声道布局
- * @param layout AVCodecParameters::ch_layout，它描述这条音频流有几个声道，以及这些声道是什么位置
- * @return 能识别时返回布局名称，识别失败时返回空字符串
- * @details
- * mono 表示单声道
- * stereo 表示左声道+ 右声道
- * 5.1 表示 前左、前右、中置、低音、后左、后右声道
- * AVChannelLayout 是 FFmpeg 的结构体，不是字符串，av_channel_layout_describe() 会把结构体
- * 转换成 stereo 这类可读字符串
- */
-std::string ConvertChannelLayout(const AVChannelLayout& layout) {
-    // 用于存储布局名称
-    std::array<char, kChannelLayoutBufferSize> buffer{};
-
-    const int result = av_channel_layout_describe(&layout, buffer.data(), buffer.size());
-
-    if (result < 0) {
-        LOG_WARN("failed to describe audio channel layout, error code: {}", result);
-        return {};
+TickResult FfmpegDemuxerNode::Tick() {
+    // 1. 若当前世代的数据已读到末尾且已向下游广播过 EOS，直接进入 EOF 条件变量挂起等待
+    if (eos_sent_) {
+        return WaitAtEof();
     }
 
-    return buffer.data();
-}
+    // 2. 读包前置检查：若恰好有新 Seek 到来，放弃从旧位置启动耗时 I/O，优先放行控制逻辑
+    std::uint64_t read_epoch = 0;
+    {
+        std::lock_guard<std::mutex> lock(control_mutex_);
 
-/**
- * @brief 创建 "流信息字段不对" 的 MediaError
- * @param message 写清楚是哪个字段不对，例如宽高为 0，采样率为 0，没有可用流
- * @return 一个已经填好的模块名、错误类型、FFmpeg 错误码 和错误说明的 MediaError
- * MediaError 是错误对象的类型；真正失败时仍然需要创建一个具体对象返回给调用方。
- * 这个小函数只是避免重复写 MediaError::FromFfmpeg(kModuleName, AVERROR_INVALIDDATA, message)
- */
-MediaError InvalidMetadataError(std::string_view message) {
-    return MediaError::FromFfmpeg(kModuleName, AVERROR_INVALIDDATA, message);
-}
-}  // namespace
-
-/**
- * @brief 获取并转换视频流信息到 VideoStreamInfo
- * @param stream avformat_find_stream_info() 之后得到的 AVStream 视频流
- * @param output 成功后写入的流编号、编码格式、长度、宽度、像素格式、帧率、time_base和duration
- * @return 返回本次的转换结果 HasError 为 true 表示有错误，为 false 表示没有错误
- */
-MediaError ConvertVideoStreamInfo(const AVStream* stream, VideoStreamInfo& output) {
-    // 1. 先清空 output
-    output = {};
-
-    // 2. 判断 stream 合法性
-    if (stream == nullptr) {
-        // 内部错误
-        return MediaError::FromInternal(kModuleName, "video stream pointer is null");
-    }
-
-    if (stream->codecpar == nullptr) {
-        // 内部错误
-        return MediaError::FromInternal(kModuleName, "video stream codec parameters are null");
-    }
-
-    const AVCodecParameters& codec_parameters = *stream->codecpar;
-    if (codec_parameters.codec_type != AVMEDIA_TYPE_VIDEO) {
-        return InvalidMetadataError("stream codec type is not video");
-    }
-
-    // 3. 开始复制
-    VideoStreamInfo converted;
-    converted.stream_index_ = stream->index;
-    converted.codec_id_ = static_cast<int>(codec_parameters.codec_id);
-    converted.width_ = codec_parameters.width;
-    converted.height_ = codec_parameters.height;
-    converted.pixel_format_ = ConvertVideoPixelFormat(codec_parameters.format);  // 像素格式
-    converted.frame_rate_ = ConvertVideoFrameRate(*stream, codec_parameters);
-    converted.time_base_ = ConvertRational(stream->time_base);
-    converted.duration_us_ = ConvertDurationToMicroseconds(stream->duration, stream->time_base);
-
-    // 4. 判断 converted 是否合法
-    if (!converted.IsValid()) {
-        return InvalidMetadataError("video stream metadata is incomplete");
-    }
-
-    output = converted;
-    LOG_DEBUG("Converted video stream: index {}, codec {}, size {}x{}",
-              output.stream_index_,
-              output.codec_id_,
-              output.width_,
-              output.height_);
-
-    return {};
-}
-
-/**
- * @brief 获取并转化视频流信息到 AudioStreamInfo
- * @param stream avformat_find_stream_info() 获取到的音频流 AVStream
- * @param output 成功后写入流编号、编码格式、采样率、声道数、声道布局、样本格式、时间基和时长
- * @return 返回本次的转换结果 HasError 为 true 表示有错误，为 false 表示没有错误
- */
-MediaError ConvertAudioStreamInfo(const AVStream* stream, AudioStreamInfo& output) {
-    // 1. 先清空 output
-    output = {};
-
-    // 2. 判断 stream 合法性
-    if (stream == nullptr) {
-        return MediaError::FromInternal(kModuleName, "audio stream pointer is null");
-    }
-
-    if (stream->codecpar == nullptr) {
-        return MediaError::FromInternal(kModuleName, "audio stream codec parameters are null");
-    }
-
-    const AVCodecParameters& codec_parameters = *stream->codecpar;
-    if (codec_parameters.codec_type != AVMEDIA_TYPE_AUDIO) {
-        return InvalidMetadataError("stream codec type is not audio");
-    }
-
-    // 3. 开始填充/转换信息
-    AudioStreamInfo converted;
-
-    converted.stream_index_ = stream->index;
-    converted.codec_id_ = static_cast<int>(codec_parameters.codec_id);
-    converted.sample_rate_hz_ = codec_parameters.sample_rate;
-    converted.channel_count_ = codec_parameters.ch_layout.nb_channels;
-    converted.channel_layout_ = ConvertChannelLayout(codec_parameters.ch_layout);
-    converted.sample_format_ = ConvertAudioSampleFormat(codec_parameters.format);
-    converted.time_base_ = ConvertRational(stream->time_base);
-    converted.duration_us_ = ConvertDurationToMicroseconds(stream->duration, stream->time_base);
-
-    if (!converted.IsValid()) {
-        return InvalidMetadataError("audio stream metadata is incomplete");
-    }
-
-    output = converted;
-
-    LOG_DEBUG("Converted audio stream: index {}, codec {}, sample {}, channels {}",
-              output.stream_index_,
-              output.codec_id_,
-              output.sample_rate_hz_,
-              output.channel_count_);
-
-    return {};
-}
-
-/**
- * @brief 从 AVFormatContext 里读取整个输入文件的基本信息
- * @param format_context avformat_open_input() 和 av_find_stream_info() 成功后的对象，
- * 它里面有容器格式、总时长、AVStream 数组等信息
- * @param output 成功后写入容器名、总时长、是否可 Seek，以及第一条可用的音频流和视频流
- * @return 返回本次的转换结果，HasError 为 true 表示转换失败，为 false 表示转换成功
- * @details
- * AVFormatContext
- *   ↓
- * 读取容器信息：格式、总时长、是否可 seek
- *   ↓
- * 遍历 AVStream 数组
- *   ↓
- * 遇到视频流：调用 ConvertVideoStreamInfo()
- *   ↓
- * 遇到音频流：调用 ConvertAudioStreamInfo()
- *   ↓
- * 填充 MediaInfo
- */
-MediaError ConvertMediaInfo(const AVFormatContext* format_context, MediaInfo& output) {
-    // 1. 清空 output
-    output = {};
-
-    // 2. 判断 AVFormatContext 合法性
-    if (format_context == nullptr) {
-        return MediaError::FromInternal(kModuleName, "format context pointer is null");
-    }
-
-    // nb_streams 这个 媒体文件中有几条流 / streams 保存流的数组不存在
-    if (format_context->nb_streams == 0 || format_context->streams == nullptr) {
-        return InvalidMetadataError("media contains no streams");
-    }
-
-    // 3. 开始填充并转化
-    MediaInfo converted;
-
-    // iformat 是 FFmpeg 识别出来的封装格式，如 mov / mp4 / m4a
-    if (format_context->iformat != nullptr && format_context->iformat->name != nullptr) {
-        converted.container_name_ = format_context->iformat->name;
-    }
-
-    // 保存媒体时长
-    if (format_context->duration != AV_NOPTS_VALUE && format_context->duration >= 0) {
-        converted.duration_us_ = format_context->duration;
-    }
-
-    // pb 是底层 IO 对象，seekable 带 AVIO_SEEKABLE_NORMAL 标志时，说明输入支持普通 seek
-    // 本地媒体文件一般支持 seek，但是网络直播流不支持
-    if (format_context->pb != nullptr) {
-        // 检查 seekable 里面有没有 AVIO_SEEKABLE_NORMAL 这个标志
-        converted.can_seek_ = (format_context->pb->seekable & AVIO_SEEKABLE_NORMAL) != 0;
-    }
-
-    // 保存第一条流转换失败的原因，如果一条有用的音视频流都没有找到，就把这个错误返回给调用方
-    MediaError first_conversion_error;
-    for (unsigned index = 0; index < format_context->nb_streams; ++index) {
-        const AVStream* stream = format_context->streams[index];
-        if (stream == nullptr || stream->codecpar == nullptr) {
-            continue;
+        if (pending_seek_.has_value()) {
+            return TickResult::kContinue;
         }
 
-        // codecpar 是这条流的编码参数，类型是 AVCodecParameters*
-        // !converted.video_stream_.has_value() 说明现在还没有保存视频流
-        if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && !converted.video_stream_.has_value()) {
-            VideoStreamInfo video_info;
-            MediaError error = ConvertVideoStreamInfo(stream, video_info);
+        // 锁定当前 Seek 请求编号，作为本次 Read 的中断比较基准
+        demuxer_->PrepareNextIoForSeekInterrupt();
 
-            // 如果视频流信息保存成功，error = false
-            if (!error.HasError()) {
-                // 如果没有错误，就把 video_info 保存到 converted.video_stream_ 里
-                converted.video_stream_ = video_info;
-            }
-            // 如果 first_conversion_error 目前还没有保存过任何失败原因
-            else if (!first_conversion_error.HasError()) {
-                first_conversion_error = error;
-            }
-        }
-
-        // 如果 stream 是音频流 但是还没有保存过音频流
-        if (stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && !converted.audio_stream_.has_value()) {
-            AudioStreamInfo audio_info;
-            MediaError error = ConvertAudioStreamInfo(stream, audio_info);
-
-            // 如果音频流保存成功
-            if (!error.HasError()) {
-                // 那么就把 audio_info 保存到 convert.audio_stream
-                converted.audio_stream_ = audio_info;
-            }
-
-            // 如果保存失败，那么就判断 是否保存过失败原因
-            else if (!first_conversion_error.HasError()) {
-                first_conversion_error = error;
-            }
-        }
+        // 锁定本次读取所属的世代号
+        read_epoch = output_epoch_;
     }
 
-    // 播放器要求至少要有一条有效的视频流或者音频流
-    if (!converted.IsValid()) {
-        // 如果之前保存过错误，就返回
-        if (first_conversion_error.HasError()) {
-            return first_conversion_error;
-        }
+    // 3. 执行单包读取与过滤
+    Packet packet;
+    FfmpegReadResult result = demuxer_->Read(packet);
+    switch (result.status_) {
+        case mediacore::FfmpegReadStatus::kPacket:
+            // 校验世代：若读包阻塞期间全局 Epoch 已被新 Seek 刷新，直接丢弃该过时包
+            if (read_epoch != GetCurrentEpoch()) {
+                return TickResult::kContinue;
+            }
 
-        // 否则返回自定义的错误原因
-        return MediaError::FromFfmpeg(kModuleName, AVERROR_STREAM_NOT_FOUND, "no valid audio or video stream found");
+            packet.SetEpoch(read_epoch);
+
+            // 将有效视频压缩包推入输出端口 Link
+            if (!SendOutput(PacketStreamItem{std::in_place_type<Packet>, std::move(packet)})) {
+                if (IsStopRequested()) {
+                    LOG_DEBUG(
+                        "Demuxer stopped sending packet for epoch {}, "
+                        "output link was interrupted by stop",
+                        read_epoch);
+                    return TickResult::kStopped;
+                }
+
+                LOG_ERROR(
+                    "Demuxer could not send packet for epoch {}, "
+                    "output link is unavailable",
+                    read_epoch);
+                return Fail("Demuxer output link is unavailable", read_epoch);
+            }
+
+            return TickResult::kContinue;
+
+        case mediacore::FfmpegReadStatus::kSkipped:
+            // 读到音频或字幕等非目标流，数据包内部已自动释放，继续下一个 Tick
+            return TickResult::kContinue;
+
+        case mediacore::FfmpegReadStatus::kSeekInterrupted:
+            // 底层读包被更新的 Seek 中断打断，返回 Continue 让主循环优先执行 Seek
+            LOG_DEBUG("Demuxer read for epoch {} was interrupted by a newer seek", read_epoch);
+            return TickResult::kContinue;
+
+        case mediacore::FfmpegReadStatus::kStopInterrupted:
+            // 底层读包被外部停机指令打断
+            LOG_INFO("Demuxer read for epoch {} was interrupted by stop", read_epoch);
+            return TickResult::kStopped;
+
+        case mediacore::FfmpegReadStatus::kEndOfStream:
+            // 流末尾校验：如果已经发生新 Seek，忽略该过时的老流 EOF
+            if (read_epoch != GetCurrentEpoch()) {
+                LOG_DEBUG("Ignoring stale EndOfStream for epoch {}", read_epoch);
+                return TickResult::kContinue;
+            }
+
+            // 向下游下发当前世代的流结束信号（EndOfStream）
+            if (!SendOutput(PacketStreamItem{EndOfStream{read_epoch}})) {
+                if (IsStopRequested()) {
+                    LOG_DEBUG(
+                        "Demuxer could not send EndOfStream for epoch {}, "
+                        "output link was interrupted by stop",
+                        read_epoch);
+                    return TickResult::kStopped;
+                }
+
+                LOG_ERROR(
+                    "Demuxer could not send EndOfStream for epoch {}, "
+                    "output link is unavailable",
+                    read_epoch);
+                return Fail("Demuxer output link is unavailable while sending EndOfStream", read_epoch);
+            }
+
+            eos_sent_ = true;
+            LOG_INFO(
+                "Demuxer reached end of stream for epoch {}; "
+                "waiting for seek or stop",
+                read_epoch);
+            return TickResult::kContinue;
+
+        case mediacore::FfmpegReadStatus::kError:
+            // 若报错属于已被弃用的历史世代，予以丢弃
+            if (read_epoch != GetCurrentEpoch()) {
+                LOG_DEBUG("Ignoring stale Demuxer read error for epoch {}", read_epoch);
+                return TickResult::kContinue;
+            }
+
+            LOG_ERROR("Demuxer read error for epoch {}: {}", read_epoch, result.error_.Message());
+            return Fail(result.error_, read_epoch);
     }
 
-    output = converted;
-    LOG_INFO("Media info converted: Container is {}, video {}, audio {}",
-             output.container_name_,
-             output.video_stream_.has_value(),
-             output.audio_stream_.has_value());
-    return {};
+    LOG_ERROR("FfmpegDemuxer returned an unknown read status for epoch {}", read_epoch);
+    return Fail("FfmpegDemuxer returned an unknown read status", read_epoch);
 }
+
+/**
+ * @brief 外部中断触发钩子：响应停止通知，打断底层阻塞 I/O 并唤醒挂起线程
+ */
+void FfmpegDemuxerNode::OnInterruptBlockingIo() noexcept {
+    LOG_DEBUG("Demuxer node interrupting FFmpeg I/O and EOF wait for stop");
+    {
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        demuxer_->RequestStop();
+    }
+
+    // 唤醒可能正处于 WaitAtEof() 挂起状态的工作线程
+    eof_cv_.notify_all();
+}
+
+/**
+ * @brief 检查是否存在外部提交但尚未被执行的 Seek 控制请求
+ * @return 存在待处理的请求时返回 true
+ */
+bool FfmpegDemuxerNode::HasPendingControl() const noexcept {
+    std::lock_guard<std::mutex> lock(control_mutex_);
+    return pending_seek_.has_value();
+}
+
+/**
+ * @brief 提取并执行外部暂存的最新 Seek 请求
+ * @note 必须在工作线程执行 Tick 前优先调用，确保控制流优先于数据流
+ */
+TickResult FfmpegDemuxerNode::ProcessPendingControl() {
+    PendingSeek request;
+    {
+        std::lock_guard<std::mutex> lock(control_mutex_);
+
+        if (!pending_seek_) {
+            return TickResult::kContinue;
+        }
+
+        // 提取请求参数并复位暂存槽
+        request = pending_seek_.value();
+        pending_seek_.reset();
+
+        // 确认本轮 Seek 已经正式接管执行，重置中断比较基准
+        demuxer_->PrepareNextIoForSeekInterrupt();
+    }
+
+    // 执行耗时的底层 Seek 时必须在锁外进行，避免阻塞外部线程继续登记新的 Seek
+    return ExecuteSeek(request);
+}
+
+/**
+ * @brief 当全流读取到达 EOF 后，使用条件变量阻塞工作线程，避免高频空转
+ * @return 被新 Seek 唤醒时返回 kContinue；被 Stop 唤醒时返回 kStopped
+ */
+TickResult FfmpegDemuxerNode::WaitAtEof() {
+    std::unique_lock<std::mutex> lock(control_mutex_);
+
+    // 标记工作线程进入休眠状态
+    eof_parked_.store(true, std::memory_order_release);
+    LOG_DEBUG("Demuxer is waiting at EOF for a seek or stop request");
+
+    // 挂起等待外部触发 Stop 或提交新的 Seek
+    eof_cv_.wait(lock, [this]() { return IsStopRequested() || pending_seek_.has_value(); });
+
+    const bool stop_requested = IsStopRequested();
+
+    // 唤醒退出休眠
+    eof_parked_.store(false, std::memory_order_release);
+    lock.unlock();
+
+    if (stop_requested) {
+        LOG_DEBUG("Demuxer left EOF wait because stop was requested");
+        return TickResult::kStopped;
+    }
+
+    LOG_DEBUG("Demuxer left EOF wait to process a seek request");
+    return TickResult::kContinue;
+}
+
+/**
+ * @brief 调用底层的 FfmpegDemuxer 执行实际时间跳转并在下游广播 StreamReset
+ * @param request 包含目标时间与世代号的跳转请求参数
+ * @return 执行状态结果
+ */
+TickResult FfmpegDemuxerNode::ExecuteSeek(PendingSeek request) {
+    LOG_INFO("Demuxer executing seek to {} us, epoch {}", request.target_us_, request.epoch_);
+
+    const FfmpegSeekResult seek_result = demuxer_->Seek(request.target_us_);
+
+    if (seek_result.status_ == FfmpegSeekStatus::kSeekInterrupted) {
+        LOG_DEBUG("Demuxer seek for epoch {} was superseded", request.epoch_);
+        return TickResult::kContinue;
+    }
+
+    if (seek_result.status_ == FfmpegSeekStatus::kStopInterrupted) {
+        LOG_DEBUG("Demuxer seek for epoch {} was interrupted by stop", request.epoch_);
+        return TickResult::kStopped;
+    }
+
+    if (seek_result.status_ != FfmpegSeekStatus::kSucceeded) {
+        // 若执行失败但该世代已经被后续的更新 Seek 取代，则忽略此失效错误
+        if (request.epoch_ != GetCurrentEpoch()) {
+            LOG_DEBUG("Ignoring failed superseded seek for epoch {}", request.epoch_);
+            return TickResult::kContinue;
+        }
+
+        LOG_ERROR("Demuxer seek failed: {}", seek_result.error_.Message());
+        return Fail(seek_result.error_, request.epoch_);
+    }
+
+    // 若 Seek 成功返回期间外部又有更新的 Seek 发生，不切换输出状态，直接交给后续 Seek 处理
+    if (request.epoch_ != GetCurrentEpoch()) {
+        LOG_DEBUG("Ignoring successful seek because a newer seek arrived for epoch {}", request.epoch_);
+        return TickResult::kContinue;
+    }
+
+    // 本次 Seek 真正落地生效：更新允许输出的世代号，并重置 EOF 发送标记
+    output_epoch_ = request.epoch_;
+    eos_sent_ = false;
+
+    // 向下游解码器投递流重置信令（StreamReset），要求下游冲刷清空老世代的残留缓存
+    if (!SendOutput(PacketStreamItem{StreamReset{request.epoch_, request.target_us_}})) {
+        if (IsStopRequested()) {
+            LOG_DEBUG("Demuxer could not send StreamReset for epoch {}; output link was interrupted by stop",
+                      request.epoch_);
+            return TickResult::kStopped;
+        }
+
+        LOG_ERROR("Demuxer could not send StreamReset for epoch {}, output link is unavailable", request.epoch_);
+        return Fail("Demuxer Send StreamReset failed", output_epoch_);
+    }
+
+    if (seek_result.best_effort_position_us_.has_value()) {
+        LOG_INFO(
+            "Demuxer completed seek for epoch {}; target {} us, demuxer-reported position {} us",
+            request.epoch_,
+            request.target_us_,
+            *seek_result.best_effort_position_us_);
+    } else {
+        LOG_INFO(
+            "Demuxer completed seek for epoch {}; target {} us; "
+            "actual presentation position will be determined by decoded output",
+            request.epoch_,
+            request.target_us_);
+    }
+
+    return TickResult::kContinue;
+}
+
 }  // namespace mediacore

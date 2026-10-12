@@ -1,5 +1,5 @@
-# FFmpeg Demuxer 的 D11 流信息转换测试。
-# 只验证 AVStream / AVCodecParameters 到项目 StreamInfo 的字段转换。
+# FFmpeg 视频 Demuxer 的公开接口测试。
+# 使用自行生成的临时 Y4M 文件验证媒体信息、读包、Seek 和取消。
 
 add_executable(ffmpeg_demuxer_node_test
     ffmpeg_demuxer_node_test.cpp

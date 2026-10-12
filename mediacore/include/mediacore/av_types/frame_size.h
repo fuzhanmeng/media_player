@@ -1,9 +1,11 @@
 /**
  * @file frame_size.h
- * @brief 基础值类型：画面尺寸（宽 x 高）
+ * @brief 画面像素几何尺寸（宽与高）强类型基础值定义
  * @details
- * 把 (width, height) 打包成具名字段，调用点必须按字段名显式赋值，避免两个
- * 相邻 int 参数被调用方误传颠倒（对应 clang-tidy easily-swappable-parameters 检查）
+ * 将视频宽高抽象为具名强类型结构体：
+ * 1. 防御易混淆参数：规避裸 int 接口中 width 与 height 传参顺序颠倒的隐患（针对 Clang-Tidy bugprone-easily-swappable-parameters 规则）；
+ * 2. 强值语义：具备完整的 constexpr / noexcept 保证与默认比较支持；
+ * 3. 零开销抽象：纯标量结构，与两个独立 int 占用相同的栈/寄存器开销。
  */
 
 #pragma once
@@ -11,16 +13,42 @@
 namespace mediacore {
 
 /**
- * @brief 画面尺寸（像素）
- * @details 纯数据聚合，构造时不做合法性校验，宽高是否 > 0 由使用方按需调用 IsValid() 检查
+ * @struct FrameSize
+ * @brief 画面二维像素物理尺寸结构体
  */
-struct FrameSize {
-    int width_{0};  ///< 画面宽度（像素）
+struct FrameSize final {
+    int width_{0};   ///< 画面宽度（像素）
     int height_{0};  ///< 画面高度（像素）
 
-    /// @brief 判断尺寸是否为正（可用于构造有效画面）
-    /// @return true 表示宽高均 > 0
-    bool IsValid() const { return width_ > 0 && height_ > 0; }
+    /**
+     * @brief 校验宽高是否均为合法正数
+     * @return 宽度与高度均严格大于 0 时返回 true，否则返回 false
+     */
+    constexpr bool IsValid() const noexcept {
+        return width_ > 0 && height_ > 0;
+    }
+
+    /**
+     * @brief 计算图像总像素量（面积）
+     * @return 宽高有效时返回 width_ * height_，否则安全返回 0
+     */
+    constexpr int Area() const noexcept {
+        return IsValid() ? (width_ * height_) : 0;
+    }
+
+    /**
+     * @brief 相等性比较操作符
+     */
+    constexpr bool operator==(const FrameSize& other) const noexcept {
+        return width_ == other.width_ && height_ == other.height_;
+    }
+
+    /**
+     * @brief 不等性比较操作符
+     */
+    constexpr bool operator!=(const FrameSize& other) const noexcept {
+        return !(*this == other);
+    }
 };
 
 }  // namespace mediacore

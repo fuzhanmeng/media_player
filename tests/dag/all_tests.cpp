@@ -21,20 +21,25 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "core/pipeline.h"
+#include "core/stream_item.h"
 
 namespace {
 
 using namespace std::chrono_literals;
+using mediacore::EndOfStream;
 using mediacore::INode;
 using mediacore::NodeFinishReason;
 using mediacore::NoPort;
 using mediacore::Pipeline;
+using mediacore::PipelineEventCallbacks;
 using mediacore::PipelineStartResult;
 using mediacore::PipelineState;
 using mediacore::TickResult;
+using IntegerStreamItem = mediacore::StreamItem<int>;
 
 /** @brief 测试断言失败时抛出的异常。 */
 class TestFailure final : public std::runtime_error {
@@ -149,12 +154,14 @@ void Require(bool condition, const std::string& message) {
 }
 
 /**
- * @brief 发送一个元素后正常返回 EOF 的 Source。
+ * @brief 依次发送一个整数和 EOS，之后等待 Stop；EOS 不结束工作线程。
  */
-class EofSource final : public INode<NoPort, int> {
+class EofSource final : public INode<NoPort, IntegerStreamItem> {
 public:
-    EofSource(std::shared_ptr<mediacore::SyncContext> sync, std::shared_ptr<Probe> probe)
-        : INode("eof_source", std::move(sync)), probe_(std::move(probe)) {}
+    EofSource(std::shared_ptr<mediacore::SyncContext> sync,
+              PipelineEventCallbacks event_callbacks,
+              std::shared_ptr<Probe> probe)
+        : INode("eof_source", std::move(sync), std::move(event_callbacks)), probe_(std::move(probe)) {}
 
 protected:
     TickResult Tick() override {
@@ -168,18 +175,28 @@ protected:
             return sent ? TickResult::kContinue : TickResult::kStopped;
         }
 
-        return TickResult::kEndOfStream;
+        if (tick_index == 2) {
+            return SendOutput(EndOfStream{GetCurrentEpoch()}) ? TickResult::kContinue : TickResult::kStopped;
+        }
+
+        std::unique_lock<std::mutex> lock(probe_->gate_mutex_);
+        probe_->gate_condition_.wait(lock, [this]() { return IsStopRequested(); });
+        return TickResult::kStopped;
     }
+
+    void OnInterruptBlockingIo() noexcept override { probe_->ReleaseAllTicks(); }
 
 private:
     std::shared_ptr<Probe> probe_;
 };
 
-/** @brief 接收一个整数、加一并发送，输入 EOF 后关闭自己的输出 Link。 */
-class IncrementTransform final : public INode<int, int> {
+/** @brief 对整数加一后发送；StreamReset 和 EOS 原样转发，继续等待下一条输入。 */
+class IncrementTransform final : public INode<IntegerStreamItem, IntegerStreamItem> {
 public:
-    IncrementTransform(std::shared_ptr<mediacore::SyncContext> sync, std::shared_ptr<Probe> probe)
-        : INode("increment_transform", std::move(sync)), probe_(std::move(probe)) {}
+    IncrementTransform(std::shared_ptr<mediacore::SyncContext> sync,
+                       PipelineEventCallbacks event_callbacks,
+                       std::shared_ptr<Probe> probe)
+        : INode("increment_transform", std::move(sync), std::move(event_callbacks)), probe_(std::move(probe)) {}
 
 protected:
     TickResult Tick() override {
@@ -188,13 +205,19 @@ protected:
 
         auto item = ReceiveInput();
         if (!item.has_value()) {
-            return IsStopRequested() ? TickResult::kStopped : TickResult::kEndOfStream;
-        }
-
-        if (!SendOutput(*item + 1)) {
             return TickResult::kStopped;
         }
-        probe_->received_.fetch_add(1);
+
+        const bool is_data = std::holds_alternative<int>(*item);
+        if (is_data) {
+            ++std::get<int>(*item);
+        }
+        if (!SendOutput(std::move(*item))) {
+            return TickResult::kStopped;
+        }
+        if (is_data) {
+            probe_->received_.fetch_add(1);
+        }
         probe_->event_.Notify();
         return TickResult::kContinue;
     }
@@ -203,11 +226,13 @@ private:
     std::shared_ptr<Probe> probe_;
 };
 
-/** @brief 接收输入直到 Link 正常 EOF 的 Sink。 */
-class DrainSink final : public INode<int, NoPort> {
+/** @brief 顺序处理数据和 EOS，收到 EOS 时上报 MediaEnded，随后继续等待输入。 */
+class DrainSink final : public INode<IntegerStreamItem, NoPort> {
 public:
-    DrainSink(std::shared_ptr<mediacore::SyncContext> sync, std::shared_ptr<Probe> probe)
-        : INode("drain_sink", std::move(sync)), probe_(std::move(probe)) {}
+    DrainSink(std::shared_ptr<mediacore::SyncContext> sync,
+              PipelineEventCallbacks event_callbacks,
+              std::shared_ptr<Probe> probe)
+        : INode("drain_sink", std::move(sync), std::move(event_callbacks)), probe_(std::move(probe)) {}
 
 protected:
     TickResult Tick() override {
@@ -215,16 +240,20 @@ protected:
         probe_->event_.Notify();
 
         auto item = ReceiveInput();
-        if (item.has_value()) {
-            probe_->last_value_.store(*item);
-            probe_->received_.fetch_add(1);
-            probe_->event_.Notify();
-            return TickResult::kContinue;
+        if (!item.has_value()) {
+            return TickResult::kStopped;
         }
 
-        probe_->eof_.store(true);
+        if (const auto* value = std::get_if<int>(&*item)) {
+            probe_->last_value_.store(*value);
+            probe_->received_.fetch_add(1);
+        } else if (const auto* eos = std::get_if<EndOfStream>(&*item)) {
+            probe_->eof_.store(true);
+            ReportMediaEnded(eos->epoch_);
+        }
+
         probe_->event_.Notify();
-        return TickResult::kEndOfStream;
+        return TickResult::kContinue;
     }
 
 private:
@@ -234,8 +263,10 @@ private:
 /** @brief 在空 Link 上阻塞 Receive()，用于验证 Pipeline::Stop() 的 Abort。 */
 class BlockingReceiveSink final : public INode<int, NoPort> {
 public:
-    BlockingReceiveSink(std::shared_ptr<mediacore::SyncContext> sync, std::shared_ptr<Probe> probe)
-        : INode("blocking_receive_sink", std::move(sync)), probe_(std::move(probe)) {}
+    BlockingReceiveSink(std::shared_ptr<mediacore::SyncContext> sync,
+                        PipelineEventCallbacks event_callbacks,
+                        std::shared_ptr<Probe> probe)
+        : INode("blocking_receive_sink", std::move(sync), std::move(event_callbacks)), probe_(std::move(probe)) {}
 
 protected:
     TickResult Tick() override {
@@ -252,8 +283,10 @@ private:
 /** @brief 填满 Link 后在第二次 Send() 上阻塞的 Source。 */
 class BlockingSendSource final : public INode<NoPort, int> {
 public:
-    BlockingSendSource(std::shared_ptr<mediacore::SyncContext> sync, std::shared_ptr<Probe> probe)
-        : INode("blocking_send_source", std::move(sync)), probe_(std::move(probe)) {}
+    BlockingSendSource(std::shared_ptr<mediacore::SyncContext> sync,
+                       PipelineEventCallbacks event_callbacks,
+                       std::shared_ptr<Probe> probe)
+        : INode("blocking_send_source", std::move(sync), std::move(event_callbacks)), probe_(std::move(probe)) {}
 
 protected:
     TickResult Tick() override {
@@ -284,8 +317,10 @@ private:
  */
 class GateNode final : public INode<NoPort, NoPort> {
 public:
-    GateNode(std::shared_ptr<mediacore::SyncContext> sync, std::shared_ptr<Probe> probe)
-        : INode("gate_node", std::move(sync)), probe_(std::move(probe)) {}
+    GateNode(std::shared_ptr<mediacore::SyncContext> sync,
+             PipelineEventCallbacks event_callbacks,
+             std::shared_ptr<Probe> probe)
+        : INode("gate_node", std::move(sync), std::move(event_callbacks)), probe_(std::move(probe)) {}
 
 protected:
     TickResult Tick() override {
@@ -307,8 +342,10 @@ private:
 /** @brief 在 Tick() 中等待 OnInterruptBlockingIo() 的模拟外部 I/O Node。 */
 class InterruptibleIoNode final : public INode<NoPort, NoPort> {
 public:
-    InterruptibleIoNode(std::shared_ptr<mediacore::SyncContext> sync, std::shared_ptr<Probe> probe)
-        : INode("interruptible_io", std::move(sync)), probe_(std::move(probe)) {}
+    InterruptibleIoNode(std::shared_ptr<mediacore::SyncContext> sync,
+                        PipelineEventCallbacks event_callbacks,
+                        std::shared_ptr<Probe> probe)
+        : INode("interruptible_io", std::move(sync), std::move(event_callbacks)), probe_(std::move(probe)) {}
 
 protected:
     TickResult Tick() override {
@@ -336,8 +373,10 @@ private:
 /** @brief 在第一次 Tick() 抛出异常的 Node。 */
 class ThrowingNode final : public INode<NoPort, NoPort> {
 public:
-    ThrowingNode(std::shared_ptr<mediacore::SyncContext> sync, std::shared_ptr<Probe> probe)
-        : INode("throwing_node", std::move(sync)), probe_(std::move(probe)) {}
+    ThrowingNode(std::shared_ptr<mediacore::SyncContext> sync,
+                 PipelineEventCallbacks event_callbacks,
+                 std::shared_ptr<Probe> probe)
+        : INode("throwing_node", std::move(sync), std::move(event_callbacks)), probe_(std::move(probe)) {}
 
 protected:
     TickResult Tick() override {
@@ -353,8 +392,11 @@ private:
 /** @brief 用于启动顺序和部分启动失败测试的可中断无端口 Node。 */
 class NamedBlockingNode final : public INode<NoPort, NoPort> {
 public:
-    NamedBlockingNode(std::shared_ptr<mediacore::SyncContext> sync, std::string name, std::shared_ptr<Probe> probe)
-        : INode(std::move(name), std::move(sync)), probe_(std::move(probe)) {}
+    NamedBlockingNode(std::shared_ptr<mediacore::SyncContext> sync,
+                      PipelineEventCallbacks event_callbacks,
+                      std::string name,
+                      std::shared_ptr<Probe> probe)
+        : INode(std::move(name), std::move(sync), std::move(event_callbacks)), probe_(std::move(probe)) {}
 
 protected:
     TickResult Tick() override {
@@ -378,14 +420,31 @@ private:
     std::shared_ptr<Probe> probe_;
 };
 
-/** @brief 验证正常 EOF 会关闭 Link 并让下游排空存量。 */
-void TestEofCloseAndDrain() {
-    Pipeline pipeline;
-    auto source_link = pipeline.CreateLink<int>(2);
-    auto sink_link = pipeline.CreateLink<int>(2);
+/** @brief 验证 EOS 在数据之后传到 Sink 并上报结束，所有线程继续存活直到 Stop。 */
+void TestEosPropagationAndDrain() {
     auto source_probe = std::make_shared<Probe>();
     auto transform_probe = std::make_shared<Probe>();
     auto sink_probe = std::make_shared<Probe>();
+    std::atomic<int> ended_count{0};
+    std::atomic<std::uint64_t> ended_epoch{0};
+    std::atomic<bool> ended_from_sink{false};
+    std::atomic<int> received_at_eos{0};
+    std::atomic<int> error_count{0};
+    PipelineEventCallbacks callbacks;
+    callbacks.on_media_ended_ = [&](mediacore::MediaEnded event) {
+        ended_epoch.store(event.epoch_);
+        ended_from_sink.store(event.node_name_ == "drain_sink");
+        received_at_eos.store(sink_probe->received_.load());
+        ended_count.fetch_add(1);
+        sink_probe->event_.Notify();
+    };
+    callbacks.on_node_error_ = [&](mediacore::NodeError) {
+        error_count.fetch_add(1);
+        sink_probe->event_.Notify();
+    };
+    Pipeline pipeline(std::move(callbacks));
+    auto source_link = pipeline.CreateLink<IntegerStreamItem>(2);
+    auto sink_link = pipeline.CreateLink<IntegerStreamItem>(2);
     auto& source = pipeline.EmplaceNode<EofSource>(source_probe);
     auto& transform = pipeline.EmplaceNode<IncrementTransform>(transform_probe);
     auto& sink = pipeline.EmplaceNode<DrainSink>(sink_probe);
@@ -394,20 +453,30 @@ void TestEofCloseAndDrain() {
     Require(transform.ConnectInput(source_link), "transform input connection failed");
     Require(transform.ConnectOutput(sink_link), "transform output connection failed");
     Require(sink.ConnectInput(sink_link), "sink input connection failed");
-    Require(pipeline.Start() == PipelineStartResult::kStarted, "EOF graph failed to start");
-    Require(sink_probe->event_.WaitFor([&]() { return sink_probe->eof_.load(); }, 1s), "sink did not observe EOF");
-    Require(WaitUntil(
-                source_probe->event_, [&]() { return source.GetFinishReason() == NodeFinishReason::kEndOfStream; }, 1s),
-            "source did not finish with EOF");
+    Require(pipeline.Start() == PipelineStartResult::kStarted, "EOS graph failed to start");
+    Require(pipeline.Resume(), "EOS graph failed to resume");
+    Require(sink_probe->event_.WaitFor([&]() { return ended_count.load() != 0; }, 1s),
+            "sink did not report MediaEnded");
+    Require(sink_probe->eof_.load(), "sink did not observe EOS");
+    Require(received_at_eos.load() == 1, "EOS was processed before the queued data");
+    Require(ended_epoch.load() == pipeline.GetCurrentEpoch(), "MediaEnded has the wrong epoch");
+    Require(ended_from_sink.load(), "MediaEnded was not reported by the terminal sink");
     Require(transform_probe->received_.load() == 1, "transform did not process the queued element");
     Require(sink_probe->received_.load() == 1, "sink did not drain the queued element");
     Require(sink_probe->last_value_.load() == 8, "sink did not receive the transformed value");
-    Require(source_link->IsClosed(), "EOF source did not close its output Link");
-    Require(sink_link->IsClosed(), "EOF transform did not close its output Link");
-    Require(pipeline.Stop(), "EOF graph Stop failed");
-    Require(pipeline.GetState() == PipelineState::kStopped, "EOF graph is not stopped");
-    Require(transform.GetFinishReason() == NodeFinishReason::kEndOfStream, "transform did not finish with EOF");
-    Require(sink.GetFinishReason() == NodeFinishReason::kEndOfStream, "sink did not finish with EOF");
+    const std::array<const mediacore::INodeBase*, 3> nodes = {&source, &transform, &sink};
+    for (const auto* node : nodes) {
+        Require(node->GetState() == mediacore::NodeState::kRunning, "EOS ended a Node thread");
+        Require(node->GetFinishReason() == NodeFinishReason::kNotFinished, "EOS recorded a thread finish reason");
+    }
+    Require(pipeline.Stop(), "EOS graph Stop failed");
+    Require(pipeline.GetState() == PipelineState::kStopped, "EOS graph is not stopped");
+    Require(ended_count.load() == 1, "EOS was not reported exactly once");
+    Require(error_count.load() == 0, "EOS graph reported a Node error");
+    for (const auto* node : nodes) {
+        Require(node->GetState() == mediacore::NodeState::kJoined, "EOS graph left a Node unjoined");
+        Require(node->GetFinishReason() == NodeFinishReason::kStopRequested, "Node did not finish due to Stop");
+    }
 }
 
 /** @brief 验证空队列上的 Receive() 会被 Stop/Abort 唤醒。 */
@@ -418,9 +487,10 @@ void TestStopWhileReceiving() {
     auto& sink = pipeline.EmplaceNode<BlockingReceiveSink>(probe);
     Require(sink.ConnectInput(link), "receive sink input connection failed");
     Require(pipeline.Start() == PipelineStartResult::kStarted, "receive graph failed to start");
+    Require(pipeline.Resume(), "receive graph failed to resume");
     Require(probe->event_.WaitFor([&]() { return probe->io_entered_.load(); }, 1s), "sink did not enter Receive()");
     Require(pipeline.Stop(), "Stop while receiving failed");
-    Require(link->IsAborted(), "Pipeline Stop did not Abort the input Link");
+    Require(!link->Send(1) && !link->Receive().has_value(), "input Link remained usable after Stop");
     Require(sink.GetState() == mediacore::NodeState::kJoined, "receive sink was not joined");
 }
 
@@ -432,10 +502,11 @@ void TestStopWhileSending() {
     auto& source = pipeline.EmplaceNode<BlockingSendSource>(probe);
     Require(source.ConnectOutput(link), "send source output connection failed");
     Require(pipeline.Start() == PipelineStartResult::kStarted, "send graph failed to start");
+    Require(pipeline.Resume(), "send graph failed to resume");
     Require(probe->event_.WaitFor([&]() { return probe->second_send_entered_.load(); }, 1s),
             "source did not reach the blocking Send()");
     Require(pipeline.Stop(), "Stop while sending failed");
-    Require(link->IsAborted(), "Pipeline Stop did not Abort the output Link");
+    Require(!link->Send(1) && !link->Receive().has_value(), "output Link remained usable after Stop");
     Require(source.GetState() == mediacore::NodeState::kJoined, "send source was not joined");
 }
 
@@ -445,6 +516,7 @@ void TestStopWhilePaused() {
     auto probe = std::make_shared<Probe>();
     auto& node = pipeline.EmplaceNode<GateNode>(probe);
     Require(pipeline.Start() == PipelineStartResult::kStarted, "paused graph failed to start");
+    Require(pipeline.Resume(), "paused graph failed to resume");
     Require(probe->event_.WaitFor([&]() { return probe->ticks_.load() == 1; }, 1s),
             "gate node did not enter its first Tick()");
     Require(pipeline.Pause(), "Pause failed while running");
@@ -461,6 +533,7 @@ void TestPauseResumePause() {
     auto probe = std::make_shared<Probe>();
     auto& node = pipeline.EmplaceNode<GateNode>(probe);
     Require(pipeline.Start() == PipelineStartResult::kStarted, "pause/resume graph failed to start");
+    Require(pipeline.Resume(), "pause/resume graph failed to resume initially");
 
     Require(probe->event_.WaitFor([&]() { return probe->ticks_.load() == 1; }, 1s), "first Tick did not start");
     Require(pipeline.Pause(), "first Pause failed");
@@ -487,6 +560,7 @@ void TestInterruptBlockingIo() {
     auto probe = std::make_shared<Probe>();
     auto& node = pipeline.EmplaceNode<InterruptibleIoNode>(probe);
     Require(pipeline.Start() == PipelineStartResult::kStarted, "I/O graph failed to start");
+    Require(pipeline.Resume(), "I/O graph failed to resume");
     Require(probe->event_.WaitFor([&]() { return probe->io_entered_.load(); }, 1s),
             "I/O node did not enter its blocking operation");
     Require(pipeline.Stop(), "Stop did not interrupt external I/O");
@@ -524,6 +598,7 @@ void TestRepeatedStop() {
     auto probe = std::make_shared<Probe>();
     auto& node = pipeline.EmplaceNode<InterruptibleIoNode>(probe);
     Require(pipeline.Start() == PipelineStartResult::kStarted, "repeat-stop graph failed to start");
+    Require(pipeline.Resume(), "repeat-stop graph failed to resume");
     Require(probe->event_.WaitFor([&]() { return probe->io_entered_.load(); }, 1s), "I/O node did not start");
     const bool first_result = pipeline.Stop();
     const bool second_result = pipeline.Stop();
@@ -538,6 +613,7 @@ void TestTickException() {
     auto probe = std::make_shared<Probe>();
     auto& node = pipeline.EmplaceNode<ThrowingNode>(probe);
     Require(pipeline.Start() == PipelineStartResult::kStarted, "exception graph failed to start");
+    Require(pipeline.Resume(), "exception graph failed to resume");
     Require(WaitUntil(
                 probe->event_, [&]() { return node.GetState() == mediacore::NodeState::kFinished; }, 1s),
             "throwing Node did not finish");
@@ -557,14 +633,17 @@ void TestJoinBeforeDestruction() {
         auto& source = pipeline.EmplaceNode<BlockingSendSource>(probe);
         Require(source.ConnectOutput(link_holder), "join-order source connection failed");
         Require(pipeline.Start() == PipelineStartResult::kStarted, "join-order graph failed to start");
+        Require(pipeline.Resume(), "join-order graph failed to resume");
         Require(probe->event_.WaitFor([&]() { return probe->second_send_entered_.load(); }, 1s),
                 "join-order source did not block");
         Require(pipeline.Stop(), "join-order Stop failed");
         Require(source.GetState() == mediacore::NodeState::kJoined, "Node was destroyed before Join");
-        Require(link_holder->IsAborted(), "Link was not aborted before Node destruction");
+        Require(!link_holder->Send(1) && !link_holder->Receive().has_value(),
+                "Link remained usable before Node destruction");
     }
     // Pipeline 已析构，但测试仍持有 shared_ptr；Link 应保持有效且不再被工作线程访问。
-    Require(link_holder->IsAborted(), "Link lifetime was not independent of Pipeline ownership");
+    Require(!link_holder->Send(1) && !link_holder->Receive().has_value(),
+            "Link did not retain its aborted state after Pipeline destruction");
     link_holder.reset();
 }
 
@@ -602,7 +681,7 @@ struct TestCase final {
 };
 
 const std::array<TestCase, 11> kTestCases = {{
-    {"eof_close_and_drain", &TestEofCloseAndDrain},
+    {"eos_propagation_and_drain", &TestEosPropagationAndDrain},
     {"stop_while_receiving", &TestStopWhileReceiving},
     {"stop_while_sending", &TestStopWhileSending},
     {"stop_while_paused", &TestStopWhilePaused},

@@ -1,21 +1,23 @@
 /**
  * @file opengl_view.h
- * @brief 视频渲染画布：实现 IVideoSink，接收 YUV420P 帧并用 OpenGL 上传三纹理、着色器 YUV→RGB 渲染
+ * @brief 使用 OpenGL 硬件加速渲染 YUV420P 视频帧的 Qt 窗口控件
  * @details
- * 数据流：后台线程调用 OnReceiveVideoFrame -> 帧写入信箱 -> 发出跨线程信号请求重绘 -> GUI 线程
- * paintGL 中读取信箱、上传纹理、执行着色器绘制
- * @note
- * OnReceiveVideoFrame 运行在生产者所在的后台线程，而所有 GL 调用只能在持有 OpenGL 上下文的GUI 线程执
- * 行，两者之间靠 Qt::QueuedConnection 信号完成线程切换
+ * 负责打通工作线程与 GUI 线程的图像渲染边界：
+ * 1. 架构定位：OpenGLView 实现 mediacore::IVideoSink 抽象接口，作为视频解码管线的最终呈现端；
+ * 2. 跨线程信箱机制：后台 VideoSinkNode 工作线程通过 OnReceiveVideoFrame 将新帧写入互斥锁保护的信箱，
+ *    并通过 Qt::QueuedConnection 发出 FrameArrived 信号触发 GUI 线程的 update()；
+ * 3. 硬件色彩空间转换：GUI 线程在 paintGL 中读取信箱，将 Y/U/V 三个单通道（GL_R8）纹理上传至 GPU，
+ *    在片段着色器（Fragment Shader）中完成矩阵级 $YUV \rightarrow RGB$ 色彩转换并最终呈现在屏幕上。
  */
+
 #pragma once
 
-/// Qt 对 OpenGL 的封装
-#include <QOpenGLBuffer>  /// GPU 显存缓冲的封装（VBO/EBO）
-#include <QOpenGLFunctions_3_3_Core>  /// OpenGL 3.3 核心版的全部函数入口
-#include <QOpenGLShaderProgram>  /// 着色器程序的 RAII 封装
-#include <QOpenGLVertexArrayObject>  /// 顶点属性布局的封装，记录顶点数据如何解析
-#include <QOpenGLWidget>  /// 能渲染 OpenGL 的窗口控件
+#include <QOpenGLBuffer>
+#include <QOpenGLFunctions_3_3_Core>
+#include <QOpenGLShaderProgram>
+#include <QOpenGLVertexArrayObject>
+#include <QOpenGLWidget>
+#include <array>
 #include <memory>
 #include <mutex>
 
@@ -27,117 +29,115 @@ struct VideoFrame;
 
 /**
  * @class OpenGLView
- * @brief 视频硬件渲染器 YUV420P -> OpenGL纹理 -> 着色器 -> 屏幕
+ * @brief 接收并显示解码视频图像的 OpenGL 3.3 视窗控件
  * @details
- * 多继承三个角色：
- * 1. QOpenGLWidget：提供 Qt 窗口环境与双缓冲刷新
- * 2. QOpenGLFunctions_3_3_Core：提供 OpenGL 3.3 Core 版本的函数入口
- * 3. mediacore::IVideoSink：帧接收协议，使本类无需知道帧的生产者是谁
+ * 采用多继承承担三个维度的核心职责：
+ * 1. QOpenGLWidget：嵌入 Qt 控件树，提供原生窗口环境、帧缓冲区管理与双缓冲自动交换（SwapBuffers）；
+ * 2. QOpenGLFunctions_3_3_Core：提供标准的 OpenGL 3.3 Core Profile 硬件加速绘图 API 入口；
+ * 3. mediacore::IVideoSink：抽象消费接口，使渲染组件无需感知视频帧的具体生产者（如软解/硬解）。
  */
 class OpenGLView : public QOpenGLWidget, protected QOpenGLFunctions_3_3_Core, public mediacore::IVideoSink {
     Q_OBJECT
 
 public:
     /**
-     * @brief 构造函数
-     * @param parent 父窗口指针,Qt 父子对象树管理生命周期
+     * @brief 构造函数：初始化 OpenGL 视窗控件
+     * @param parent Qt 父控件指针，由父子对象树统一管理本控件生命周期
      */
     explicit OpenGLView(QWidget* parent = nullptr);
 
     /**
-     * @brief 析构函数
-     * @note 需在 GL 上下文有效时释放纹理等显存资源，否则调用无上下文可作用，导致显存泄漏
+     * @brief 析构函数：释放 OpenGL 显存资源
+     * @note 析构时必须在有效的 OpenGL 上下文中释放纹理、缓冲与着色器句柄。
      */
     ~OpenGLView() override;
 
+    Q_DISABLE_COPY_MOVE(OpenGLView)
+
     /**
-     * @brief 接收一帧待显示的 YUV420P 视频帧
-     * @param VideoFrame 共享所有权的视频帧
+     * @brief 接收一帧已完成解码并经过格式转换的 YUV420P 视频帧
+     * @param video_frame 共享所有权的有效视频图像帧
      * @note
-     * 由后台生产者线程调用：加锁写入信箱后发出 FrameArrived 信号，信号以 Qt::QueuedConnection
-     * 方式投递到 GUI 线程触发重绘，本函数自身不涉及任何 GL 调用
+     * 1. 此回调由后台 VideoSinkNode 工作线程同步调用；
+     * 2. 内部仅执行轻量的互斥锁置换信箱操作，绝不阻塞工作线程，也不直接调用 OpenGL 绘制指令。
      */
     void OnReceiveVideoFrame(std::shared_ptr<mediacore::VideoFrame> video_frame) override;
 
 signals:
     /**
-     * @brief 通知有新的一帧已存入信箱，请求 GUI 线程重绘
-     * @note 仅用于跨线程投递：本信号连接到自身的 update()，连接类型为 Qt::QueuedConnection
-     * 确保 update() 总是在 GUI 线程执行，而不论 emit 发生在哪个线程
+     * @brief 通知有新视频帧已写入信箱，请求 GUI 主线程调度重绘
+     * @note 以 Qt::QueuedConnection 队列化方式跨线程投递，确保 update() 严格在 GUI 线程执行。
      */
     void FrameArrived();
 
 protected:
     /**
-     * @brief 初始化 GL 上下文：加载函数指针、编译着色器、建立全屏矩形几何、预分配纹理句柄
+     * @brief 初始化 OpenGL 渲染上下文
+     * @details
+     * 在首帧渲染前被 Qt 自动调用：
+     * 1. 加载 Core Profile 函数指针；
+     * 2. 编译并链接 $YUV \rightarrow RGB$ 矩阵转换着色器程序；
+     * 3. 建立全屏四边形几何顶点数据（VAO / VBO / EBO）；
+     * 4. 预先生成 Y/U/V 三个纹理对象的句柄并配置线性过滤采样参数。
      */
     void initializeGL() override;
 
     /**
-     * @brief 窗口大小调整：窗口大小变化时更新 glViewport
-     * @param width 新的物理宽度
-     * @param height 新的物理高度
+     * @brief 响应视窗尺寸变更事件
+     * @param width 控件新的物理宽度（像素）
+     * @param height 控件新的物理高度（像素）
+     * @details 根据视窗几何尺寸更新 glViewport，适配自适应画面拉伸。
      */
     void resizeGL(int width, int height) override;
 
     /**
-     * @brief 渲染一帧：从信箱取最新帧，上传三平面纹理，用着色器绘制到屏幕
+     * @brief 核心渲染主循环：绘制当前视频画面
+     * @details
+     * 执行逻辑：
+     * 1. 从互斥锁保护的信箱中取出最新持有的视频帧；
+     * 2. 校验着色器与帧有效性；
+     * 3. 根据分辨率变化使用 glTexImage2D（重分显存）或 glTexSubImage2D（热更新）上传 Y/U/V 三平面纹理；
+     * 4. 绑定纹理单元至采样器，运行着色器绘制全屏网格。
      */
     void paintGL() override;
 
 private:
     /**
-     * @brief 编译链接 YUV -> RGB 的顶点着色器与片段着色器
-     * @return true 表示着色器编译链接成功，false 表示失败
+     * @brief 编译并链接 YUV 至 RGB 色彩空间转换着色器程序
+     * @return 编译链接成功返回 true，发生语法或链接错误返回 false
      */
     bool BuildShader();
 
     /**
-     * @brief 上传全屏矩形顶点（位置 + 纹理坐标） 到 VAO/VBO/EBO
+     * @brief 初始化全屏四边形几何图元数据
+     * @details 将标准化设备坐标（NDC）空间下的位置及纹理 UV 坐标上传至 GPU（VBO / EBO / VAO）。
      */
     void SetupGeometry();
 
     /**
-     * @brief 创建 3 个纹理句柄并设置采样、环绕参数（Y/U/V 各一张 R8 单通道纹理）
+     * @brief 生成 3 个纹理句柄并配置采样过滤与寻址环绕参数
+     * @details 创建 Y/U/V 各自对应的 GL_TEXTURE_2D
+     * 纹理对象，配置双线性插值（GL_LINEAR）与边缘截断（GL_CLAMP_TO_EDGE）。
      */
     void SetupTextures();
 
     /**
-     * @brief 将当前帧的 Y/U/V 三平面分别上传到对应纹理
-     * @param frame 待上传的有效数据帧（调用方已确保非空且 IsValid）
-     * @note 分辨率发生变化时用 glTexImage2D 重新分配显存，否则用 glTexSubImage2D 仅更新内容
+     * @brief 将当前帧的 Y/U/V 三平面像素数据上传至 GPU 显存
+     * @param frame 待上传的有效图像帧（已校验 IsValid 为 true）
+     * @note 仅在视频宽高发生改变时使用 glTexImage2D 重新分配显存；尺寸未变时使用 glTexSubImage2D 复用显存直接覆盖。
      */
     void UploadFrameTextures(const mediacore::VideoFrame& frame);
 
 private:
-    /// 保护 current_frame_ 的跨线程访问：后台线程写入，GUI 线程 paintGL 读取
-    std::mutex frame_mutex_;
-
-    /// 信箱：仅保留最新的一帧，旧帧会被新帧覆盖
-    std::shared_ptr<mediacore::VideoFrame> current_frame_{nullptr};
-
-    /// 着色器程序：顶点着色器与片段着色器链接后的整体
-    QOpenGLShaderProgram shader_program_;
-
-    /// Y/U/V 三平面对应的纹理句柄
-    std::array<GLuint, 3> texture_ids_{0, 0, 0};
-
-    /// 顶点数组对象：记录顶点属性布局
-    QOpenGLVertexArrayObject vao_;
-
-    /// 顶点缓冲对象：全屏矩形顶点数据
-    QOpenGLBuffer vbo_{QOpenGLBuffer::VertexBuffer};
-
-    /// 索引缓冲对象：两个三角形拼成矩形所用的索引数据
-    QOpenGLBuffer ebo_{QOpenGLBuffer::IndexBuffer};
-
-    /// 纹理显存是否已首次分配：false 时用 glTexImage2D 分配，true 时用 glTexSubImage2D 更新
-    bool texture_allocated_{false};
-
-    /// 着色器程序是否已成功编译链接
-    bool shader_ready_{false};
-
-    /// 上一帧的分辨率，用于检测尺寸变化以触发纹理重新分配
-    int last_frame_width_{0};
-    int last_frame_height_{0};
+    std::mutex frame_mutex_;  ///< 互斥锁：保护 current_frame_ 信箱的跨线程读写访问
+    std::shared_ptr<mediacore::VideoFrame> current_frame_{nullptr};  ///< 视频帧信箱：始终仅保留最新到达的一帧画面
+    QOpenGLShaderProgram shader_program_;  ///< 着色器程序对象（承载 YUV 转 RGB 片段着色器）
+    std::array<GLuint, 3> texture_ids_{0, 0, 0};  ///< Y/U/V 三个平面的 OpenGL 2D 纹理句柄（0: Y, 1: U, 2: V）
+    QOpenGLVertexArrayObject vao_;  ///< 顶点数组对象（VAO），保存顶点属性解析格式
+    QOpenGLBuffer vbo_{QOpenGLBuffer::VertexBuffer};  ///< 顶点缓冲对象（VBO），存储网格顶点与纹理坐标
+    QOpenGLBuffer ebo_{QOpenGLBuffer::IndexBuffer};  ///< 索引缓冲对象（EBO），存储三角形顶点绘制索引
+    bool texture_allocated_{false};  ///< 标记纹理显存是否已初次分配
+    bool shader_ready_{false};  ///< 标记着色器程序是否已成功通过编译与链接
+    int last_frame_width_{0};  ///< 记录上一帧宽度，用于检测视频分辨率动态重协商
+    int last_frame_height_{0};  ///< 记录上一帧高度，用于检测视频分辨率动态重协商
 };
