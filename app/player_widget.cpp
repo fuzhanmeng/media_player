@@ -133,7 +133,7 @@ void PlayerWidget::OpenMediaFile(const QString& file_path) {
     const QFileInfo file_info(file_path);
     const std::string media_path = file_info.absoluteFilePath().toUtf8().toStdString();
     last_media_directory_ = file_info.absolutePath();
-    setWindowTitle(tr("%1 — ai_media_player").arg(file_info.fileName()));
+    setWindowTitle(tr("%1 — media_player").arg(file_info.fileName()));
 
     LOG_INFO("Opening selected video '{}'", media_path);
     player_->Open(media_path);
@@ -279,9 +279,8 @@ void PlayerWidget::RefreshPlaybackState() {
     controller_->SetPlayPauseEnabled(state != mediacore::PlaybackState::kOpening &&
                                      state != mediacore::PlaybackState::kSeeking);
 
-    const bool can_seek = state == mediacore::PlaybackState::kPlaying ||
-                          state == mediacore::PlaybackState::kPaused ||
-                          state == mediacore::PlaybackState::kEnded;
+    const bool can_seek = state == mediacore::PlaybackState::kPlaying || state == mediacore::PlaybackState::kPaused ||
+        state == mediacore::PlaybackState::kEnded;
     controller_->SetSeekEnabled(can_seek && player_->GetDurationUs() > 0);
 
     switch (state) {

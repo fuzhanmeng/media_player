@@ -60,7 +60,7 @@ int main(int argc, char* argv[]) {
         // 4. 实例化主交互视窗并注入播放控制器借用指针
         // 重要契约：window 声明在 player 之后，保证析构时 window 优先释放并解除所有弱引用
         PlayerWidget window(player.get());
-        window.setWindowTitle("ai_media_player");
+        window.setWindowTitle("media_player");
         window.resize(1920, 1080);
         window.show();
         LOG_INFO("Main window shown");

@@ -15,6 +15,7 @@ set(MEDIACORE_SOURCES
     src/av_types/video_codec_parameters.cpp
     src/core/player.cpp
     src/sink/video_sink_node.cpp
+    src/av_types/audio_codec_parameters.cpp
 )
 
 # ============ 定义静态库 ============

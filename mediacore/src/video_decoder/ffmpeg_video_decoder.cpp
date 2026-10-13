@@ -426,7 +426,7 @@ FfmpegDecoderReceiveResult FfmpegVideoDecoder::ConvertCurrentFrame(std::uint64_t
     }
 
     const AVPixelFormat source_format = static_cast<AVPixelFormat>(decoded_frame_->format);
-    if (sws_isSupportedInput(source_format) < 0) {
+    if (sws_isSupportedInput(source_format) <= 0) {
         LOG_ERROR("Decoder '{}' produced unsupported swscale input format {} for epoch {}",
                   codec_name_,
                   decoded_frame_->format,

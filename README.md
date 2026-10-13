@@ -332,7 +332,7 @@ DAG-only 测试构建，不能宣称完整播放器或硬解运行时已验收�
 ```bash
 ./build.sh                  # 默认 RelWithDebInfo，可传 Release / Debug
 source build/RelWithDebInfo/generators/conanrun.sh
-./build/RelWithDebInfo/app/ai_media_player
+./build/RelWithDebInfo/app/media_player
 ```
 
 `build.sh` 依次执行带 `conan.lock` 的 `conan install`、`cmake --preset` 和
@@ -360,8 +360,8 @@ conan install --requires=spdlog/1.15.3 --lockfile=conan.lock \
       --generator=CMakeDeps --generator=CMakeToolchain \
       --build=missing -s build_type=RelWithDebInfo
 cmake -S . -B build-dag \
-      -DAI_MEDIA_PLAYER_BUILD_MEDIACORE=OFF \
-      -DAI_MEDIA_PLAYER_BUILD_APP=OFF \
+      -DMEDIA_PLAYER_BUILD_MEDIACORE=OFF \
+      -DMEDIA_PLAYER_BUILD_APP=OFF \
       -DBUILD_TESTING=ON \
       -DCMAKE_BUILD_TYPE=RelWithDebInfo \
       -DCMAKE_TOOLCHAIN_FILE=build-dag/generators/conan_toolchain.cmake

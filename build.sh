@@ -11,7 +11,7 @@ BUILD_TYPE=${1:-RelWithDebInfo}
 # 将传入的构建类型转为全小写,以匹配 Conan 生成的 CMake Preset 名字 (例如: conan-release)
 PRESET_NAME="conan-$(echo "$BUILD_TYPE" | tr '[:upper:]' '[:lower:]')"
 
-echo "开始构建项目: ai_media_player"
+echo "开始构建项目: media_player"
 echo "构建类型: $BUILD_TYPE"
 echo "使用的 CMake Preset: $PRESET_NAME"
 
@@ -116,4 +116,4 @@ fi
 echo -e "\n编译成功！"
 echo "运行前请加载 Conan 运行时环境:"
 echo "source build/$BUILD_TYPE/generators/conanrun.sh"
-echo "./build/$BUILD_TYPE/app/ai_media_player"
+echo "./build/$BUILD_TYPE/app/media_player"

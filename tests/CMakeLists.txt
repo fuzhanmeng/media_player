@@ -6,7 +6,7 @@ add_subdirectory(dag)
 # The DAG tests build without mediacore, Qt, or FFmpeg, but still use the
 # Conan-managed spdlog logger. The remaining tests link mediacore and therefore
 # need the complete Conan dependency graph.
-if(AI_MEDIA_PLAYER_BUILD_MEDIACORE)
+if(MEDIA_PLAYER_BUILD_MEDIACORE)
     add_subdirectory(config)
     add_subdirectory(core)
     add_subdirectory(demux)

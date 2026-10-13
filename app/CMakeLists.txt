@@ -7,7 +7,7 @@
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets OpenGL OpenGLWidgets)
 
 # 定义可执行文件 target
-add_executable(ai_media_player
+add_executable(media_player
     main.cpp
     controller_widget.cpp
     player_widget.cpp
@@ -15,7 +15,7 @@ add_executable(ai_media_player
 )
 
 # 链接 Qt 和媒体核心库
-target_link_libraries(ai_media_player PRIVATE
+target_link_libraries(media_player PRIVATE
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets

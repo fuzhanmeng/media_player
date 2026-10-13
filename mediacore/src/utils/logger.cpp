@@ -27,10 +27,10 @@
 namespace mediacore {
 namespace {
 
-constexpr const char* kLoggerName = "AI_MEDIA_PLAYER";
-constexpr const char* kFallbackLoggerName = "AI_MEDIA_PLAYER_NULL";
+constexpr const char* kLoggerName = "MEDIA_PLAYER";
+constexpr const char* kFallbackLoggerName = "MEDIA_PLAYER_NULL";
 constexpr const char* kLogDirectory = "logs";
-constexpr const char* kLogFilePath = "logs/ai_media_player.log";
+constexpr const char* kLogFilePath = "logs/media_player.log";
 
 // 滚动日志文件大小及数量配额（单文件最大 10 MiB，保留 5 个轮转历史，防止占满磁盘）
 constexpr std::size_t kMaxLogFileSizeBytes = 10 * 1024 * 1024;

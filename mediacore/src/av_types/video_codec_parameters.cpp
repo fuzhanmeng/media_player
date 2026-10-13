@@ -3,11 +3,10 @@
  * @brief 保存一份可以交给视频解码器使用的 FFmpeg 参数
  */
 
-#include "video_codec_parameters.h"
+#include "av_types/video_codec_parameters.h"
 
-#include <utility>
-
-#include "mediacore/logger.h"
+#include <memory>
+#include <stdexcept>
 
 extern "C" {
 #include <libavcodec/codec_par.h>
@@ -15,40 +14,56 @@ extern "C" {
 
 namespace mediacore {
 
-/**
- * @brief 创建一个不包含参数的空对象
- */
-VideoCodecParameters::~VideoCodecParameters() {
-    LOG_TRACE("VideoCodecParameters released: {}", static_cast<const void*>(av_parameters_));
+VideoCodecParameters::~VideoCodecParameters() = default;
 
-    avcodec_parameters_free(&av_parameters_);
+/**
+ * @brief 自定义的删除器
+ */
+void VideoCodecParameters::Deleter::operator()(AVCodecParameters* p) const noexcept {
+    avcodec_parameters_free(&p);
 }
 
 /**
  * @brief 移动构造函数，使用一个对象去初始化另一个对象
  * @param other 被移动的对象，调整后被置空
  */
-VideoCodecParameters::VideoCodecParameters(VideoCodecParameters&& other) noexcept
-    : av_parameters_(std::exchange(other.av_parameters_, nullptr)) {}
+VideoCodecParameters::VideoCodecParameters(VideoCodecParameters&& other) noexcept = default;
 
 /**
  * @brief 移动赋值运算符，将一个对象资源转移到另一个对象
  * @param other 被转移资源的对象
  */
-VideoCodecParameters& VideoCodecParameters::operator=(VideoCodecParameters&& other) noexcept {
-    if (this == &other) {
-        LOG_ERROR("Cannot self-replicate: this == &other");
-        return *this;
+VideoCodecParameters& VideoCodecParameters::operator=(VideoCodecParameters&& other) noexcept = default;
+
+/**
+ * @brief 对外部传入的音频编解码参数 source 执行深拷贝操作
+ * @param source 指向源 AVCodecParameters 的指针，如 AVStream::codecpar
+ * @return 拥有独立副本所有权的 AudioCodecParameters 实例
+ * @throw std::invalid_argument 输入 source 指针为空时抛出
+ * @throw std::bad_alloc 分配 AVCodecParameters 结构体显示内存失败时抛出
+ * @throw std::runtime_error 调用 avcodec_parameters_copy 拷贝参数或 extradata 失败时抛出
+ * @note 内部使用 avcodec_parameters_copy，保证包括 extradata 二进制缓冲在内的完整复制
+ */
+VideoCodecParameters VideoCodecParameters::CopyFrom(const AVCodecParameters* source) {
+    if (source == nullptr) {
+        throw std::invalid_argument("VideoCodecParameters: source pointer is nullptr");
     }
 
-    // 1. 释放资源
-    avcodec_parameters_free(&av_parameters_);
+    // 1. 申请临时的视频参数内存
+    VideoCodecParameters result;
+    result.video_parameters_.reset(avcodec_parameters_alloc());
 
-    // 2. 转移资源并置空
-    av_parameters_ = std::exchange(other.av_parameters_, nullptr);
+    // 2. 申请失败
+    if (!result.video_parameters_) {
+        throw std::bad_alloc();
+    }
 
-    LOG_TRACE("VideoCodecParameters move-assigned: {}", static_cast<const void*>(av_parameters_));
-    return *this;
+    // 3. 申请成功
+    if (avcodec_parameters_copy(result.video_parameters_.get(), source) < 0) {
+        // 拷贝失败
+        throw std::runtime_error("VideoCodecParameters: avcodec_parameters_copy failed");
+    }
+
+    return result;
 }
-
 }  // namespace mediacore

@@ -9,23 +9,21 @@
 
 #pragma once
 
+#include <memory>
+
 struct AVCodecParameters;
 
 namespace mediacore {
 
-class FfmpegDemuxer;
-
 /**
  * @class VideoCodecParameters
- * @brief 独占一份 AVCodecParameters 的小包装类
- * @details
- * AVCodecParameters 本身是 FFmpeg 分配的 C 结构体，这里保存了其指针，并负责在析构时调用
- * avcodec_parameters_free()，类外只能读取参数，不可复制这份资源
+ * @brief 独占型视频编解码参数封装容器
+ * @details 提供了只读访问接口，封装了 FFmpeg 底层 AVcodecParameters 的深拷贝与生命周期管理
  */
 class VideoCodecParameters {
 public:
     /**
-     * @brief 创建一个不包含参数的空对象
+     * @brief 默认构造函数
      * @details 空对象的 Get() 返回 nullptr，IsValid() 返回 false
      */
     VideoCodecParameters() noexcept = default;
@@ -59,26 +57,42 @@ public:
     VideoCodecParameters& operator=(VideoCodecParameters&& other) noexcept;
 
     /**
+     * @brief 将 Demuxer 解复用得到的音频编码参数拷贝过来
+     * @param source 音频编码参数来源
+     */
+    static VideoCodecParameters CopyFrom(const AVCodecParameters* source);
+
+    /**
      * @brief 返回底层的参数指针，空对象返回 nullptr
      * @return 有参数时返回只读指针；空对象返回 nullptr
      */
-    const AVCodecParameters* Get() const noexcept { return av_parameters_; }
+    [[nodiscard]] const AVCodecParameters* Get() const noexcept { return video_parameters_.get(); }
 
     /**
      * @brief 判断是否持有参数副本
      * @return 持有返回 true，否则返回 false
      */
-    bool IsValid() const noexcept { return av_parameters_ != nullptr; }
-
-private:
-    friend class FfmpegDemuxer;
+    [[nodiscard]] bool IsValid() const noexcept { return video_parameters_ != nullptr; }
 
     /**
-     * @brief 接收一块已经由 FFmpeg 分配好的参数内存
-     * @param parameters 要交给本对象管理的指针，可以为空
+     * @brief 显式布尔类型转换重载，等价于 IsValid()
      */
-    explicit VideoCodecParameters(AVCodecParameters* av_parameters) noexcept : av_parameters_(av_parameters) {}
+    explicit operator bool() const noexcept { return IsValid(); }
 
-    AVCodecParameters* av_parameters_{nullptr};  ///< 当前对象独自负责释放的参数指针
+    /**
+     * @brief 重载箭头运算符，提供对底层结构体成员的直接只读访问
+     */
+    const AVCodecParameters* operator->() const noexcept { return video_parameters_.get(); }
+
+private:
+    /**
+     * @struct Deleter
+     * @brief 适配 avcodec_parameters_free 的自定义释放仿函数
+     */
+    struct Deleter {
+        void operator()(AVCodecParameters* p) const noexcept;
+    };
+
+    std::unique_ptr<AVCodecParameters, Deleter> video_parameters_{nullptr};
 };
 }  // namespace mediacore

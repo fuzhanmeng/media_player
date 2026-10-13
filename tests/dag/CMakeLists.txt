@@ -4,11 +4,11 @@
 # 管理的 spdlog。
 
 find_package(Threads REQUIRED)
-if(NOT AI_MEDIA_PLAYER_BUILD_MEDIACORE)
+if(NOT MEDIA_PLAYER_BUILD_MEDIACORE)
     # DAG-only mode still uses the project's Conan-managed logger, but does
     # not need the full Qt/FFmpeg graph.
     find_package(spdlog 1.15.3 EXACT CONFIG REQUIRED
-        PATHS "${AI_MEDIA_PLAYER_CONAN_GENERATORS_DIR}"
+        PATHS "${MEDIA_PLAYER_CONAN_GENERATORS_DIR}"
         NO_DEFAULT_PATH
     )
     ai_media_player_assert_conan_package(spdlog)

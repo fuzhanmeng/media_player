@@ -13,8 +13,8 @@ conan install --requires=spdlog/1.15.3 --lockfile=conan.lock \
       --generator=CMakeDeps --generator=CMakeToolchain \
       --build=missing -s build_type=RelWithDebInfo
 cmake -S . -B /tmp/ai-media-player-d9 \
-      -DAI_MEDIA_PLAYER_BUILD_MEDIACORE=OFF \
-      -DAI_MEDIA_PLAYER_BUILD_APP=OFF \
+      -DMEDIA_PLAYER_BUILD_MEDIACORE=OFF \
+      -DMEDIA_PLAYER_BUILD_APP=OFF \
       -DBUILD_TESTING=ON \
       -DCMAKE_BUILD_TYPE=RelWithDebInfo \
       -DCMAKE_TOOLCHAIN_FILE=/tmp/ai-media-player-d9/generators/conan_toolchain.cmake
