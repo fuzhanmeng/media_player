@@ -18,7 +18,7 @@ namespace mediacore {
 /**
  * @class AudioCodecParameters
  * @brief 独占型音频编解码参数封装容器
- * @details 
+ * @details
  * 提供了只读访问接口，封装了 FFmpeg 底层 AVcodecParameters 的深拷贝与生命周期管理
  */
 class AudioCodecParameters {

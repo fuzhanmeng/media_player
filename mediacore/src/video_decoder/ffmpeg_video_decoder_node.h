@@ -61,7 +61,7 @@ public:
     ~FfmpegVideoDecoderNode() override = default;
 
     // 严禁拷贝与移动，保证节点拓扑生命周期唯一
-    FfmpegVideoDecoderNode(const FfmpegVideoDecoderNode&) = delete;
+     FfmpegVideoDecoderNode(const FfmpegVideoDecoderNode&) = delete;
     FfmpegVideoDecoderNode& operator=(const FfmpegVideoDecoderNode&) = delete;
     FfmpegVideoDecoderNode(FfmpegVideoDecoderNode&&) = delete;
     FfmpegVideoDecoderNode& operator=(FfmpegVideoDecoderNode&&) = delete;

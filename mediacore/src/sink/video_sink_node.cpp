@@ -1,16 +1,9 @@
 /**
  * @file video_sink_node.cpp
- * @brief 视频输出渲染节点实现（按时序向显示端交付画面并处理 Seek Hold 与 EOS）
+ * @brief 视频输出节点实现，负责帧交付、Seek 预览帧选择和轨道状态报告
  * @details
- * 负责管线最终端数据的消费与交付：
- * 1. 帧分发与解耦：将解码后的 VideoFrame 包装为 std::shared_ptr 提交给 VideoSinkDispatcher，
- *    通过分发器弱引用解耦外部 UI 界面（如 Qt 窗口或原生视图）的生命周期；
- * 2. 精准 Seek 首帧截获与挂起机制（Seek Hold）：
- *    - 过滤目标时间点前的早到关键帧（Pre-roll frames），仅留最后一张作为兜底备选；
- *    - 第一张 PTS >= target 的目标帧交付上屏后，主动挂起节点工作线程（WaitForSeekRelease）；
- *    - 待 Player 控制线程完成状态流转判定并调用 ReleaseSeekHold() 后，方才放行后续帧读取；
- * 3. 流末尾兜底与事件汇报：在 Seek 撞到流末尾（EOF）时自动使用备选候选帧兜底呈现，
- *    并向 Pipeline 上报 SeekCompleted 与 MediaEnded 事件。
+ * 正常播放的帧时序由 AvSyncNode 控制，本节点不再进行同步等待
+ * Seek 时寻找第一张 PTS 不早于目标时间的帧，并保留目标之前最近的一帧作为备用
  */
 
 #include "sink/video_sink_node.h"
@@ -28,280 +21,187 @@
 
 namespace mediacore {
 
-namespace {
-
 /**
- * @brief 创建分发器并挂载指定的单一显示端，返回托管的 shared_ptr
- * @param sink 外部显示端实例指针（非拥有借用）
- */
-std::shared_ptr<VideoSinkDispatcher> CreateAttachedDispatcher(IVideoSink* sink) {
-    auto dispatcher = std::make_shared<VideoSinkDispatcher>();
-    dispatcher->Attach(sink);
-    return dispatcher;
-}
-
-constexpr const char* kNodeName = "video_sink";
-
-}  // namespace
-
 /**
- * @brief 构造函数：初始化视频输出节点并绑定分发器
- * @param sync_ctx 全局同步控制上下文
- * @param event_callbacks 节点事件回调集合
- * @param video_frame_dispatcher 负责向显示端分发帧的共享分发器
+ * @brief 初始化视频输出节点。
+ * @param sync_context Pipeline 同步上下文
+ * @param callbacks Pipeline 事件回调
+ * @param video_dispatcher 视频帧分发器
+ * @param timeline 共享播放时间轴
  * @throws std::invalid_argument 当 video_frame_dispatcher 为空时抛出
  */
 VideoSinkNode::VideoSinkNode(std::shared_ptr<SyncContext> sync_ctx,
                              PipelineEventCallbacks event_callbacks,
-                             std::shared_ptr<VideoSinkDispatcher> video_frame_dispatcher)
-    : INode(kNodeName, std::move(sync_ctx), std::move(event_callbacks)),
-      video_frame_dispatcher_(std::move(video_frame_dispatcher)) {
-    if (video_frame_dispatcher_ == nullptr) {
-        LOG_ERROR("VideoSinkNode requires a non-null VideoSinkDispatcher");
-        throw std::invalid_argument("VideoSinkNode requires a non-null VideoSinkDispatcher");
+                             std::shared_ptr<VideoSinkDispatcher> video_dispatcher,
+                             std::shared_ptr<PlaybackTimeline> timeline)
+    : INode("video_sink", std::move(sync_ctx), std::move(event_callbacks)),
+      video_dispatcher_(std::move(video_dispatcher)),
+      timeline_(std::move(timeline)) {
+    if (video_dispatcher_ == nullptr || timeline_ == nullptr) {
+        LOG_ERROR("VideoSinkNode requires a non-null VideoSinkDispatcher and PlaybackTimeline");
+        throw std::invalid_argument("VideoSinkNode requires a non-null VideoSinkDispatcher and PlaybackTimeline");
     }
-
-    active_media_epoch_ = GetCurrentEpoch();
-    LOG_INFO("VideoSinkNode constructed, media epoch {}", active_media_epoch_);
 }
 
 /**
- * @brief 便利构造函数：基于已有 IVideoSink 指针委托构造
- */
-VideoSinkNode::VideoSinkNode(std::shared_ptr<SyncContext> sync_ctx,
-                             PipelineEventCallbacks event_callbacks,
-                             IVideoSink* sink)
-    : VideoSinkNode(std::move(sync_ctx), std::move(event_callbacks), CreateAttachedDispatcher(sink)) {}
-
-/**
- * @brief 解除 Seek 定位期间的帧读取挂起阻塞（实现 ISeekHoldReleasable 接口）
+ * @brief 将当前播放版本的视频帧交给显示端
  * @details
- * 目标帧交付上屏后，节点会停止后续读取并阻塞挂起；
- * Player 控制线程在处理完 SeekCompleted 并确定是继续播放还是保持定格暂停后，
- * 调用本函数解除挂起。
+ * 交付前检查 epoch，丢弃 Seek 过程中失效的旧帧
+ * 使用 shared_ptr 管理帧生命周期，允许显示端延迟使用
  */
-void VideoSinkNode::ReleaseSeekHold() noexcept {
-    {
-        std::lock_guard<std::mutex> lock(seek_hold_mutex_);
-        seek_hold_release_requested_ = true;
+void VideoSinkNode::DeliverFrame(VideoFrame frame) {
+    if (IsCurrentEpoch(frame.epoch_) && timeline_->Get().epoch_ == frame.epoch_) {
+        video_dispatcher_->DeliverFrame(std::make_shared<VideoFrame>(std::move(frame)));
     }
-
-    seek_hold_cv_.notify_all();
-    LOG_DEBUG("VideoSinkNode allowed processing after seek target");
 }
 
 /**
- * @brief 从输入端口消费并分发处理一个 VideoFrame、StreamReset 或 EndOfStream
+ * @brief 登记视频轨道已经完成本轮 Seek，并在所有活动轨道就绪后上报聚合结果。
+ * @param position 选定的视频帧位置，单位为微秒。
+ * @param reached_eof 是否在输入结尾使用了目标之前的最后一帧完成定位。
+ */
+void VideoSinkNode::ReportReady(std::int64_t position, bool reached_eof) {
+    if (is_video_ready_) {
+        return;
+    }
+
+    is_video_ready_ = true;
+    const auto result = timeline_->MarkReady(PlaybackTrack::kVideo, current_epoch_, position, reached_eof);
+
+    LOG_DEBUG("Video sink reported seek readiness at epoch {}, position {} us, EOF {}",
+              current_epoch_,
+              position,
+              reached_eof);
+
+    if (result) {
+        LOG_INFO("All tracks ready after seek at epoch {}, position {} us, all tracks at EOF {}",
+                 current_epoch_,
+                 result->position_us_,
+                 result->all_eof_);
+        ReportSeekCompleted(current_epoch_, result->position_us_, result->all_eof_);
+    }
+}
+
+/**
+ * @brief 消费视频输入并处理帧交付、Seek 和 EOF
+ * @details
+ * 输入类型：StreamReset / VideoFrame / EndOfStream，普通暂停时保留待处理数据；Seek 期间继续搜索预览帧
  */
 TickResult VideoSinkNode::Tick() {
-    // 1. 若此前已交付 Seek 定位帧，阻塞等待 Player 决策放行
-    if (is_waiting_for_player_seek_decision_) {
-        WaitForSeekRelease();
-    }
+    const auto timeline_state = timeline_->Get();
 
-    // 2. 优先检查是否存在暂停期间已出队但暂存未处理的输入项；若无暂存项，才从上游队列读取
-    if (!deferred_input_item_during_pause_.has_value()) {
-        deferred_input_item_during_pause_ = ReceiveInput();
+    // 1. 如果 Seek 预览已经完成，等待其他轨道就绪
+    if (current_epoch_ == timeline_state.epoch_ && is_video_ready_ && timeline_state.seeking_) {
+        timeline_->Wait(timeline_state.state_version_);
 
-        // 返回 nullopt 表示输入 Link 被打断（Abort）或已关闭，正常 EOF 会通过 EndOfStream 变体项传递
-        if (!deferred_input_item_during_pause_.has_value()) {
-            active_epoch_eos_processed_.store(false, std::memory_order_release);
-            return TickResult::kStopped;
-        }
-    }
-
-    // 3. 消费前校验运行状态：若当前管线处于暂停（Paused），保留该项不予处理，等待唤醒
-    if (sync_ctx_->GetState() == PipelineRunState::kPaused) {
         return TickResult::kContinue;
     }
 
-    StreamItem<VideoFrame> item = std::move(*deferred_input_item_during_pause_);
-    deferred_input_item_during_pause_.reset();
+    // 2. 获取输数据，没有处理完之前始终保留数据
+    if (!pending_item_) {
+        pending_item_ = ReceiveInputFor(std::chrono::milliseconds(5));
+    }
 
-    // 4. 分发处理视频帧
-    if (auto* frame = std::get_if<VideoFrame>(&item)) {
-        if (!IsCurrentEpoch(frame->epoch_)) {
+    // 3. 如果没接收到数据
+    if (!pending_item_) {
+        return IsStopRequested() ? TickResult::kStopped : TickResult::kContinue;
+    }
+
+    // 4. 丢弃已经失效的旧版本数据
+    const auto input_epoch = std::visit([](const auto& itme) { return itme.epoch_; }, *pending_item_);
+
+    if (!IsCurrentEpoch(input_epoch) || input_epoch != timeline_->Get().epoch_) {
+        pending_item_.reset();
+        return TickResult::kContinue;
+    }
+
+    const auto current_state = timeline_->Get();
+
+    // 普通暂停时不消费数据，Seek 期间允许继续处理
+    if (!current_state.playing_ && !current_state.seeking_) {
+        return TickResult::kContinue;
+    }
+
+    auto stream_item = std::move(*pending_item_);
+    pending_item_.reset();
+
+    // Seek 重置：切换播放版本并重新开始帧搜索
+    if (const auto* reset = std::get_if<StreamReset>(&stream_item)) {
+        current_epoch_ = reset->epoch_;
+        seek_target_us_ = reset->target_us_;
+
+        is_searching_ = true;
+        is_video_ready_ = false;
+        is_eos_processed_ = false;
+
+        fallback_frame_.reset();
+        return TickResult::kContinue;
+    }
+
+    // 视频帧处理
+    if (auto* video_frame = std::get_if<VideoFrame>(&stream_item)) {
+        if (input_epoch != current_epoch_) {
+            return Fail("video frame before StreamReset", input_epoch);
+        }
+
+        if (is_searching_) {
+            // 目标之前的帧仅作为备用，不交付显示
+            const auto frame_pts = video_frame->pts_us_.value_or(seek_target_us_);
+
+            if (frame_pts < seek_target_us_) {
+                fallback_frame_ = std::move(*video_frame);
+            } else {
+                // 找到第一张满足目标时间的帧，完成预览
+                const auto actual_position_us = frame_pts;
+
+                DeliverFrame(std::move(*video_frame));
+                is_searching_ = false;
+                fallback_frame_.reset();
+                ReportReady(actual_position_us, false);
+            }
+        } else if (!is_eos_processed_) {
+            // 正常播放：直接交付，上游已完成同步调度
+            DeliverFrame(std::move(*video_frame));
+        }
+
+        return TickResult::kContinue;
+    }
+
+    // 视频流结束处理
+    if (const auto* end_of_stream = std::get_if<EndOfStream>(&stream_item)) {
+        if (input_epoch != current_epoch_) {
+            return Fail("video EOS before StreamReset", input_epoch);
+        }
+
+        // 防止重复处理 EOS
+        if (is_eos_processed_) {
             return TickResult::kContinue;
         }
-        return HandleVideoFrame(std::move(*frame));
-    }
 
-    // 5. 分发处理流重置信令（StreamReset）
-    if (const auto* reset = std::get_if<StreamReset>(&item)) {
-        return HandleStreamReset(*reset);
-    }
+        is_eos_processed_ = true;
 
-    // 6. 分发处理流结束信令（EndOfStream）
-    if (const auto* eos = std::get_if<EndOfStream>(&item)) {
-        return HandleEndOfStream(*eos);
-    }
+        if (is_searching_) {
+            // 未找到目标帧时，使用备用帧完成 Seek 预览
+            // 没有备用帧则直接使用目标时间报告就绪
+            const auto actual_position_us =
+                fallback_frame_ ? fallback_frame_->pts_us_.value_or(seek_target_us_) : seek_target_us_;
 
-    return Fail("VideoSinkNode received an unknown stream item");
-}
-
-/**
- * @brief 挂起阻塞当前工作线程，直到 Player 批准放行或触发停机/新 Seek
- */
-void VideoSinkNode::WaitForSeekRelease() {
-    std::unique_lock<std::mutex> lock(seek_hold_mutex_);
-
-    seek_hold_cv_.wait(lock, [this]() {
-        return seek_hold_release_requested_ || IsStopRequested() || !IsCurrentEpoch(active_media_epoch_);
-    });
-
-    is_waiting_for_player_seek_decision_ = false;
-    seek_hold_release_requested_ = false;
-}
-
-/**
- * @brief 处理常规视频图像帧
- * @param frame 待渲染呈现的视频帧对象
- */
-TickResult VideoSinkNode::HandleVideoFrame(VideoFrame frame) {
-    if (IsStopRequested()) {
-        return TickResult::kStopped;
-    }
-
-    // 取出帧后若管线恰好转入暂停，将帧重新暂存，等恢复后再上屏
-    if (sync_ctx_->GetState() == PipelineRunState::kPaused) {
-        deferred_input_item_during_pause_.emplace(std::in_place_type<VideoFrame>, std::move(frame));
-        return TickResult::kContinue;
-    }
-
-    // 丢弃不属于当前全局活跃世代的过期残留帧
-    if (!IsCurrentEpoch(frame.epoch_)) {
-        return TickResult::kContinue;
-    }
-
-    // 处于 Seek 检索阶段时，交由专用检索逻辑进行时间戳匹配
-    if (is_searching_for_seek_target_frame_) {
-        ProcessFrameDuringSeek(frame);
-        return TickResult::kContinue;
-    }
-
-    // 正常播放流程：通过分发器安全投递上屏
-    video_frame_dispatcher_->DeliverFrame(std::make_shared<VideoFrame>(std::move(frame)));
-    return TickResult::kContinue;
-}
-
-/**
- * @brief Seek 寻帧状态机核心处理：筛选目标帧并建立兜底备份
- * @param frame 待检索判定的视频帧
- */
-void VideoSinkNode::ProcessFrameDuringSeek(const VideoFrame& frame) {
-    if (!frame.pts_us_.has_value()) {
-        return;
-    }
-
-    // 尚未达到目标时间：仅作为候选帧备份保留，不直接上屏，防止画面闪烁倒退
-    if (frame.pts_us_.value() < seek_target_pts_us_) {
-        fallback_frame_before_seek_target_ = frame;
-        return;
-    }
-
-    // 命中第一张 PTS >= seek_target_pts_us_ 的精准目标帧，立即交付上屏呈现
-    video_frame_dispatcher_->DeliverFrame(std::make_shared<VideoFrame>(frame));
-
-    // 首帧交付完成后立即进入 Seek Hold 挂起等待状态，等待 Player 决策
-    {
-        std::lock_guard<std::mutex> lock(seek_hold_mutex_);
-        is_waiting_for_player_seek_decision_ = true;
-        seek_hold_release_requested_ = false;
-    }
-
-    is_searching_for_seek_target_frame_ = false;
-    seek_result_frame_delivered_ = true;
-
-    LOG_INFO(
-        "VideoSinkNode delivered seek target frame at pts {} us, epoch {}", frame.pts_us_.value(), active_media_epoch_);
-
-    // 向上层汇报 Seek 顺利完成（精确匹配到目标帧）
-    ReportSeekCompleted(active_media_epoch_, frame.pts_us_.value(), false);
-}
-
-/**
- * @brief 处理时间跳转（Seek）后的流重置信令
- * @param reset 包含新世代 Epoch 与目标时间戳的控制载荷
- */
-TickResult VideoSinkNode::HandleStreamReset(const StreamReset& reset) {
-    if (!IsCurrentEpoch(reset.epoch_)) {
-        return TickResult::kContinue;
-    }
-
-    // 同步更新活跃世代与重置 EOS 处理标记
-    active_media_epoch_ = reset.epoch_;
-    active_epoch_eos_processed_.store(false, std::memory_order_release);
-
-    // 开启新一轮 Seek 目标帧检索
-    is_searching_for_seek_target_frame_ = true;
-    seek_target_pts_us_ = reset.target_us_;
-    seek_result_frame_delivered_ = false;
-    is_waiting_for_player_seek_decision_ = false;
-    fallback_frame_before_seek_target_.reset();
-
-    {
-        std::lock_guard<std::mutex> lock(seek_hold_mutex_);
-        seek_hold_release_requested_ = false;
-    }
-
-    LOG_INFO("VideoSinkNode reset to epoch {}, seek target us is {}", reset.epoch_, reset.target_us_);
-    return TickResult::kContinue;
-}
-
-/**
- * @brief 处理流结束信令（EndOfStream）并汇报播放结束事件
- * @param eos 包含流结束世代号的控制载荷
- */
-TickResult VideoSinkNode::HandleEndOfStream(const EndOfStream& eos) {
-    if (!IsCurrentEpoch(eos.epoch_)) {
-        return TickResult::kContinue;
-    }
-
-    if (eos.epoch_ != active_media_epoch_) {
-        return Fail("VideoSinkNode received a new epoch EOS before StreamReset");
-    }
-
-    // 极端场景：Seek 检索期间直接遭遇流末尾（如 Seek 到视频最后空白处）
-    if (is_searching_for_seek_target_frame_ && !seek_result_frame_delivered_) {
-        if (fallback_frame_before_seek_target_.has_value()) {
-            // 将目标时间前距离最近的最后一帧候选帧兜底交付上屏
-            video_frame_dispatcher_->DeliverFrame(std::make_shared<VideoFrame>(*fallback_frame_before_seek_target_));
-
-            {
-                std::lock_guard<std::mutex> lock(seek_hold_mutex_);
-                is_waiting_for_player_seek_decision_ = true;
-                seek_hold_release_requested_ = false;
+            if (fallback_frame_) {
+                DeliverFrame(std::move(*fallback_frame_));
             }
 
-            is_searching_for_seek_target_frame_ = false;
-            seek_result_frame_delivered_ = true;
-
-            const std::int64_t fallback_pts = fallback_frame_before_seek_target_->pts_us_.value_or(0);
-            LOG_INFO("VideoSinkNode seek hit EOF, using last preroll frame at pts {} us", fallback_pts);
-
-            // 汇报 SeekCompleted，标记 reached_eof 为 true
-            ReportSeekCompleted(active_media_epoch_, fallback_pts, true);
-        } else {
-            // 连一张备用帧都没有就已触底，视为媒体源数据异常
-            is_searching_for_seek_target_frame_ = false;
-            return Fail("Seek reached EOS with no candidate frame to display");
+            ReportReady(actual_position_us, true);
         }
+
+        // 报告视频轨道结束，所有活动轨道结束后通知媒体结束
+        if (timeline_->MarkEnded(PlaybackTrack::kVideo, current_epoch_)) {
+            ReportMediaEnded(end_of_stream->epoch_);
+        }
+
+        return TickResult::kContinue;
     }
 
-    // 标记当前世代 EOS 已消费处理完成，并上报全局 MediaEnded 事件
-    active_epoch_eos_processed_.store(true, std::memory_order_release);
-    LOG_INFO("VideoSinkNode reached end of stream, epoch {}", eos.epoch_);
-    ReportMediaEnded(eos.epoch_);
-
-    return TickResult::kContinue;
-}
-
-/**
- * @brief 外部中断触发钩子：响应停止通知，唤醒处于 Seek Hold 挂起的工作线程
- */
-void VideoSinkNode::OnInterruptBlockingIo() noexcept {
-    LOG_DEBUG("VideoSinkNode interrupting blocking I/O");
-    seek_hold_cv_.notify_all();
+    return Fail("VideoSinkNode received an unknown stream item", input_epoch);
 }
 
 }  // namespace mediacore

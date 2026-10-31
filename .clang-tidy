@@ -17,8 +17,9 @@ Checks: >
   modernize-avoid-c-arrays,
   readability-identifier-naming,
   bugprone-*,
+  -bugprone-easily-swappable-parameters,
   performance-*
-
+  
 WarningsAsErrors: ''
 
 CheckOptions:

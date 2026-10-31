@@ -17,6 +17,7 @@
 #include <mutex>
 #include <optional>
 
+#include "av_sync/playback_timeline.h"
 #include "av_types/packet.h"
 #include "core/inode.h"
 #include "core/iseek_source.h"
@@ -26,42 +27,65 @@
 namespace mediacore {
 
 /**
- * @brief 节点向下游输出的数据载体（Variant 变体类型）
- * @details 在任意时刻仅承载以下三种数据项之一：
- * 1. Packet：包含有效压缩码流数据的视频包；
- * 2. StreamReset：指示下游解码器清空内部残留缓存的重置控制信号；
- * 3. EndOfStream：通知下游全流数据已读取完毕的结束终止信号。
+ * @brief 解复用节点向下游传递的数据类型。
+ *
+ * @details
+ * StreamItem<Packet> 是一个变体类型，同一时刻只保存以下类型中的一种：
+ * - Packet：一份压缩音频包或视频包，具体轨道由 Packet 的 stream_index 区分；
+ * - StreamReset：Seek 成功后发送的控制消息，要求下游清理旧世代的解码状态；
+ * - EndOfStream：当前世代的输入数据已经读完，通知下游结束处理并 drain
  */
 using PacketStreamItem = StreamItem<Packet>;
 
 /**
  * @class FfmpegDemuxerNode
- * @brief 负责从媒体文件读取音视频包并处理定位请求的源节点
+ * @brief 从媒体输入中读取压缩音视频包，并将它们分发到下游解码节点的源节点
  * @details
  * 本节点属于 Source Node，无上游输入端口，只向下游提供数据流输出。
  *
- * 线程模型设计：
- * FFmpeg 底层上下文严禁并发调用。外部控制线程（如 UI 或 Player 控制线程）发起 Seek 时，
- * 仅通过 RequestSeek() 记录参数并向底层发送协作中断信号；实际耗时的跳转操作（ExecuteSeek）
- * 统一委托给本节点专职的工作线程串行处理。
+ * 工作线程模型：
+ * 1. FfmpegDemuxer 的 AVFormatContext 由本节点工作线程独占访问；
+ * 2. 工作线程在 Tick() 中读取一个压缩包，并根据 stream_index 选择输出 Link；
+ * 3. 外部线程调用 RequestSeek() 时，只更新 pending_seek_ 并触发底层 I/O 中断；
+ * 4. 工作线程通过 ProcessPendingControl() 取出最新请求，再串行执行 ExecuteSeek()；
+ * 5. 因此 UI/控制线程不会和工作线程并发调用同一个 FFmpeg 解复用上下文
  */
-class FfmpegDemuxerNode final : public INode<NoPort, PacketStreamItem>, public ISeekSource {
+class FfmpegDemuxerNode final : public INodeBase, public ISeekSource {
 public:
+    // 每条输出 Link 的元素类型都是 PacketStreamItem：Packet / Reset / EOS
+    using OutputLink = Link<PacketStreamItem>;
+    ;
+
     /**
-     * @brief 构造函数：初始化解复用节点并接管已打开的解复用器所有权
+     * @brief 构造解复用源节点，并接管已经打开的 FfmpegDemuxer
      * @param sync 跨节点共享的播放控制与状态同步上下文
      * @param event_callbacks 用于向 Pipeline 控制层汇报错误与状态事件的回调集合
      * @param demuxer 已完成 Open 探测的解复用器实例（所有权转移）
+     * @param timeline 可选的共享播放时间线；双路 Seek 预滚需要它判断音视频终端是否到达目标
      * @throws std::invalid_argument 当 sync 为空、demuxer 为空或缺少必要回调时抛出
      */
     FfmpegDemuxerNode(std::shared_ptr<SyncContext> sync,
                       PipelineEventCallbacks event_callbacks,
-                      std::unique_ptr<FfmpegDemuxer> demuxer);
+                      std::unique_ptr<FfmpegDemuxer> demuxer,
+                      std::shared_ptr<PlaybackTimeline> timeline = {});
 
     /**
-     * @brief 虚析构函数：释放节点资源
+     * @brief 将视频压缩包输出端连接到视频解码器对应的有界 Link
+     * @param output Pipeline 创建的视频 Packet 队列；本节点只保存其 shared_ptr，不负责创建队列
+     * @details 节点只有处于 Start 前可以连接配置
      */
-    ~FfmpegDemuxerNode() override = default;
+    bool ConnectVideoOutput(std::shared_ptr<OutputLink> output);
+
+    /**
+     * @brief  将音频压缩包输出端连接到音频解码器对应的有界 Link
+     * @details 节点只有处于 Start 前可以连接配置
+     */
+    bool ConnectAudioOutput(std::shared_ptr<OutputLink> output);
+
+    /**
+     * @brief 析构节点；成员对象按 RAII 规则释放，底层 Demuxer 由 unique_ptr 管理
+     */
+    ~FfmpegDemuxerNode() override;
 
     // 禁用拷贝与移动，保证节点拓扑所有权唯一
     FfmpegDemuxerNode(const FfmpegDemuxerNode&) = delete;
@@ -70,13 +94,13 @@ public:
     FfmpegDemuxerNode& operator=(FfmpegDemuxerNode&&) = delete;
 
     /**
-     * @brief 获取当前打开媒体的元数据快照
+     * @brief 获取当前媒体的元数据
      * @return 包含时长、编码、流配置等信息的 MediaInfo 引用
      */
     const MediaInfo& GetMediaInfo() const noexcept { return demuxer_->GetMediaInfo(); }
 
     /**
-     * @brief 检查解复用工作线程是否正处于读到流末尾后的挂起阻塞状态
+     * @brief 查询解复用工作线程是否已经在 EOF 处挂起等待
      * @return true 表示解复用线程已消费完全部 Packet 并休眠；收到新 Seek 或 Stop 时复位为 false
      * @note 仅反映数据源是否读完，不代表下游解码与渲染节点已全部消费呈现完毕
      */
@@ -144,15 +168,57 @@ private:
      */
     TickResult ExecuteSeek(PendingSeek request);
 
-    std::unique_ptr<FfmpegDemuxer> demuxer_;  ///< 底层解复用器实例（由本节点工作线程独占调用）
-    std::uint64_t output_epoch_{0};  ///< 当前允许向下游输出的数据流所属世代号；仅在 Seek 成功后更新
-    bool eos_sent_{false};  ///< 当前世代下是否已向下游发送过 EndOfStream 信号
+    /**
+     * @brief 驱动双路 Seek 的预滚、等待就绪和最终重读校验流程
+     * @details
+     * 当视频、音频两个输出分支同时存在时，单个 Demuxer 读取游标会带来一个问题：
+     * 如果视频解码器已经到达目标并停止消费，而 Demuxer 继续读取音频/视频交错数据，视频队列可能会被填满
+     * 进而阻塞 Demuxer，导致音频分支无法继续获取需要的数据
+     */
+    TickResult TickSeekPreroll();
 
-    mutable std::mutex control_mutex_;  ///< 保护 pending_seek_ 并发读写的互斥锁
-    std::optional<PendingSeek> pending_seek_;  ///< 待执行的最新 Seek 请求（覆盖更新，连续 Seek 仅保留最新一条）
+    /**
+     * @brief 在同一轮双路 Seek 的阶段切换时，把 Demuxer 读取位置重新定位到目标附近
+     * @details
+     * 这是一次 Seek 流程内部的重定位，不是新的用户 Seek
+     * 不生成新的 Seek、不重新向下游发送 StreamReset、不清空已经送入解码器的状态、只重置底层读取位置
+     * @return
+     * kContinue：可以继续下一轮处理，或由更新的请求接管
+     * kStopped：被 Stop 中断；kError：本轮内部重定位失败
+     */
+    TickResult RestartSeekPass();
 
-    std::atomic<bool> eof_parked_{false};  ///< 工作线程当前是否休眠在 WaitAtEof() 中的状态标志
-    std::condition_variable eof_cv_;  ///< 用于在出现新 Seek 或停止请求时唤醒挂起线程的条件变量
+    struct SeekPreroll;
+
+    std::unique_ptr<FfmpegDemuxer> demuxer_;  ///< 底层 FFmpeg 解复用器
+
+    std::shared_ptr<PlaybackTimeline> timeline_;  ///< 与音视频终端共享的播放时间线状态
+
+    std::unique_ptr<SeekPreroll> seek_preroll_;
+    ///< 双路 Seek 的临时状态对象:保存当前预滚阶段、每条轨道已交付包的摘要、
+    ///< 最终重读的校验进度，以及因下游队列暂时满而保留的至多一个待发送项
+
+    std::shared_ptr<OutputLink> video_output_;  ///< 视频压缩包输出队列
+
+    std::shared_ptr<OutputLink> audio_output_;  ///< 音频压缩包输出队列
+
+    // -------------------- 数据世代与 EOF 状态 --------------------
+    std::uint64_t output_epoch_{0};  ///< 当前节点允许向下游发送的数据所属世代号
+
+    bool eos_sent_{false};  ///< 当前 output_epoch_ 是否已经向所有存在的输出分支发送过 EndOfStream
+
+    // -------------------- 外部控制请求 --------------------
+    mutable std::mutex control_mutex_;
+    ///< 保护 pending_seek_ 的互斥锁，也用于协调“登记新 Seek”与“建立下一次 I/O 中断基准”
+
+    std::optional<PendingSeek> pending_seek_;  ///< 尚未由工作线程取走的 Seek 请求槽
+
+    // -------------------- EOF 等待 --------------------
+    std::atomic<bool> eof_parked_{false};
+    ///< 工作线程是否已经进入 WaitAtEof() 等待状态，供外部只读查询
+
+    std::condition_variable eof_cv_;
+    ///< EOF 等待条件变量。RequestSeek() 和停止钩子会通知它，唤醒挂起的工作线程
 };
 
 }  // namespace mediacore

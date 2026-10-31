@@ -60,7 +60,7 @@ struct SeekCompleted final {
 /**
  * @struct PipelineEventCallbacks
  * @brief 注入给拓扑中各 Node 的统一事件回调出口集合
- * @note 回调函数在 Node 的工作线程内部被同步调用，必须实现为非阻塞的无挂起操作。
+ * @note 回调函数在 Node 的工作线程内部被同步调用，必须实现为非阻塞的无挂起操作
  */
 struct PipelineEventCallbacks final {
     using MediaEndedCallback = std::function<void(MediaEnded)>;

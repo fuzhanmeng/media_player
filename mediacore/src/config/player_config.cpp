@@ -1,11 +1,11 @@
 /**
  * @file player_config.cpp
- * @brief PlayerConfig 默认值构建与参数合法性校验实现
+ * @brief PlayerConfig 的默认构造入口和配置校验实现
  * @details
  * 本文件职责严格限定于配置层：
  * 1. 提供工厂方法返回合法的默认播放器配置；
  * 2. 检查配置项是否满足管线启动的最小自洽闭环条件；
- * 3. 不依赖具体的 I/O 文件读取，不解析命令行，不引入任何 Qt 或 FFmpeg 依赖。
+ * 3. 不依赖具体的 I/O 文件读取，不解析命令行，不引入任何 Qt 或 FFmpeg 依赖
  */
 
 #include "mediacore/player_config.h"
@@ -17,35 +17,121 @@ namespace mediacore {
 
 namespace {
 
+/// 与 IAudioSink 实现约定的最小/最大硬件缓冲时长（毫秒）
+constexpr int kMinDeviceBufferMs = 5;
+constexpr int kMaxBufferMs = 2000;
+
+/// PCM 解码块时长上限：解码器每块最多 240 帧，即 48 kHz 下的 5ms
+constexpr int kMaxPcmBlockDurationMs = 5;
+constexpr int kInFlightPcmBlockCount = 2;
+
 /**
- * @brief 校验队列容量必须大于 0
- * @param value 待校验的队列容量值
- * @param name 配置项路径名称（用于构造错误提示信息）
- * @return 校验结果；若 value 为 0 则返回错误原因
- * @details
- * name 来源于固定字符串常量，因此使用 const char* 接收，零动态分配开销；
- * 仅在校验失败分支构造 std::string 描述文本。
+ * @brief 检查队列容量是否大于零
+ * @param capacity 队列允许容纳的元素数量
+ * @param config_name 用于错误信息的配置字段名称
+ * @return 容量非零时校验通过，否则返回错误原因
  */
-ConfigValidationResult ValidatePositiveCapacity(std::size_t value, const char* name) {
-    if (value == 0) {
-        return {false, std::string(name) + " must be greater than zero"};
+ConfigValidationResult ValidatePositiveCapacity(std::size_t capacity, const char* config_name) {
+    if (capacity == 0) {
+        return {false, std::string(config_name) + " must be greater than zero"};
     }
+
     return {true, {}};
 }
 
 /**
- * @brief 校验毫秒级时间跨度必须大于 0
- * @param value 待校验的时间长度（单位：毫秒）
- * @param name 配置项路径名称（用于构造错误提示信息）
- * @return 校验结果；若 value <= 0 则返回错误原因
- * @details
- * 毫秒参数选用有符号 int 接收，目的是在校验阶段能精准拦截负数配置；
- * 若使用无符号类型接收，负数（如 -1）会被隐式类型转换为极大的正整数，导致校验失效。
+ * @brief 校验以毫秒表示的时长是否大于零
+ * @param duration_ms 时长，单位为毫秒
+ * @param config_name 用于描述错误信息的配置字段名称
+ * @return 时长大于零时校验通过，否则返回错误原因
  */
-ConfigValidationResult ValidatePositiveDuration(int value, const char* name) {
-    if (value <= 0) {
-        return {false, std::string(name) + " must be greater than zero"};
+ConfigValidationResult ValidatePositiveMilliseconds(int duration_ms, const char* config_name) {
+    if (duration_ms <= 0) {
+        return {false, std::string(config_name) + " must be greater than zero"};
     }
+
+    return {true, {}};
+}
+
+/**
+ * @brief 检验音频缓存预算是否合理
+ * @param audio 音频设备 buffer 的请求值和总预算配置
+ * @param audio_pcm_block_capacity 解码后音频队列可容纳的 PCM 块数量
+ * @return 配置合理时通过校验，否则返回首个不满足的约束
+ * @details
+ * 此处估算的预算由三部分组成：
+ *   1. 解码队列：每个 PCM 块按最多 kMaxPcmBlockDurationMs 毫秒估算；
+ *   2. 在途数据：按两个 PCM 块估算；
+ *   3. 设备端：使用 device_buffer_ms_ 作为请求的 PCM buffer 时长
+ *
+ * 要求三部分之和不超过 max_buffer_ms_
+ */
+ConfigValidationResult ValidateAudioBufferBudget(const AudioConfig& audio, std::size_t audio_pcm_block_capacity) {
+    ConfigValidationResult result = ValidatePositiveMilliseconds(audio.device_buffer_ms_, "audio.device_buffer_ms");
+
+    if (!result.ok_) {
+        return result;
+    }
+
+    if (audio.device_buffer_ms_ < kMinDeviceBufferMs || audio.device_buffer_ms_ > kMaxBufferMs) {
+        return {false, "audio.device_buffer_ms must be within [5,2000]"};
+    }
+
+    result = ValidatePositiveMilliseconds(audio.max_buffer_ms_, "audio.max_buffer_ms");
+
+    if (!result.ok_) {
+        return result;
+    }
+
+    if (audio.max_buffer_ms_ > kMaxBufferMs) {
+        return {false, "audio.max_buffer_ms must not exceed 2000"};
+    }
+
+    if (audio.max_buffer_ms_ < audio.device_buffer_ms_) {
+        return {false, "audio.max_buffer_ms must be greater than or equal to audio.device_buffer_ms"};
+    }
+
+    constexpr int kInFlightMs = kInFlightPcmBlockCount * kMaxPcmBlockDurationMs;
+
+    const int budget_after_device_ms = audio.max_buffer_ms_ - audio.device_buffer_ms_;
+    if (budget_after_device_ms < kInFlightMs) {
+        return {false, "audio.max_buffer_ms must cover the device buffer and two kInFlightMs PCM block"};
+    }
+
+    const int budget_for_queue_ms = budget_after_device_ms - kInFlightMs;
+    const auto max_pcm_blocks = static_cast<std::size_t>(budget_for_queue_ms / kMaxPcmBlockDurationMs);
+
+    if (audio_pcm_block_capacity > max_pcm_blocks) {
+        return {false,
+                "audio PCM queue + two in-flight PCM blocks + requested device buffer "
+                "must not exceed audio.max_buffer_ms"};
+    }
+
+    return {true, {}};
+}
+
+/**
+ * @brief 校验音画同步以及 Seek 相关参数
+ * @param sync 音画同步配置
+ * @return 参数符合校验时通过检查，否则返回首个错误原因
+ */
+ConfigValidationResult ValidateSyncConfig(const SyncConfig& sync) {
+    if (sync.late_drop_us_ <= 0) {
+        return {false, "sync.late_drop_us must be greater than zero"};
+    }
+
+    if (sync.reanchor_timeout_.count() <= 0) {
+        return {false, "sync.reanchor_timeout must be greater than zero"};
+    }
+
+    if (sync.seek_timeout_.count() <= 0) {
+        return {false, "sync.seek_timeout must be greater than zero"};
+    }
+
+    if (sync.seek_timeout_ <= sync.reanchor_timeout_) {
+        return {false, "sync.seek_timeout must be greater than sync.reanchor_timeout"};
+    }
+
     return {true, {}};
 }
 
@@ -61,6 +147,15 @@ PlayerConfig PlayerConfig::Default() {
 }
 
 /**
+ * @brief 校验与媒体轨道无关的公共配置，供尚未打开媒体的 Player 构造阶段使用。
+ * @return 同步与 Seek 参数合法时 ok_ 为 true；否则返回首个错误原因。
+ * @details 轨道确认后仍须调用 ValidateForTracks()，避免无关的轨道配置阻止纯音频或纯视频播放。
+ */
+ConfigValidationResult PlayerConfig::ValidateCommon() const {
+    return ValidateSyncConfig(sync_);
+}
+
+/**
  * @brief 检查播放器配置是否满足当前阶段的最小闭环要求
  * @details
  * 校验顺序遵循数据流由前至后的正向管线拓扑：
@@ -73,60 +168,96 @@ PlayerConfig PlayerConfig::Default() {
  * @return 校验成功返回 ok_ 为 true 的结果；失败返回首个错误原因
  */
 ConfigValidationResult PlayerConfig::Validate() const {
-    // 1. 解封装阶段视频压缩包队列容量校验
-    // 解封装阶段会为视频压缩包创建有界 Link 队列。
-    // 容量为 0 时，Demuxer 读取的 Packet 无处缓冲，下游 Link/ThreadSafeQueue 构造也会直接抛出异常。
-    ConfigValidationResult result =
-        ValidatePositiveCapacity(demux_.video_packet_capacity_, "demux.video_packet_capacity");
+    ConfigValidationResult result;
+
+    // 1. 校验解封装阶段的压缩包队列容量
+    result = ValidatePositiveCapacity(demux_.video_packet_capacity_, "demux.video_packet_capacity");
     if (!result.ok_) {
         return result;
     }
 
-    // 2. 解封装阶段音频压缩包队列容量校验
-    // 与视频包队列一致，必须保证至少能容纳一个压缩包。
-    // Demuxer 解析出音频流数据包时需送入该队列，不可为 0。
     result = ValidatePositiveCapacity(demux_.audio_packet_capacity_, "demux.audio_packet_capacity");
     if (!result.ok_) {
         return result;
     }
 
-    // 3. 视频原始帧队列容量校验
-    // 视频帧队列用于缓存解码后的原始未压缩图像数据（VideoFrame）。
-    // 若容量为 0，视频解码器无法完成向渲染节点或同步模块的帧投递。
+    // 2. 校验解码后的数据队列容量
     result = ValidatePositiveCapacity(decode_.video_frame_capacity_, "decode.video_frame_capacity");
     if (!result.ok_) {
         return result;
     }
 
-    // 4. 音频原始帧队列容量校验
-    // 音频帧队列用于存储解码后的原始 PCM 音频帧。
-    // 该容量将直接作为底层 Link/ThreadSafeQueue 的上限，必须大于 0。
+    // audio_frame_capacity_ 的单位是 PCM 块数量，不是单块内的采样帧数量
     result = ValidatePositiveCapacity(decode_.audio_frame_capacity_, "decode.audio_frame_capacity");
     if (!result.ok_) {
         return result;
     }
 
-    // 5. 音频底层设备硬件缓冲时长校验
-    // 表示声卡/操作系统底层音频后端自身持有的固有环形缓冲时长。
-    // 值为 0 或负数在物理实现上无效，会导致音频设备打开初始化失败。
-    result = ValidatePositiveDuration(audio_.device_buffer_ms_, "audio.device_buffer_ms");
+    // 3. 检查解码队列、在途块与设备 buffer 组合后的音频缓存预算
+    result = ValidateAudioBufferBudget(audio_, decode_.audio_frame_capacity_);
     if (!result.ok_) {
         return result;
     }
 
-    // 6. 音频总缓冲上限时长校验
-    // 表示“管线内部软件队列 + 底层音频硬件”总计允许积压的最大音频时长。
-    // 该值过小容易因调度抖动产生欠载破音，过大则会导致 Seek 或 Pause 时旧声音残留延迟明显。
-    result = ValidatePositiveDuration(audio_.max_buffer_ms_, "audio.max_buffer_ms");
+    // 4. 校验音画同步和 Seek 相关参数
+    return ValidateCommon();
+}
+
+/**
+ * @brief 根据媒体实际包含的音视频轨道，校验播放器配置
+ * @param has_video 是否包含视频轨道
+ * @param has_audio 是否包含音频轨道
+ * @return true 表示校验通过，false 表示校验失败
+ * @details
+ * 本函数只负责校验配置，不负责解析媒体文件或检测音视频轨道
+ */
+ConfigValidationResult PlayerConfig::ValidateForTracks(bool has_video, bool has_audio) const {
+    // 1. 检查媒体是否至少包含了一条轨道
+    if (!has_audio && !has_video) {
+        return {false, "media has neither a video nor an audio stream"};
+    }
+
+    // 2. 检验播放器的公共同步配置：无论是纯音频/视频还是混合媒体，都执行此检查
+    ConfigValidationResult result = ValidateCommon();
     if (!result.ok_) {
         return result;
     }
 
-    // 7. 音频参数自洽性校验
-    // 总缓存上限必须大于或等于底层设备固有硬件缓冲。
-    // 若设备硬件本身需缓存 200ms，而管线总上限限制在 100ms，参数构成逻辑冲突，拒绝通过。
-    if (audio_.max_buffer_ms_ < audio_.device_buffer_ms_) {
-        return {false, "audio.max_buffer_ms must be greater than or equal to audio.device_buffer_ms"};
+    // 3. 如果媒体包含视频轨道，校验视频相关配置
+    if (has_video) {
+        // 视频压缩包队列容量必须 > 0
+        result = ValidatePositiveCapacity(demux_.video_packet_capacity_, "demux.video_packet_capacity");
+
+        if (!result.ok_) {
+            return result;
+        }
+
+        // 视频解码帧队列容量必须 > 0
+        result = ValidatePositiveCapacity(decode_.video_frame_capacity_, "decode.video_frame_capacity");
+
+        if (!result.ok_) {
+            return result;
+        }
+    }
+
+    // 4. 如果媒体包含音频轨道，校验音频相关配置
+    if (has_audio) {
+        // 音频压缩包队列容量必须 > 0
+        result = ValidatePositiveCapacity(demux_.audio_packet_capacity_, "demux.audio_packet_capacity");
+
+        if (!result.ok_) {
+            return result;
+        }
+
+        // 音频解码队列容量必须 > 0, 这里的容量表示 PCM 块的数量， 不是 PCM 块中采样帧的数量
+        result = ValidatePositiveCapacity(decode_.audio_frame_capacity_, "decode.audio_frame_capacity");
+
+        if (!result.ok_) {
+            return result;
+        }
+
+        // 检测音频设备缓冲时长、总缓冲预算以及解码队列之间的约束
+        return ValidateAudioBufferBudget(audio_, decode_.audio_frame_capacity_);
     }
 
     return {true, {}};

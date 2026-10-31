@@ -3,23 +3,32 @@
 # ============ 收集源文件 ============
 # 显式列出而非 GLOB：CMake 官方建议——GLOB 在增删文件时不会自动触发重新配置，易踩坑
 set(MEDIACORE_SOURCES
-    src/core/player_factory.cpp
+    src/audio_decoder/alsa_audio_sink.cpp
+    src/audio_decoder/ffmpeg_audio_decoder.cpp
+    src/audio_decoder/ffmpeg_audio_decoder_node.cpp
+    src/av_sync/av_sync_node.cpp 
+    src/av_types/audio_codec_parameters.cpp
     src/av_types/packet.cpp
-    src/utils/logger.cpp
+    src/av_types/video_codec_parameters.cpp
     src/config/player_config.cpp
     src/core/media_error.cpp
-    src/demux/ffmpeg_demuxer.cpp
-    src/demux/ffmpeg_demuxer_node.cpp
-    src/video_decoder/ffmpeg_video_decoder.cpp
-    src/video_decoder/ffmpeg_video_decoder_node.cpp
-    src/av_types/video_codec_parameters.cpp
+    src/core/player_factory.cpp
     src/core/player.cpp
+    src/demux/ffmpeg_demuxer_node.cpp
+    src/demux/ffmpeg_demuxer.cpp
+    src/sink/audio_sink_node.cpp
     src/sink/video_sink_node.cpp
-    src/av_types/audio_codec_parameters.cpp
+    src/utils/logger.cpp 
+    src/video_decoder/ffmpeg_video_decoder_node.cpp
+    src/video_decoder/ffmpeg_video_decoder.cpp
 )
 
 # ============ 定义静态库 ============
 add_library(mediacore STATIC ${MEDIACORE_SOURCES})
+
+# ALSA is used by the concrete audio sink. Because mediacore is a static
+# library, the dependency must propagate to executables that link the library.
+find_library(MEDIACORE_ASOUND_LIBRARY asound REQUIRED)
 
 # ============ 头文件搜索路径 ============
 # PUBLIC：app 层可见，随依赖传播（仅 include/mediacore/ 下的契约与跨边界 DTO）
@@ -48,4 +57,5 @@ target_link_libraries(mediacore PUBLIC
     ffmpeg::swscale    # 视频解码后的像素格式转换
     spdlog::spdlog    # LOG_* 宏和 logger 实现都依赖 spdlog
     ffmpeg::avformat  # ffmpeg 解复用
+    ${MEDIACORE_ASOUND_LIBRARY}
 )

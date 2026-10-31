@@ -34,7 +34,7 @@
 #include "core/pipeline_event.h"
 #include "core/sync_context.h"
 #include "mediacore/logger.h"
-
+#include "core/worker_thread_context.h"
 namespace mediacore {
 
 class Pipeline;
@@ -329,6 +329,11 @@ protected:
     virtual void OnInterruptBlockingIo() noexcept {}
 
     /**
+     * @brief 工作线程退出前清理线程独占 I/O，不能把 ALSA drop 延迟到所有其他节点 Join 之后
+     */
+    virtual void OnThreadExit() noexcept {}
+
+    /**
      * @brief 判定当前是否仍允许配置端口（仅 kCreated 状态允许）
      */
     bool CanConfigure() const noexcept { return GetState() == NodeState::kCreated; }
@@ -571,6 +576,8 @@ private:
      * @brief 工作线程的主事件循环
      */
     void ThreadMain() noexcept {
+        // 用户设备/显示回调也在节点线程执行，必须覆盖退出回调和错误上报的整个调用栈。
+        WorkerThreadContext::Scope worker_scope;
         NodeFinishReason reason = NodeFinishReason::kNotFinished;
 
         try {
@@ -702,6 +709,13 @@ protected:
     std::optional<InT> ReceiveInput() { return input_ ? input_->Receive() : std::nullopt; }
 
     /**
+     * @brief 超时返回空，调用者检查 Stop，不能把超时当成 EOS
+     */
+    std::optional<InT> ReceiveInputFor(std::chrono::milliseconds timeout) {
+        return input_ ? input_->ReceiveFor(timeout) : std::nullopt;
+    }
+
+    /**
      * @brief 向下游 Link 阻塞发送数据
      */
     bool SendOutput(OutT item) { return output_ && output_->Send(std::move(item)); }
@@ -770,6 +784,11 @@ public:
 
 protected:
     std::optional<InT> ReceiveInput() { return input_ ? input_->Receive() : std::nullopt; }
+
+    /** @brief 超时返回空，让设备控制与采样时钟有机会运行。 */
+    std::optional<InT> ReceiveInputFor(std::chrono::milliseconds timeout) {
+        return input_ ? input_->ReceiveFor(timeout) : std::nullopt;
+    }
 
 private:
     std::shared_ptr<InputLink> input_;

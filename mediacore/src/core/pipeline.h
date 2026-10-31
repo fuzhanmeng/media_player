@@ -453,6 +453,9 @@ public:
      */
     std::uint64_t GetCurrentEpoch() const noexcept { return sync_ctx_->GetEpoch(); }
 
+    /** @brief 判断是否已注册可接收 Seek 请求的源节点；不判断媒体本身是否可定位。 */
+    bool CanSeek() const noexcept { return seek_source_ != nullptr; }
+
     /**
      * @brief 获取共享同步上下文的只读视图
      */
@@ -511,8 +514,8 @@ private:
         }
     }
 
-    std::shared_ptr<SyncContext> sync_ctx_;  ///< 全拓扑共享的同步与世代上下文
-    PipelineEventCallbacks event_callbacks_;  ///< 对外汇报的事件回调集合
+    std::shared_ptr<SyncContext> sync_ctx_;  ///< 全局同步上下文
+    PipelineEventCallbacks event_callbacks_;  ///< Pipeline 回调函数
     ISeekSource* seek_source_{nullptr};  ///< 负责响应 Seek 的源节点（非拥有弱引用）
     ISeekHoldReleasable* hold_releasable_{nullptr};  ///< 负责响应 Seek Hold 解除的节点（非拥有弱引用）
     NodeThreadFactory thread_factory_;  ///< 工作线程创建工厂

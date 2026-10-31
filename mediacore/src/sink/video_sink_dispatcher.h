@@ -48,6 +48,22 @@ public:
      */
     ~VideoSinkDispatcher() = default;
 
+
+    /**
+     * @brief 永久关闭后续帧投递，不等待已经登记的在途回调。
+     * @details 回调内销毁 Player 时不能等待当前回调本身退出，因此关闭入口与等待退出
+     *          分开处理。Close 返回不代表在途回调已结束，也不能据此立即销毁外部 Sink。
+     *          正常销毁仍需停止并 Join 节点，或通过 Detach 等待在途回调结束。
+     */
+    void Close() noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        closed_ = true;
+        sink_ = nullptr;
+    }
+
+    /** @brief 查询当前线程是否正执行本分发器的显示回调，不等待任何工作线程。 */
+    bool IsInCallback() const noexcept { return DeliveryCallbackScope::Contains(this); }
+
     // 禁用拷贝与移动，保证互斥锁与回调追踪容器生命周期唯一
     VideoSinkDispatcher(const VideoSinkDispatcher&) = delete;
     VideoSinkDispatcher& operator=(const VideoSinkDispatcher&) = delete;
@@ -227,6 +243,7 @@ private:
     std::mutex mutex_;  ///< 保护 sink_ 与 in_flight_callbacks_ 的互斥锁
     std::condition_variable in_flight_cv_;  ///< 在途回调计数归零通知条件变量
     IVideoSink* sink_{nullptr};  ///< 当前绑定的外部目标显示端（弱引用指针）
+    bool closed_{false};  ///< 由 mutex_ 保护；永久关闭后 Attach 不得重新启用投递。
     std::unordered_map<IVideoSink*, std::size_t>
         in_flight_callbacks_;  ///< 各 Sink 实例当前正在执行回调的并发计数追踪表
 };

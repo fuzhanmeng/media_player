@@ -17,6 +17,7 @@
 #include <optional>
 #include <string>
 
+#include "av_types/audio_codec_parameters.h"
 #include "av_types/packet.h"
 #include "av_types/video_codec_parameters.h"
 #include "mediacore/av_types/stream_info.h"
@@ -130,7 +131,7 @@ struct FfmpegReadResult final {
  * @brief FfmpegDemuxer::Seek() 调用的执行状态
  */
 enum class FfmpegSeekStatus : std::uint8_t {
-    kSucceeded,  ///< 底层跳转成功，已定位到关键帧并冲刷解复用缓冲区
+    kSucceeded,  ///< libavformat 接受定位请求并移动了读取位置；不代表已精确命中目标帧
     kSeekInterrupted,  ///< 本次跳转因更晚到来的新 Seek 打断
     kStopInterrupted,  ///< 本次跳转因 Stop 请求打断
     kError,  ///< 跳转发生底层错误，详情见 error_
@@ -169,7 +170,8 @@ class FfmpegDemuxer;
  */
 struct FfmpegDemuxerOpenResult final {
     std::unique_ptr<FfmpegDemuxer> demuxer_{};  ///< 成功创建的解复用器对象独占所有权
-    VideoCodecParameters video_codec_parameters_{};  ///< 用于配置视频解码器的参数元数据
+    VideoCodecParameters video_codec_parameters_{};  ///< 视频参数
+    AudioCodecParameters audio_codec_parameters_{};  ///< 音频参数
     MediaError error_{};  ///< 失败时的详细错误信息
 };
 
@@ -241,20 +243,41 @@ public:
      */
     int GetVideoStreamIndex() const noexcept { return video_stream_index_; }
 
+    /** @brief 获取所选音频流索引，无音频时返回 -1；只读接口。 */
+    int GetAudioStreamIndex() const noexcept { return audio_stream_index_; }
+
+    /**
+     * @brief 仅在容器明确声明不可定位时拒绝 Seek，未知能力仍交由 FFmpeg 尝试。
+     * @details MediaInfo::can_seek_ 只识别普通可定位 AVIO，不能代表 HLS/RTSP 等格式的自有
+     *          read_seek 能力。FFmpeg 8 的公开接口不暴露该回调，因此不能据此误拒未知输入。
+     */
+    bool CanAttemptSeek() const noexcept;
+
 private:
     /**
-     * @brief 私有构造函数，由 Open() 验证成功后通过 std::make_unique 创建
+     * @struct SelectedStreamIndices
+     * @brief 保存本次 Demuxer 实际使用的主视频流和主音频流索引
+     * @details
+     * 把两个同为 int 的索引放进带字段名的对象，避免构造函数调用处把音视频索引传反缺少对应轨道时索引为 -1
+     */
+    struct SelectedStreamIndices final {
+        int video_stream_index_{-1};
+        int audio_stream_index_{-1};
+    };
+
+    /**
+     * @brief 私有构造函数，由 Open() 验证成功后创建并接管 AVFormatContext 所有权
      * @param av_format_ctx 已成功打开的 FFmpeg 输入上下文句柄
      * @param media_info 解析提取出的媒体元数据
-     * @param video_stream_index 目标视频流对应的索引
+     * @param stream_indices 本次选中的音视频流索引；缺少对应轨道时为 -1
      * @param interrupt 共享中断控制句柄
-     * @param timeline_origin_ts 零时间轴对应的流原始基准时间戳（按 video_stream->time_base 换算）
+     * @param timeline_origin_us 选中音视频流共享的原始时间原点（微秒）
      */
     FfmpegDemuxer(AVFormatContext* av_format_ctx,
                   MediaInfo media_info,
-                  int video_stream_index,
+                  SelectedStreamIndices stream_indices,
                   DemuxerInterruptHandle interrupt,
-                  std::int64_t timeline_origin_ts) noexcept;
+                  std::int64_t timeline_origin_us) noexcept;
 
     /**
      * @brief 注册给 FFmpeg AVIOInterruptCB 的底层 C 语言回调函数
@@ -266,16 +289,17 @@ private:
     AVFormatContext* av_format_ctx_{nullptr};  ///< 拥有的 FFmpeg 输入上下文
     MediaInfo media_info_{};  ///< 媒体流元信息缓存
     int video_stream_index_{-1};  ///< 目标视频流索引
+    int audio_stream_index_{-1};  ///< 目标音频流索引
     DemuxerInterruptHandle interrupt_{};  ///< 中断控制句柄
 
     /**
-     * @brief 播放器零时刻在底层视频流原始时间轴中的基准偏移
+     * @brief 播放器零时刻在容器原始时间轴中的基准偏移
      * @details
-     * 单位为目标流的 time_base 刻度（Tick）。
+     * 单位为微秒，每个包按所属流的 time_base 换算后相减。
      * 当媒体存在非零 start_time（如推流、TS 分段）时，用于校准消除播放起始时间偏移：
-     * $PTS_{playback} = PTS_{raw} - timeline\_origin\_ts$。
+     * 不能用每条流自己的第一帧归零，否则会破坏源文件的音视频时间偏移。
      */
-    std::int64_t timeline_origin_ts_{0};
+    std::int64_t timeline_origin_us_{0};
 
     bool eof_reached_{false};  ///< 是否已读到流末尾；成功 Seek 后会被重置为 false
 };
