@@ -42,7 +42,7 @@ constexpr const char* kModuleName = "audio_sink_node";
  * @param audio_output IAudioSink 用于和 ALSA 交互的播放后端
  * @param max_audio_buffer_ms 已经被后端接受但是还未播放的数据时长预算，单位毫秒
  * @throw std::invalid_argument 参数为空或缓冲预算超出[5,2000)
- */ 
+ */
 AudioSinkNode::AudioSinkNode(std::shared_ptr<SyncContext> sync_ctx,
                              PipelineEventCallbacks evrnt_callbacks,
                              std::shared_ptr<PlaybackTimeline> timeline,
@@ -60,7 +60,7 @@ AudioSinkNode::AudioSinkNode(std::shared_ptr<SyncContext> sync_ctx,
     }
 
     // 以构造时刻的时间轴状态作为起点：之后只有版本号变化才会触发 Seek 清理
-    const auto state = timeline->Get();
+    const auto state = timeline_->Get();
     active_epoch_ = latest_epoch_ = state.epoch_;
     applied_version_ = state.state_version_;
     next_frame_ = TargetSample(state.seek_target_us_);
@@ -220,10 +220,8 @@ void AudioSinkNode::ReportReady(std::int64_t target_pts_us, bool eof) {
     seek_ready_ = true;
     const auto result = timeline_->MarkReady(PlaybackTrack::kAudio, active_epoch_, target_pts_us, eof);
 
-    LOG_DEBUG("Audio sink reported seek readiness at epoch {}, position {} us, EOF {}",
-              active_epoch_,
-              target_pts_us,
-              eof);
+    LOG_DEBUG(
+        "Audio sink reported seek readiness at epoch {}, position {} us, EOF {}", active_epoch_, target_pts_us, eof);
 
     if (result) {
         LOG_INFO("All tracks ready after seek at epoch {}, position {} us, all tracks at EOF {}",
@@ -280,7 +278,11 @@ std::size_t AudioSinkNode::SubmitFrames(const std::int16_t* samples, std::size_t
         throw std::runtime_error("AduioSinkNode: device reported writing more samples than requested");
     }
     next_frame_ += static_cast<std::int64_t>(written);
-    clock_ready_ = clock_ready_ != (written != 0);
+
+    if (written != 0) {
+        clock_ready_ = true;
+    }
+
     return written;
 }
 
@@ -297,7 +299,8 @@ void AudioSinkNode::ProcessFrame(const PlaybackTimeline::Snapshot& state) {
 
     // 1. 数据合法性校验：确保为成对的立体声采样点、单包未超限，且时间戳未溢出
     if (frame.samples_.size() % PcmFrame::kChannels != 0 || count > kMaxFramesPerBlock) {
-        throw std::runtime_error("AudioSinkNode: PCM must be stereo chunks of at most 240 frames");
+        throw std::runtime_error("AudioSinkNode: invalid PCM block: frames=" + std::to_string(count) +
+                                 ", max=240, samples=" + std::to_string(frame.samples_.size()));
     }
 
     const auto frame_count = static_cast<std::int64_t>(count);

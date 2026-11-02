@@ -242,12 +242,12 @@ struct FfmpegAudioDecoder::Impl final {
     bool Emit(const std::int16_t* samples, int count, std::uint64_t epoch, const Output& output) {
         // 1. 循环拆分
         for (int offset = 0; offset < count;) {
-            const int frames = std::min(kMaxInputFrameSamples, count - offset);
+            // 每块输出最多包含的采样帧数 kMaxOutputFrames = 240
+            const int frames = std::min(FfmpegAudioDecoder::kMaxOutputFrames, count - offset);
 
-            if (next_output_sample_ > std::numeric_limits<std::int64_t>::max() - offset) {
-                ThrowFfmpeg("audio output timesample overflow", AVERROR(EAGAIN));
+            if (next_output_sample_ > std::numeric_limits<std::int64_t>::max() - frames) {
+                ThrowFfmpeg("audio output timestamp overflow", AVERROR(ERANGE));
             }
-
             PcmFrame chunk;
             chunk.epoch_ = epoch;
             chunk.start_sample_ = next_output_sample_;

@@ -169,7 +169,7 @@ private:
 
 private:
     /// 上游解码器一次最多交付的采样帧数（5 ms @ 48 kHz）；校验和补静音缓冲区共用。
-    static constexpr std::size_t kMaxFramesPerBlock = 240;
+    static constexpr std::size_t kMaxFramesPerBlock = PcmFrame::kMaxBlockFrames;
 
     std::shared_ptr<PlaybackTimeline> timeline_;  ///< 音频、视频和播放控制共同使用的时间轴
     std::unique_ptr<IAudioSink> sink_;  ///< 实际接收并播放 PCM 的音频设备接口

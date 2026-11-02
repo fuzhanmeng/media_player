@@ -657,8 +657,9 @@ void Player::Control::ControlLoop() noexcept {
                 std::unique_lock<std::mutex> lock(mailbox_mutex_);
                 auto next_wakeup_time = std::chrono::steady_clock::now() + std::chrono::milliseconds(25);
                 const bool seeking = GetState() == PlaybackState::kSeeking;
-                if (seeking)
+                if (seeking) {
                     next_wakeup_time = std::min(next_wakeup_time, seek_deadline_);
+                }
 
                 // 无论当前是否 Seeking 都要等待和取出邮箱消息。旧实现把整个出队逻辑放在
                 // `if (seeking)` 内，导致 Idle/Opening/Playing 状态永远不消费 Open/Play/Stop。
@@ -739,15 +740,18 @@ void Player::Control::ControlLoop() noexcept {
             HandleStop();
             play_after_open_ = resume_after_seek_ = false;
             SetState(PlaybackState::kError);
-            if (shutting_down_.load(std::memory_order_acquire))
+            if (shutting_down_.load(std::memory_order_acquire)) {
                 break;
+            }
+
         } catch (...) {
             LOG_ERROR("Player control exception: unknown exception");
             HandleStop();
             play_after_open_ = resume_after_seek_ = false;
             SetState(PlaybackState::kError);
-            if (shutting_down_.load(std::memory_order_acquire))
+            if (shutting_down_.load(std::memory_order_acquire)) {
                 break;
+            }
         }
     }
 }
@@ -982,7 +986,7 @@ bool Player::Control::BuildPipeline(FfmpegDemuxerOpenResult open_result) {
         auto decoded_audio_frame_link =
             new_pipeline->CreateLink<StreamItem<PcmFrame>>(config_.decode_.audio_frame_capacity_);
 
-        // 打开视频解码器
+        // 打开音频解码器
         auto audio_decoder_open_result = FfmpegAudioDecoder::Open(std::move(open_result.audio_codec_parameters_),
                                                                   media_info.audio_stream_->time_base_);
 
@@ -1225,15 +1229,19 @@ bool Player::Control::StartSeek(std::int64_t target_position_us, bool should_res
         target_position_us = std::min(target_position_us, media_duration_us);
     }
 
-    // 4. 时间轴切换新的 epoch，再由 Pipeline 请求 Demuxer 定位
+    // 4. 先生成新 epoch 并同步给时间轴，再由 Pipeline 请求 Demuxer 定位
+    //    不能在 Seek 前读取 GetCurrentEpoch()：该值还是上一轮，Seek 内部才会递增
+    //    也不能等 Seek 返回再更新时间轴：Demuxer 可能已经发出了新 epoch 的 Reset
     resume_after_seek_ = should_resume_after_seek;
-    LoadTimeline()->BeginSeek(pipeline_->GetCurrentEpoch(), target_position_us);
-
     seek_deadline_ = std::chrono::steady_clock::now() + config_.sync_.seek_timeout_;
     SetState(PlaybackState::kSeeking);
 
-    if (!pipeline_->Seek(target_position_us).has_value()) {
-        // 时间轴已经进入了新的 epoch，但是 pipeline 未接受请求，必须清理本轮状态，不能继续等待完成事件
+    const auto timeline = LoadTimeline();
+    const auto seek_epoch = pipeline_->Seek(target_position_us, [timeline, target_position_us](std::uint64_t epoch) {
+        timeline->BeginSeek(epoch, target_position_us);
+    });
+    if (!seek_epoch.has_value()) {
+        // 请求未被接受时清理本轮状态，不能继续等待完成事件。
         HandleStop();
         SetState(PlaybackState::kError);
         return false;

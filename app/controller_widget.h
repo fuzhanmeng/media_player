@@ -13,8 +13,11 @@
 
 #include <QWidget>
 
+#include <cstdint>
+
 class QPushButton;
 class QSlider;
+class QLabel;
 
 /**
  * @class ControllerWidget
@@ -57,6 +60,27 @@ public:
      */
     void SetSeekEnabled(bool enabled);
 
+    /**
+     * @brief 更新进度条当前值，不触发用户 Seek 信号
+     * @param value 归一化进度，范围为 [0, 1000]
+     * @details 播放器定时刷新时调用；使用信号屏蔽避免程序同步进度被误认为用户操作。
+     */
+    void SetProgress(int value);
+
+    /**
+     * @brief 更新时间轴旁的当前时间和总时长文本
+     * @param position_us 播放器报告的当前位置，单位微秒
+     * @param duration_us 媒体总时长，单位微秒；未知或无效时显示占位符
+     * @details 用户拖动滑块时，当前时间显示滑块对应的预览时间；未拖动时显示实际播放时间。
+     */
+    void SetTimeDisplay(std::int64_t position_us, std::int64_t duration_us);
+
+    /**
+     * @brief 查询用户当前是否正在拖动进度条
+     * @return true 表示滑块仍由用户按住拖动，刷新线程应暂时保留其预览位置
+     */
+    [[nodiscard]] bool IsSliderDown() const;
+
 signals:
     /**
      * @brief 用户点击了播放/暂停按钮时触发
@@ -71,6 +95,11 @@ signals:
     void Seek(int position);
 
 private:
+    void UpdateTimeDisplay();
+
     QPushButton* play_pause_button_{nullptr};  ///< 播放/暂停控制按钮（Qt 对象树托管）
+    QLabel* time_label_{nullptr};  ///< 当前播放时间与媒体总时长（Qt 对象树托管）
     QSlider* progress_slider_{nullptr};        ///< 时间轴定位进度条（Qt 对象树托管）
+    std::int64_t position_us_{0};  ///< 最近一次从播放器读取的媒体位置
+    std::int64_t duration_us_{0};  ///< 最近一次从播放器读取的媒体总时长
 };

@@ -222,7 +222,7 @@ public:
 
         // 5. 所有轨道都已到达：标记结果已返回，由最后到达的一条轨道返回结果
         seek_reported_ = true;
-        return SeekResult{aligned_seek_time_us_, seek_ready_tracks_ == media_tracks_};
+        return SeekResult{aligned_seek_time_us_, seek_end_tracks_ == media_tracks_};
     }
 
     /**
@@ -243,6 +243,10 @@ public:
      * 音频位置正常前进时，播放位置以音频为准，音频长时间未更新时，改用系统的单调时钟推算出的位置
      */
     void PublishAudio(std::uint64_t epoch, std::int64_t position_us) {
+        // 音频节点与 GUI 查询、控制线程可能并发访问时间轴；所有状态字段都由
+        // state_mutex_ 保护，先加锁再检查本轮 epoch 和播放状态。
+        std::lock_guard<std::mutex> lock(state_mutex_);
+
         // 1. 忽略上一轮迟到的报告，以及跳转中、暂停中、已停止时的报告
         if (epoch != playback_state_.epoch_ || playback_state_.seeking_ || !playback_state_.playing_ ||
             playback_state_.stopped_) {
@@ -293,12 +297,12 @@ public:
 
         // 2. 该轨道已经调用过本方法时，不重复记录
         const auto bit = static_cast<unsigned>(track);
-        if (seek_end_tracks_ & bit) {
+        if (finished_tracks_ & bit) {
             return false;
         }
 
         // 3. 记录该轨道已经结束
-        seek_end_tracks_ |= bit;
+        finished_tracks_ |= bit;
 
         // 4. 音频结束时，冻结当前位置并改用系统的单调时钟推进，使得剩余的视频画面可以继续播放结束
         if (track == PlaybackTrack::kAudio) {
@@ -310,7 +314,7 @@ public:
         state_changed_cv_.notify_all();
 
         // 5. 所有实际存在的轨道都结束后，才认为媒体播放结束
-        return seek_end_tracks_ == media_tracks_;
+        return finished_tracks_ == media_tracks_;
     }
 
     /**
@@ -320,7 +324,7 @@ public:
         std::lock_guard<std::mutex> lock(state_mutex_);
 
         // 媒体至少有一条轨道，且已结束的轨道与媒体包含的轨道完全一致
-        return media_tracks_ != 0 && (seek_end_tracks_ == media_tracks_);
+        return media_tracks_ != 0 && (finished_tracks_ == media_tracks_);
     }
 
     /**

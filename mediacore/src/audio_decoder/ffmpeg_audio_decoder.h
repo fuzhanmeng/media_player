@@ -82,7 +82,7 @@ public:
      * @brief 每块输出最多包含的采样帧数
      * @details 选择了 240 帧， 240/48000 = 5ms
      */
-    static constexpr int kMaxOutputFrames = 240;
+    static constexpr int kMaxOutputFrames = PcmFrame::kMaxBlockFrames;
 
     /**
      * @brief 根据编码参数创建音频解码器，重采样器在收到第一帧时才创建

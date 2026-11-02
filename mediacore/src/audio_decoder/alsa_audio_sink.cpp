@@ -156,7 +156,7 @@ public:
             return 0;
         }
 
-        const snd_pcm_uframes_t written = snd_pcm_writei(pcm_, data, requested_frames);
+        const snd_pcm_sframes_t written = snd_pcm_writei(pcm_, data, requested_frames);
 
         if (written < 0) {
             if (written != -EAGAIN) {
@@ -380,8 +380,9 @@ public:
         }
 
         // 第二部分：请求恢复播放
-        // 只有此前成功使用硬件暂停，才需要调用硬件恢复接口
-        // 如果此前使用软件暂停，则设备队列已经被 drop 清空，需要通过后面的 PumpReplay() 重新提交保留的副本
+        // 硬件暂停需要先调用 snd_pcm_pause(0)；软件暂停虽然没有硬件恢复动作，
+        // 但同样必须清除 paused_，否则 Write()/PumpReplay() 会一直返回 0，
+        // 音频节点无法继续消费 PCM，最终会把上游队列堵满。
         if (hardware_pause_active_) {
             const int result = snd_pcm_pause(pcm_, 0);
 
@@ -399,27 +400,30 @@ public:
                 Recover(result);
             }
 
-            hardware_pause_active_ = false;
-
-            // 清除逻辑暂停标志
-            paused_ = false;
-
-            // 恢复后先刷新设备状态和播放进度，再尝试重送旧数据
-            RefreshShadowFromAlsa();
-
-            // 尝试重新提交 shadow_samples_ 中尚未提交给 ALSA 的后缀
-            PumpReplay();
-
-            // 记录恢复后的状态:
-            // ShadowFrames() 是本对象保留的总帧数,submitted_pending_frames_ 是其中已重新提交或仍留在设备中的前部帧数；
-            // 两者之差就是当前等待重送的后缀帧数。
-            LOG_DEBUG(
-                "ALSA device '{}' pause cleared, {} pending frames, "
-                "{} frames awaiting replay",
-                device_,
-                ShadowFrames(),
-                ShadowFrames() - submitted_pending_frames_);
+        } else if (!paused_) {
+            // 已经处于播放状态，无需重复恢复。
+            return;
         }
+
+        // 硬件恢复成功，或软件暂停完成后，统一清除逻辑暂停标志。
+        // 软件暂停时 snd_pcm_drop()/prepare() 已经把设备置于可写状态，
+        // 后续 PumpReplay() 会把保留的 shadow 数据重新提交。
+        hardware_pause_active_ = false;
+        paused_ = false;
+
+        // 恢复后先刷新设备状态和播放进度，再尝试重送旧数据。
+        RefreshShadowFromAlsa();
+        PumpReplay();
+
+        // 记录恢复后的状态:
+        // ShadowFrames() 是本对象保留的总帧数,submitted_pending_frames_ 是其中已重新提交或仍留在设备中的前部帧数；
+        // 两者之差就是当前等待重送的后缀帧数。
+        LOG_DEBUG(
+            "ALSA device '{}' pause cleared, {} pending frames, "
+            "{} frames awaiting replay",
+            device_,
+            ShadowFrames(),
+            ShadowFrames() - submitted_pending_frames_);
     }
 
 private:
@@ -654,6 +658,9 @@ private:
             if (written != -EAGAIN) {
                 Recover(static_cast<int>(written));
             }
+
+            // 负 errno 不是写入帧数；本轮没有提交数据，留到下一次 Write()/恢复轮询重试。
+            return;
         }
 
         // 只推进提交边界，不改变 shadow 大小，短写后，下一次从新的边界继续重送

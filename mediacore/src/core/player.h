@@ -226,7 +226,7 @@ public:
      * @return 时间轴的位置快照，单位为微秒；时间轴尚未创建时返回 0
      * @note 可供 UI 定期查询，仅用于获取播放进度，不参与解码和音频输出
      */
-    std::int64_t GetPositionUs() const;
+    std::int64_t GetPositionUs() const override;
 
 private:
     struct Control;

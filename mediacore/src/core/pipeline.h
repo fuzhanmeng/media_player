@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -363,10 +364,13 @@ public:
     /**
      * @brief 向注册的源节点请求时间跳转（Seek）
      * @param target_us 目标时间戳（微秒）
+     * @param on_epoch_started 新 Epoch 已生成且 Link 已清空后、请求下发前执行的回调；
+     *        用于让共享时间轴先切换到与节点相同的 Epoch，避免节点先发布新世代数据。
      * @return 若成功下发则返回新世代 Epoch，未注册 Seek 源时返回 std::nullopt
      * @throws std::logic_error 当管线未处于 Running 状态时抛出
      */
-    std::optional<std::uint64_t> Seek(std::int64_t target_us) {
+    std::optional<std::uint64_t> Seek(std::int64_t target_us,
+                                      const std::function<void(std::uint64_t)>& on_epoch_started = {}) {
         if (state_ != PipelineState::kRunning) {
             throw std::logic_error("Seek requires a running Pipeline");
         }
@@ -377,6 +381,9 @@ public:
         }
 
         const std::uint64_t epoch = BeginNewEpoch();
+        if (on_epoch_started) {
+            on_epoch_started(epoch);
+        }
         seek_source_->RequestSeek(epoch, target_us);
         sync_ctx_->WakeAllPausedThreads();
         return epoch;

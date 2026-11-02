@@ -107,6 +107,13 @@ public:
      * @return 媒体总时长（单位：微秒）；若媒体未打开、属于无界直播流或时长未知时返回 -1
      */
     virtual std::int64_t GetDurationUs() const = 0;
+
+    /**
+     * @brief 线程安全地获取当前播放位置
+     * @return 当前媒体位置（单位：微秒）；尚未打开媒体时返回 0
+     * @note 该值由共享播放时间轴估算，适合 UI 周期性刷新进度显示。
+     */
+    virtual std::int64_t GetPositionUs() const = 0;
 };
 
 }  // namespace mediacore

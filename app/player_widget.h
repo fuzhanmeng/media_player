@@ -80,7 +80,9 @@ private slots:
     void OnSeek(int position);
 
     /**
-     * @brief 定时/事件驱动刷新：拉取 IPlayer 状态快照，更新按钮图标与状态文本提示
+     * @brief 定时刷新播放器状态、时间轴进度和状态文本
+     * @details 从 IPlayer 读取总时长与当前媒体位置，把位置按千分比写入进度条；
+     *          用户拖动滑块时保留其预览值，避免定时刷新覆盖拖动操作。
      */
     void RefreshPlaybackState();
 

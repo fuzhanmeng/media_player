@@ -13,8 +13,12 @@
 #include "controller_widget.h"
 
 #include <QHBoxLayout>
+#include <QLabel>
 #include <QPushButton>
+#include <QSignalBlocker>
 #include <QSlider>
+
+#include <algorithm>
 
 #include "mediacore/logger.h"
 
@@ -34,6 +38,7 @@
 ControllerWidget::ControllerWidget(QWidget* parent)
     : QWidget(parent),
       play_pause_button_(new QPushButton(tr("播放"), this)),
+      time_label_(new QLabel(tr("--:-- / --:--"), this)),
       progress_slider_(new QSlider(Qt::Horizontal, this)) {
     // 1. 配置进度条量程
     // 使用 [0, 1000] 整数刻度表达播放相对进度（千分比），规避浮点传递可能导致的精度截断误差
@@ -43,6 +48,7 @@ ControllerWidget::ControllerWidget(QWidget* parent)
     // 2. 装配水平布局
     auto* layout = new QHBoxLayout(this);
     layout->addWidget(play_pause_button_);
+    layout->addWidget(time_label_);
     layout->addWidget(progress_slider_);
 
     // 3. 绑定播放/暂停按钮点击事件
@@ -62,6 +68,9 @@ ControllerWidget::ControllerWidget(QWidget* parent)
         LOG_INFO("Progress slider released, position {}", position);
         emit Seek(position);
     });
+
+    // 拖动过程中仅更新文本预览；真正的 Seek 仍只在释放滑块时发出。
+    connect(progress_slider_, &QSlider::sliderMoved, this, [this](int) { UpdateTimeDisplay(); });
 
     LOG_INFO("ControllerWidget constructed");
 }
@@ -98,4 +107,78 @@ void ControllerWidget::SetPlayPauseEnabled(bool enabled) {
  */
 void ControllerWidget::SetSeekEnabled(bool enabled) {
     progress_slider_->setEnabled(enabled);
+}
+
+/**
+ * @brief 设置播放器推算出的当前播放进度
+ * @param value 归一化进度，范围为 [0, 1000]
+ * @details
+ * 这是播放器状态到 Qt 控件的单向同步入口。进度条只在用户松开滑块时发出
+ * Seek，因此这里即使设置值也不会产生 Seek；信号屏蔽用于避免未来增加
+ * valueChanged 连接后出现程序更新反向触发用户操作的问题。
+ */
+void ControllerWidget::SetProgress(int value) {
+    const int clamped_value = std::clamp(value, 0, 1000);
+    if (progress_slider_->value() == clamped_value) {
+        return;
+    }
+
+    const QSignalBlocker blocker(progress_slider_);
+    progress_slider_->setValue(clamped_value);
+}
+
+/**
+ * @brief 更新当前播放位置和总时长，并刷新控制条上的时间文本
+ * @param position_us 当前媒体位置，单位微秒
+ * @param duration_us 媒体总时长，单位微秒
+ * @details 播放位置由 PlayerWidget 的 100ms 定时器持续传入。若用户正拖动滑块，
+ *          UpdateTimeDisplay 会优先将滑块比例换算为预览时间，避免真实播放时间覆盖预览。
+ */
+void ControllerWidget::SetTimeDisplay(std::int64_t position_us, std::int64_t duration_us) {
+    duration_us_ = std::max<std::int64_t>(duration_us, 0);
+    position_us_ = duration_us_ > 0 ? std::clamp<std::int64_t>(position_us, 0, duration_us_) : 0;
+    UpdateTimeDisplay();
+}
+
+/**
+ * @brief 按当前滑块状态格式化并显示“当前位置 / 总时长”
+ * @details 时间精度显示到秒；超过一小时的媒体使用“小时:分钟:秒”，较短媒体使用“分钟:秒”。
+ */
+void ControllerWidget::UpdateTimeDisplay() {
+    if (duration_us_ <= 0) {
+        time_label_->setText(tr("--:-- / --:--"));
+        return;
+    }
+
+    const auto format_time = [](std::int64_t time_us) {
+        const std::int64_t total_seconds = std::max<std::int64_t>(time_us, 0) / 1'000'000;
+        const std::int64_t hours = total_seconds / 3600;
+        const std::int64_t minutes = (total_seconds / 60) % 60;
+        const std::int64_t seconds = total_seconds % 60;
+        if (hours > 0) {
+            return QStringLiteral("%1:%2:%3")
+                .arg(hours, 2, 10, QLatin1Char('0'))
+                .arg(minutes, 2, 10, QLatin1Char('0'))
+                .arg(seconds, 2, 10, QLatin1Char('0'));
+        }
+        return QStringLiteral("%1:%2")
+            .arg(total_seconds / 60, 2, 10, QLatin1Char('0'))
+            .arg(seconds, 2, 10, QLatin1Char('0'));
+    };
+
+    std::int64_t display_position_us = position_us_;
+    if (IsSliderDown()) {
+        display_position_us = static_cast<std::int64_t>(progress_slider_->value()) * duration_us_ / 1000;
+    }
+    display_position_us = std::clamp<std::int64_t>(display_position_us, 0, duration_us_);
+    time_label_->setText(QStringLiteral("%1 / %2")
+                             .arg(format_time(display_position_us), format_time(duration_us_)));
+}
+
+/**
+ * @brief 返回进度条是否处于用户拖动状态
+ * @return QSlider::isSliderDown() 的当前值
+ */
+bool ControllerWidget::IsSliderDown() const {
+    return progress_slider_ != nullptr && progress_slider_->isSliderDown();
 }

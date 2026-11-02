@@ -264,7 +264,9 @@ void PlayerWidget::OnSeek(int position) {
  *    - 同步播放/暂停按钮的高亮与图标（kPlaying 时显示暂停图标，其余显示播放图标）；
  *    - 在 Opening 与 Seeking 状态下禁用播放/暂停按钮，防止非法并发控制打乱状态机；
  *    - 仅在 Playing、Paused 或 Ended 且总时长有效的前提下激活进度条交互；
- * 3. 依据状态机枚举，更新底部状态提示标签（playback_status_label_）的用户指引文本。
+ * 3. 读取总时长和时间轴当前位置，按 position / duration 换算进度条的千分比；
+ *    用户拖动滑块期间不覆盖其预览值，未知时长时清零进度；
+ * 4. 依据状态机枚举，更新底部状态提示标签（playback_status_label_）的用户指引文本。
  */
 void PlayerWidget::RefreshPlaybackState() {
     if (player_ == nullptr) {
@@ -275,13 +277,36 @@ void PlayerWidget::RefreshPlaybackState() {
     }
 
     const mediacore::PlaybackState state = player_->GetState();
+    const std::int64_t duration_us = player_->GetDurationUs();
+    const std::int64_t position_us = player_->GetPositionUs();
+
+    // 同步真实播放时间和总时长；拖动时控制条内部改为显示滑块对应的预览时间。
+    controller_->SetTimeDisplay(position_us, duration_us);
+
+    // 总时长由解封装阶段得到，当前位置由 PlaybackTimeline 按音频时钟或系统时钟估算。
+    // 两者都在 GUI 定时器中读取，避免后台线程直接修改 Qt 控件。
+    if (duration_us > 0) {
+        const std::int64_t clamped_position_us =
+            std::clamp<std::int64_t>(position_us, 0, duration_us);
+        const int progress = static_cast<int>(
+            static_cast<long double>(clamped_position_us) / static_cast<long double>(duration_us) * 1000.0L);
+
+        // 用户拖动期间，滑块值代表用户的预览位置，不能被后台播放位置覆盖。
+        if (!controller_->IsSliderDown()) {
+            controller_->SetProgress(progress);
+        }
+    } else if (!controller_->IsSliderDown()) {
+        // 未打开媒体或媒体没有可用时长时，清除上一次媒体遗留的进度。
+        controller_->SetProgress(0);
+    }
+
     controller_->SetPlaying(state == mediacore::PlaybackState::kPlaying);
     controller_->SetPlayPauseEnabled(state != mediacore::PlaybackState::kOpening &&
                                      state != mediacore::PlaybackState::kSeeking);
 
     const bool can_seek = state == mediacore::PlaybackState::kPlaying || state == mediacore::PlaybackState::kPaused ||
         state == mediacore::PlaybackState::kEnded;
-    controller_->SetSeekEnabled(can_seek && player_->GetDurationUs() > 0);
+    controller_->SetSeekEnabled(can_seek && duration_us > 0);
 
     switch (state) {
         case mediacore::PlaybackState::kIdle:

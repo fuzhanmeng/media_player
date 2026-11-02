@@ -26,6 +26,7 @@ namespace mediacore {
 struct PcmFrame {
     static constexpr int kSampleRate = 48000;  ///< 每秒 48000 个采样时刻
     static constexpr int kChannels = 2;  ///< 标准双声道立体声
+    static constexpr int kMaxBlockFrames = 240; ///< 每个 PCM 块最多包含 240 采样帧
 
     std::vector<std::int16_t> samples_;  ///< 交错排列的 PCM 原始采样点数据
     std::int64_t start_sample_{0};  ///< 本数据块在媒体时间轴上的起始位置，以采样帧为单位
