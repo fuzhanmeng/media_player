@@ -508,7 +508,7 @@ FfmpegDemuxerOpenResult FfmpegDemuxer::Open(const std::string& uri, DemuxerInter
 
     // 1. 入参合法性校验：拒绝空 URI
     if (uri.empty()) {
-        LOG_WARN("FfmpegDemuxer::Open rejected an empty URI");
+        LOG_ERROR("FfmpegDemuxer::Open rejected an empty URI");
         result.error_ = MakeFfmpegError(kOpenInputOperation, AVERROR(EINVAL));
         return result;
     }
@@ -705,7 +705,7 @@ FfmpegDemuxerOpenResult FfmpegDemuxer::Open(const std::string& uri, DemuxerInter
     if (opened_media_info.video_stream_) {
         const VideoStreamInfo& video_stream_info = opened_media_info.video_stream_.value();
 
-        LOG_INFO("Demuxer opened successfully, video stream {}: {}x{}, codec {}, pixel format {}, {} fps",
+        LOG_INFO("Demuxer opened video stream {}: {}x{}, codec {}, pixel format {}, {} fps",
                  video_stream_index,
                  video_stream_info.width_,
                  video_stream_info.height_,

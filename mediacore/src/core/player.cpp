@@ -551,8 +551,12 @@ Player::Control::Control(PlayerConfig config, AudioSinkFactory audio_sink_factor
     }
     // 没有自定义工厂时使用默认 ALSA 工厂；纯视频媒体不会调用该工厂
     if (!audio_sink_factory_) {
+        // getenv 在"变量存在但为空字符串"时返回 ""，而不是 nullptr。
+        // 只判 nullptr 会把空串当设备名传给 ALSA，构造函数随即抛 invalid_argument
+        // 这里把空串也当作"未设置"，回退到 default
         const char* configured_device_name = std::getenv("AI_MEDIA_PLAYER_ALSA_DEVICE");
-        const std::string alsa_device_name = configured_device_name ? configured_device_name : "default";
+        const bool device_name_is_set = configured_device_name != nullptr && *configured_device_name != '\0';
+        const std::string alsa_device_name = device_name_is_set ? configured_device_name : "default";
         const int device_buffer_ms = config_.audio_.device_buffer_ms_;
         audio_sink_factory_ = [alsa_device_name, device_buffer_ms] {
             return CreateAlsaAudioSink(alsa_device_name, device_buffer_ms);
@@ -992,9 +996,17 @@ bool Player::Control::BuildPipeline(FfmpegDemuxerOpenResult open_result) {
         auto& audio_decoder_node =
             new_pipeline->EmplaceNode<FfmpegAudioDecoderNode>(std::move(audio_decoder_open_result.audio_decoder_));
 
-        // 在控制线程中创建 IAudioSink 对象，若工厂返回空指针则构建失败，工厂抛出的异常由控制循环捕获
-        // AudioSinkNode 接管对象，并在自己的工作线程中调用 Open()；声卡打开失败会在节点运行阶段暴露
-        auto audio_sink_device = audio_sink_factory_ ? audio_sink_factory_() : nullptr;
+        // 在控制线程中创建 IAudioSink 对象；AudioSinkNode 接管对象后，会在自己的工作线程里调用 Open()，
+        // 因此这里是"对象构造失败"的唯一出口，声卡真正打开失败则在节点运行阶段暴露。
+        // 工厂可能抛异常（如 ALSA 参数非法），必须就地捕获并带上上下文，
+        // 否则异常会一路冒到 ControlLoop，日志只能看到底层原因，看不出是哪个分支的哪一步失败的。
+        std::unique_ptr<IAudioSink> audio_sink_device;
+        try {
+            audio_sink_device = audio_sink_factory_ ? audio_sink_factory_() : nullptr;
+        } catch (const std::exception& error) {
+            LOG_ERROR("Audio sink creation failed while building the audio branch: {}", error.what());
+            return false;
+        }
 
         if (!audio_sink_device) {
             LOG_ERROR("Audio sink factory returned no device; audio branch cannot be built");

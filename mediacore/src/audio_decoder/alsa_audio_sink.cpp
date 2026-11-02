@@ -59,7 +59,10 @@ public:
      * @throw std::invalid_argument 设备名称为空或时长超出
      */
     AlsaAudioSink(std::string device, int buffer_ms) : device_(std::move(device)), buffer_ms_(buffer_ms) {
-        if (device.empty() || buffer_ms_ < kMinBufferMs || buffer_ms_ > kMaxBufferMs) {
+        // 注意：成员初始化列表先于函数体执行，形参 device 此时已被 move 走，
+        // 状态是"有效但未指定"（std::string 上通常就是空串）。
+        // 因此必须检查已经保存的成员 device_，检查形参会无条件判定为空并每次构造都抛异常。
+        if (device_.empty() || buffer_ms_ < kMinBufferMs || buffer_ms_ > kMaxBufferMs) {
             throw std::invalid_argument("ALSA: device must be non-empty and buffer_ms must be [5,2000]");
         }
     }

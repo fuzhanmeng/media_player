@@ -152,9 +152,19 @@ public:
 
     /**
      * @brief 析构函数：保证在管线销毁前彻底停止并 Join 全部线程
+     * @details 若销毁时仍处于 kBuilding（建图过程中抛异常或提前返回），说明从未调用 Start()，
+     *          没有任何工作线程或在途数据，继续执行五阶段停止协议只会刷出一串无意义的
+     *          "stop signal requested / Link abort" 日志，因此直接标记为已停止后返回。
      */
     ~Pipeline() {
         LOG_INFO("Pipeline destroying, current state {}", PipelineStateToString(state_));
+
+        // 从未启动：没有线程需要 Join，也没有队列需要 Abort。成员析构会照常释放 Link 与 Node。
+        if (state_ == PipelineState::kBuilding) {
+            state_ = PipelineState::kStopped;
+            LOG_INFO("Pipeline destroyed before start; no worker threads to stop");
+            return;
+        }
 
         const bool stop_succeeded = Stop();
 
