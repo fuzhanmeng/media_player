@@ -716,6 +716,12 @@ protected:
     }
 
     /**
+     * @brief 输入 Link 是否已被 Pipeline 终止
+     * @return 没有输入端口或未被终止时返回 false
+     */
+    bool IsInputAborted() const noexcept { return input_ && input_->IsAborted(); }
+
+    /**
      * @brief 向下游 Link 阻塞发送数据
      */
     bool SendOutput(OutT item) { return output_ && output_->Send(std::move(item)); }
@@ -789,6 +795,12 @@ protected:
     std::optional<InT> ReceiveInputFor(std::chrono::milliseconds timeout) {
         return input_ ? input_->ReceiveFor(timeout) : std::nullopt;
     }
+
+    /**
+     * @brief 输入 Link 是否已被 Pipeline 终止
+     * @return 没有输入端口或未被终止时返回 false
+     */
+    bool IsInputAborted() const noexcept { return input_ && input_->IsAborted(); }
 
 private:
     std::shared_ptr<InputLink> input_;

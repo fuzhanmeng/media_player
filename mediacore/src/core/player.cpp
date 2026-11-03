@@ -47,8 +47,12 @@ namespace mediacore {
  * @param open_sequence 本次 Open 的编号，用于过滤被后续 Open 替代的旧任务
  * @param on_open_finished 打开结束后的通知回调；只通知控制线程，不创建 Pipeline
  *
- * 工作线程写入打开结果或异常后，先以 release 语义发布 is_finished_，再投递完成通知
- * 控制线程通过 Join() 等待线程退出后读取结果，避免与后台线程并发访问这些成员
+ * 线程执行顺序：
+ * 1. 打开解封装器并探测流信息；
+ * 2. 按探测到的轨道，在后台线程中打开视频/音频解码器（avcodec_open2、sws/swr 初始化）；
+ * 3. 发布完成标志并通知控制线程。
+ *
+ * 解码器在这里打开，是为了避免 avcodec_open2 等耗时调用阻塞 Player 控制线程的邮箱。
  */
 OpenTask::OpenTask(std::string media_uri, std::uint64_t open_sequence, std::function<void()> on_open_finished)
     : media_uri_(std::move(media_uri)), open_sequence_(open_sequence) {
@@ -58,6 +62,40 @@ OpenTask::OpenTask(std::string media_uri, std::uint64_t open_sequence, std::func
             // 此处只打开输入并探测流信息；播放期间的持续读包由 Pipeline 的 Demuxer 节点负责
             open_result_ = FfmpegDemuxer::Open(media_uri_, interrupt_handle_);
             media_error_ = open_result_.error_;
+
+            if (!media_error_.HasError() && open_result_.demuxer_) {
+                // GetMediaInfo() 返回 const 引用，用引用接收避免拷贝整个 MediaInfo
+                const MediaInfo& info = open_result_.demuxer_->GetMediaInfo();
+
+                // 如果有视频流
+                if (info.video_stream_.has_value()) {
+
+                    // 打开视频解码器
+                    auto decoder_open = FfmpegVideoDecoder::Open(
+                        std::move(open_result_.video_codec_parameters_),
+                        info.video_stream_->time_base_);
+                    if (!decoder_open.Succeeded()) {
+                        media_error_ = decoder_open.error_;
+                    } else {
+                        video_decoder_ = std::move(decoder_open.video_decoder_);
+                    }
+                }
+
+                // 如果有音频流
+                if (!media_error_.HasError() && info.audio_stream_.has_value()) {
+
+                    // 打开音频解码器
+                    auto decoder_open = FfmpegAudioDecoder::Open(
+                        std::move(open_result_.audio_codec_parameters_),
+                        info.audio_stream_->time_base_);
+                    if (!decoder_open.Successed()) {
+                        media_error_ = decoder_open.media_error_;
+                    } else {
+                        audio_decoder_ = std::move(decoder_open.audio_decoder_);
+                    }
+                }
+            }
+
         } catch (...) {
             // 保存异常对象，留给控制线程处理；不要让异常逃出线程入口，否则程序会 terminate
             open_exception_ = std::current_exception();
@@ -66,8 +104,9 @@ OpenTask::OpenTask(std::string media_uri, std::uint64_t open_sequence, std::func
         is_finished_.store(true, std::memory_order_release);
         // 先发布完成标志，再发送通知；即使通知入队失败，控制循环也会定期检查 IsFinished()
         try {
-            if (on_open_finished)
+            if (on_open_finished) {
                 on_open_finished();
+            }
         } catch (...) {
             // 线程入口不能让异常逃出去，否则会导致 std::terminate
         }
@@ -223,6 +262,8 @@ struct Player::Control {
     PlaybackState GetState() const;
     std::int64_t GetDurationUs() const;
     std::int64_t GetPositionUs() const;
+    IPlayer::PlaybackSnapshot GetSnapshot() const;
+
     /**
      * @brief 取得当前发布的时间轴，并在本次查询期间持有它
      * @return 当前时间轴的 shared_ptr；尚未建好 Pipeline 或停止后可能为空
@@ -374,7 +415,9 @@ public:
      * @param open_result OpenTask 产生的解封装器和编解码参数；所需资源会移动到对应节点
      * @return true 表示节点连接和线程启动成功，不保证音频设备此时已经打开或首帧已经显示
      */
-    bool BuildPipeline(FfmpegDemuxerOpenResult open_result);
+    bool BuildPipeline(FfmpegDemuxerOpenResult open_result,
+                       std::unique_ptr<FfmpegVideoDecoder> video_decoder,
+                       std::unique_ptr<FfmpegAudioDecoder> audio_decoder);
 
     /**
      * @brief 为当前 Pipeline 创建事件回调
@@ -531,6 +574,13 @@ std::int64_t Player::GetDurationUs() const {
 /** @brief 读取当前时间轴的位置快照；没有时间轴时返回 0，单位为微秒 */
 std::int64_t Player::GetPositionUs() const {
     return control_->GetPositionUs();
+}
+
+/**
+ * @brief 一次性读取播放状态、总时长与当前位置
+ */
+IPlayer::PlaybackSnapshot Player::GetSnapshot() const {
+    return control_->GetSnapshot();
 }
 
 /**
@@ -866,10 +916,15 @@ void Player::Control::HandleOpenFinished(std::uint64_t open_sequence) {
     }
 
     FfmpegDemuxerOpenResult open_result = open_task_->TakeOpenResult();
+
+    // 取出解码器
+    std::unique_ptr<FfmpegVideoDecoder> video_decoder = open_task_->TakeVideoDecoder();
+    std::unique_ptr<FfmpegAudioDecoder> audio_decoder = open_task_->TakeAudioDecoder();
+
     open_task_.reset();
 
     // 使用打开线程交付的解封装器和编解码参数组装 Pipeline
-    if (!BuildPipeline(std::move(open_result))) {
+    if (!BuildPipeline(std::move(open_result), std::move(video_decoder), std::move(audio_decoder))) {
         // Pipeline 组装或启动失败
         LOG_ERROR("Player failed to build pipeline");
         play_after_open_ = false;
@@ -895,7 +950,9 @@ void Player::Control::HandleOpenFinished(std::uint64_t open_sequence) {
  * 所有连接成功后才启动 Pipeline
  * 音频设备对象由工厂函数创建并交给 AudioSinkNode，设备 Open 在节点线程中执行
  */
-bool Player::Control::BuildPipeline(FfmpegDemuxerOpenResult open_result) {
+bool Player::Control::BuildPipeline(FfmpegDemuxerOpenResult open_result,
+                                    std::unique_ptr<FfmpegVideoDecoder> video_decoder,
+                                    std::unique_ptr<FfmpegAudioDecoder> audio_decoder) {
     ++pipeline_generation_;
 
     // 1. 创建 pipeline
@@ -906,26 +963,32 @@ bool Player::Control::BuildPipeline(FfmpegDemuxerOpenResult open_result) {
     const bool has_video_stream = media_info.video_stream_.has_value();
     const bool has_audio_stream = media_info.audio_stream_.has_value();
 
-    // 3. 根据媒体实际包含的轨道校验配置，若没有音频也没有视频，就无法构建可播放的 Pipeline，报错返回
+    // 3. 预校验：有轨道就必须有对应的已打开解码器
+    if ((has_video_stream && !video_decoder) || (has_audio_stream && !audio_decoder)) {
+        LOG_ERROR("Player pipeline rejected: decoder missing for an existing track");
+        return false;
+    }
+
+    // 4. 根据媒体实际包含的轨道校验配置，若没有音频也没有视频，就无法构建可播放的 Pipeline，报错返回
     const auto track_validation = config_.ValidateForTracks(has_video_stream, has_audio_stream);
     if (!track_validation.ok_) {
         LOG_ERROR("Player rejected media topology: {}", track_validation.message_);
         return false;
     }
 
-    // 4. 获取共享时间轴
+    // 5. 获取共享时间轴
     auto playback_timeline =
         std::make_shared<PlaybackTimeline>(has_video_stream, has_audio_stream, config_.sync_.reanchor_timeout_);
 
-    // 5. 是否支持 Seek
+    // 6. 是否支持 Seek
     can_attempt_seek_ = open_result.demuxer_->CanAttemptSeek();
 
-    // 6. 获取可 Seek 的源节点：DemuxerNode
+    // 7. 获取可 Seek 的源节点：DemuxerNode
     auto& demuxer_node =
         new_pipeline->EmplaceNode<FfmpegDemuxerNode>(std::move(open_result.demuxer_), playback_timeline);
     new_pipeline->SetSeekSource(&demuxer_node);
 
-    // 7. 视频分支：解封装 -> 视频解码 -> 音视频同步 -> 显示输出
+    // 8. 视频分支：解封装 -> 视频解码 -> 音视频同步 -> 显示输出
     if (has_video_stream) {
         // 创建视频解复用输出队列
         auto video_packets_link = new_pipeline->CreateLink<StreamItem<Packet>>(config_.demux_.video_packet_capacity_);
@@ -937,19 +1000,9 @@ bool Player::Control::BuildPipeline(FfmpegDemuxerOpenResult open_result) {
         // AvSyncNode 已决定视频帧的放行时机；此 Link 只保留一帧，避免同步之后再次积累延迟
         auto synced_video_frame_link = new_pipeline->CreateLink<StreamItem<VideoFrame>>(1);
 
-        // 打开音频解码器
-        auto video_decode_open_result = FfmpegVideoDecoder::Open(std::move(open_result.video_codec_parameters_),
-                                                                 media_info.video_stream_->time_base_);
-
-        if (!video_decode_open_result.Succeeded()) {
-            LOG_ERROR("Video decoder open failed: {}", video_decode_open_result.error_.ToString());
-
-            return false;
-        }
-
         // 创建视频解码节点
         auto& video_decoder_node =
-            new_pipeline->EmplaceNode<FfmpegVideoDecoderNode>(std::move(video_decode_open_result.video_decoder_));
+            new_pipeline->EmplaceNode<FfmpegVideoDecoderNode>(std::move(video_decoder));
 
         // 缺少有效帧率时按 25 fps（每帧约 40 ms）估算，仅用于缺失 PTS 和最后一帧结束时间的兜底
         const auto video_frame_rate = media_info.video_stream_->frame_rate_;
@@ -986,19 +1039,9 @@ bool Player::Control::BuildPipeline(FfmpegDemuxerOpenResult open_result) {
         auto decoded_audio_frame_link =
             new_pipeline->CreateLink<StreamItem<PcmFrame>>(config_.decode_.audio_frame_capacity_);
 
-        // 打开音频解码器
-        auto audio_decoder_open_result = FfmpegAudioDecoder::Open(std::move(open_result.audio_codec_parameters_),
-                                                                  media_info.audio_stream_->time_base_);
-
-        if (!audio_decoder_open_result.Successed()) {
-            LOG_ERROR("Audio decoder open failed: {}", audio_decoder_open_result.media_error_.ToString());
-
-            return false;
-        }
-
         // 创建音频解码节点
         auto& audio_decoder_node =
-            new_pipeline->EmplaceNode<FfmpegAudioDecoderNode>(std::move(audio_decoder_open_result.audio_decoder_));
+            new_pipeline->EmplaceNode<FfmpegAudioDecoderNode>(std::move(audio_decoder));
 
         // 在控制线程中创建 IAudioSink 对象；AudioSinkNode 接管对象后，会在自己的工作线程里调用 Open()，
         // 因此这里是"对象构造失败"的唯一出口，声卡真正打开失败则在节点运行阶段暴露。
@@ -1019,6 +1062,8 @@ bool Player::Control::BuildPipeline(FfmpegDemuxerOpenResult open_result) {
         }
 
         // 创建音频分发节点
+        // max_buffer_ms_ 是配置层的自洽性预算（设备 + 在途 + 队列），只参与
+        // ValidateAudioBufferBudget；运行时流控以设备实际缓冲为准，因此传 device_buffer_ms_。
         auto& audio_sink_node = new_pipeline->EmplaceNode<AudioSinkNode>(
             playback_timeline, std::move(audio_sink_device), config_.audio_.device_buffer_ms_);
 
@@ -1065,6 +1110,8 @@ void Player::Control::HandlePlay() {
 
     if (!pipeline_) {
         LOG_WARN("Player play ignored: no pipeline");
+
+        return;
     }
 
     const PlaybackState playback_state = GetState();
@@ -1373,6 +1420,21 @@ bool Player::Control::IsOutputAtEnd() const noexcept {
 std::int64_t Player::Control::GetPositionUs() const {
     const auto playback_timeline = LoadTimeline();
     return playback_timeline ? playback_timeline->Get().media_position_us_ : 0;
+}
+
+/**
+ * @brief 一次性读取播放状态、总时长与当前位置
+ */
+IPlayer::PlaybackSnapshot Player::Control::GetSnapshot() const {
+    IPlayer::PlaybackSnapshot snapshot;
+    snapshot.state_ = state_.load(std::memory_order_acquire);
+    snapshot.duration_us_ = media_duration_us_.load(std::memory_order_acquire);
+
+    // 先取状态、再取位置：避免"新状态 + 旧位置"的组合
+    const auto timeline = LoadTimeline();
+    snapshot.position_us_ = timeline ? timeline->Get().media_position_us_ : 0;
+
+    return snapshot;
 }
 
 /**

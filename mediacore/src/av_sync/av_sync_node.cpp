@@ -41,7 +41,7 @@
 namespace mediacore {
 
 namespace {
-constexpr const char* kModuleName = "sv_sync_node";
+constexpr const char* kModuleName = "av_sync_node";
 }
 
 /**
@@ -120,6 +120,7 @@ TickResult AvSyncNode::Tick() {
     // 如果当前正在进行 Seek，并且目标画面已经发送到了下游，就暂时不取数据
     if (control.seeking_ && control.epoch_ == seek_epoch_ && seek_target_forwarded_) {
         timeline_->Wait(control.state_version_);
+        return TickResult::kContinue;
     }
 
     // 2. 如果pending_ 为空，取出一个待处理的数据项
@@ -199,7 +200,7 @@ TickResult AvSyncNode::Tick() {
             // 计算视频帧 PTS 和主时钟的差值
             const auto delta = *frame->pts_us_ - state.media_position_us_;
 
-            // 1. 视频帧来早了,保留 pending_，等待播放位置或时间轴状态发生变化,下一轮 Tick 再次检查同一帧
+            // 1. 视频帧来早了：等到主时钟追上它的 PTS，或控制状态变化时再重算
             if (delta > 0) {
                 LOG_TRACE("AVSync waiting for video frame: epoch {}, PTS {} us, clock {} us, early {} us",
                           epoch,
@@ -207,6 +208,7 @@ TickResult AvSyncNode::Tick() {
                           state.media_position_us_,
                           delta);
 
+                timeline_->WaitForPosition(state.state_version_, *frame->pts_us_);
                 return TickResult::kContinue;
             }
 
@@ -225,7 +227,8 @@ TickResult AvSyncNode::Tick() {
                           -delta,
                           drop_late_us_);
 
-                if (dropped == 1 && dropped % 30 == 0) {
+                // 每 30 次 打印一次 log
+                if (dropped == 1 || dropped % 30 == 0) {
                     LOG_WARN("AVSync late video frames dropped: {}, latest lateness {} us, threshold {} us, epoch {}",
                              dropped,
                              -delta,

@@ -9,7 +9,7 @@
  * 3. 五阶段无死锁停止协议（Five-stage Stop Protocol）：
  *    - 阶段 1：向所有 Node 发布停止信令（SignalStop）；
  *    - 阶段 2：强制打断（Abort）所有 Link 队列，唤醒因背压或等数据而阻塞的线程；
- *    - 阶段 3：解除 Seek Hold 与阻塞式外部 I/O（如网络/文件读取）；
+ *    - 阶段 3：打断阻塞式外部 I/O（如网络/文件读取或编解码操作）；
  *    - 阶段 4：广播唤醒暂停门控条件变量（WakeAllPausedThreads）；
  *    - 阶段 5：逆序安全 Join 并回收全部 Node 线程；
  * 4. 世代控制（Epoch Isolation）：Seek 时原子递增 Epoch 并清空 Link 内部队列，阻断过期数据。
@@ -34,7 +34,6 @@
 #include <vector>
 
 #include "core/inode.h"
-#include "core/iseek_hold_releasable.h"
 #include "core/iseek_source.h"
 #include "core/link.h"
 #include "core/pipeline_event.h"
@@ -347,21 +346,6 @@ public:
     void SetSeekSource(ISeekSource* source) noexcept { seek_source_ = source; }
 
     /**
-     * @brief 注册 Seek Hold 挂起释放者（通常为 VideoSinkNode）
-     * @param releasable 实现了 ISeekHoldReleasable 接口的节点非拥有指针
-     */
-    void SetSeekHoldReleasable(ISeekHoldReleasable* releasable) noexcept { hold_releasable_ = releasable; }
-
-    /**
-     * @brief 解除当前的 Seek Hold 挂起状态
-     */
-    void ReleaseSeekHold() noexcept {
-        if (hold_releasable_) {
-            hold_releasable_->ReleaseSeekHold();
-        }
-    }
-
-    /**
      * @brief 向注册的源节点请求时间跳转（Seek）
      * @param target_us 目标时间戳（微秒）
      * @param on_epoch_started 新 Epoch 已生成且 Link 已清空后、请求下发前执行的回调；
@@ -421,9 +405,6 @@ public:
                 success = false;
             }
         }
-
-        // 解除 Seek hold，避免 Sink 节点因等待 Player 决策而永久挂起
-        ReleaseSeekHold();
 
         // 阶段 3：打断底层可能阻塞的外部非 Link I/O（如网络读取或编解码操作）
         for (auto& node : nodes_) {
@@ -534,7 +515,6 @@ private:
     std::shared_ptr<SyncContext> sync_ctx_;  ///< 全局同步上下文
     PipelineEventCallbacks event_callbacks_;  ///< Pipeline 回调函数
     ISeekSource* seek_source_{nullptr};  ///< 负责响应 Seek 的源节点（非拥有弱引用）
-    ISeekHoldReleasable* hold_releasable_{nullptr};  ///< 负责响应 Seek Hold 解除的节点（非拥有弱引用）
     NodeThreadFactory thread_factory_;  ///< 工作线程创建工厂
     std::vector<std::unique_ptr<INodeBase>> nodes_;  ///< 拓扑中所有 Node 的独占所有权集合
     std::vector<std::shared_ptr<ILinkControl>> links_;  ///< 拓扑中所有 Link 的多态控制接口集合

@@ -10,26 +10,33 @@
 #include <thread>
 #include <utility>
 
+#include "audio_decoder/ffmpeg_audio_decoder.h"
 #include "audio_decoder/iaudio_sink.h"
 #include "demux/ffmpeg_demuxer.h"
 #include "mediacore/iplayer.h"
 #include "mediacore/media_error.h"
 #include "mediacore/playback_state.h"
 #include "mediacore/player_config.h"
+#include "video_decoder/ffmpeg_video_decoder.h"
 
 namespace mediacore {
 
 class IVideoSink;
 class PlayerJoinTask;
 class PlayerThreadReaper;
+class FfmpegVideoDecoder;
+class FfmpegAudioDecoder;
 
 /**
  * @class OpenTask
  * @brief 管理一次异步媒体打开任务
  * @details
- * 后台线程负责打开媒体源并探测音视频流信息
+ * 后台线程负责打开媒体源、探测音视频流信息，并预先打开对应的解码器。
  * 内部持有 DemuxerInterruptHandle，允许外部请求中断 FFmpeg 的阻塞 I/O
- * 任务完成后保存打开结果，并通过回调通知 Player 控制线程
+ * 任务完成后保存打开结果与解码器，并通过回调通知 Player 控制线程
+ *
+ * 所有权约定：打开结果与解码器都必须在线程 Join 之后，通过 Take* 系列函数取出；
+ * 取出前不应在其他线程读取这些成员。
  */
 class OpenTask {
 public:
@@ -85,6 +92,20 @@ public:
     FfmpegDemuxerOpenResult TakeOpenResult() noexcept { return std::move(open_result_); }
 
     /**
+     * @brief 移交后台线程打开的视频解码器
+     * @return 媒体不含视频流、解码器打开失败或已被取走时返回 nullptr
+     * @note 必须先调用 Join()；移至控制线程后由 BuildPipeline 交给解码节点
+     */
+    std::unique_ptr<FfmpegVideoDecoder> TakeVideoDecoder() noexcept { return std::move(video_decoder_); }
+
+    /**
+     * @brief 移交后台线程打开的音频解码器
+     * @return 媒体不含音频流、解码器打开失败或已被取走时返回 nullptr
+     * @note 必须先调用 Join()
+     */
+    std::unique_ptr<FfmpegAudioDecoder> TakeAudioDecoder() noexcept { return std::move(audio_decoder_); }
+
+    /**
      * @brief 获取后台打开过程中产生的结构化错误
      * @note 必须在 Join() 后调用
      */
@@ -121,6 +142,9 @@ private:
 
     std::thread open_thread_;  ///< 执行媒体打开和流信息探测的线程
     std::atomic<bool> is_finished_{false};  ///< 后台线程是否已发布执行结果
+
+    std::unique_ptr<FfmpegVideoDecoder> video_decoder_;  ///< 后台线程打开的视频解码器
+    std::unique_ptr<FfmpegAudioDecoder> audio_decoder_;  ///< 后台线程打开的音频解码器
 };
 
 /**
@@ -227,6 +251,12 @@ public:
      * @note 可供 UI 定期查询，仅用于获取播放进度，不参与解码和音频输出
      */
     std::int64_t GetPositionUs() const override;
+
+    /**
+     * @brief 一次性读取播放状态、总时长与当前位置
+     * @return 三者一致的快照
+     */
+    IPlayer::PlaybackSnapshot GetSnapshot() const override;
 
 private:
     struct Control;

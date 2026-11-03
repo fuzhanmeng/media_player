@@ -30,6 +30,17 @@ class IVideoSink;
 class IPlayer {
 public:
     /**
+     * @struct PlaybackSnapshot
+     * @brief 同一时刻的播放状态、总时长与播放位置
+     * @details 三个字段由同一次调用返回，保证彼此一致；UI 应优先使用本结构而非分别查询
+     */
+    struct PlaybackSnapshot final {
+        PlaybackState state_{PlaybackState::kIdle};  ///< 对外状态
+        std::int64_t duration_us_{-1};  ///< 总时长，未知时 -1
+        std::int64_t position_us_{0};  ///< 当前播放位置
+    };
+
+    /**
      * @brief 默认构造函数
      */
     IPlayer() = default;
@@ -114,6 +125,12 @@ public:
      * @note 该值由共享播放时间轴估算，适合 UI 周期性刷新进度显示。
      */
     virtual std::int64_t GetPositionUs() const = 0;
+
+    /**
+     * @brief 一次性读取播放状态、总时长与当前位置
+     * @return 三者一致的快照
+     */
+    virtual PlaybackSnapshot GetSnapshot() const = 0;
 };
 
 }  // namespace mediacore

@@ -22,6 +22,10 @@
 #include "mediacore/av_types/video_frame.h"
 #include "mediacore/logger.h"
 #include "mediacore/media_error.h"
+#include "core/inode.h"
+extern "C" {
+#include <libavutil/error.h>
+}
 
 namespace mediacore {
 
@@ -55,7 +59,10 @@ FfmpegVideoDecoderNode::FfmpegVideoDecoderNode(std::shared_ptr<SyncContext> sync
  * 3. 正常媒体流结束（EOF）通过 EndOfStream 变体项显式传递，非通道断开。
  */
 TickResult FfmpegVideoDecoderNode::Tick() {
-    std::optional<StreamItem<Packet>> item = ReceiveInput();
+
+    const auto k_idle_poll = std::chrono::milliseconds(5);
+
+    std::optional<StreamItem<Packet>> item = ReceiveInputFor(k_idle_poll);
 
     // 未能成功接收到数据项（Link 被打断或不可用）
     if (!item.has_value()) {
@@ -66,8 +73,13 @@ TickResult FfmpegVideoDecoderNode::Tick() {
             return TickResult::kStopped;
         }
 
-        LOG_ERROR("Video decoder node input link is unavailable without a stop request");
-        return Fail("Video decoder input link is unavailable", GetCurrentEpoch());
+        if (IsInputAborted()) {
+            LOG_ERROR("Video decoder node input link is unavailable without a stop request");
+            return Fail("Video decoder input link is unavailable", GetCurrentEpoch());
+        }
+
+        // 超时：没有数据，也没有停止或终止；返回继续，让基类重新检查暂停门控
+        return TickResult::kContinue;
     }
 
     // 分发具体的数据流元素
@@ -116,6 +128,17 @@ TickResult FfmpegVideoDecoderNode::FailIfEpochIsCurrent(const MediaError& error,
     return Fail(error, epoch);
 }
 
+bool FfmpegVideoDecoderNode::IsSkippableDecodeError(const MediaError& error) noexcept {
+    if (error.GetCategory() != MediaErrorCategory::kFfmpeg) {
+        return false;
+    }
+
+    // 只把"输入数据损坏"当作可跳过。
+    // AVERROR_EXTERNAL 表示解码器外部（硬件加速器、驱动、外部库）失败，
+    // 属于设备级故障而非单帧损坏，必须正常上报，否则硬件真的挂掉时会表现得像"跳过了几个坏帧"。
+    return error.Code() == AVERROR_INVALIDDATA;
+}
+
 /**
  * @brief 提交单个输入 Packet 到解码器，并将就绪的解码视频帧投递至下游
  * @param packet 待解码的视频压缩数据包
@@ -155,10 +178,24 @@ TickResult FfmpegVideoDecoderNode::HandlePacket(Packet& packet) {
             }
 
             case FfmpegDecoderSendStatus::kDrained:
+                // 解码器已排空：若本世代已经发过 EOS，属于重复包，直接丢弃；否则才是时序错误
+                if (eos_forwarded_) {
+                    LOG_DEBUG("Video decoder dropped a packet arriving after drain for epoch {}", packet.GetEpoch());
+                    return TickResult::kContinue;
+                }
                 return FailIfEpochIsCurrent("VideoDecoder rejected packet because codec is still drained",
                                             packet.GetEpoch());
 
             case FfmpegDecoderSendStatus::kError:
+                if (IsSkippableDecodeError(send_result.media_error_) &&
+                    ++consecutive_skippable_errors_ <= kMaxConsecutiveSkippableErrors) {
+                    LOG_WARN("Video decoder skipped a corrupt packet at epoch {} ({} consecutive): {}",
+                             packet.GetEpoch(),
+                             consecutive_skippable_errors_,
+                             send_result.media_error_.ToString());
+                    return TickResult::kContinue;
+                }
+                consecutive_skippable_errors_ = 0;
                 return FailIfEpochIsCurrent(send_result.media_error_, packet.GetEpoch());
         }
 
@@ -195,6 +232,9 @@ TickResult FfmpegVideoDecoderNode::HandleStreamReset(const StreamReset& reset) {
     output_epoch_ = reset.epoch_;
     eof_parked_.store(false, std::memory_order_release);
     eos_forwarded_ = false;
+    // 新世代开始时清零连续错误计数：它统计的是"连续"损坏，
+    // 跨 Seek 累积会让一个健康的新位置被历史坏包连累
+    consecutive_skippable_errors_ = 0;
 
     LOG_DEBUG("Video Decoder reset to epoch {}", reset.epoch_);
     return TickResult::kContinue;
@@ -304,6 +344,9 @@ TickResult FfmpegVideoDecoderNode::ReceiveAndForwardFrames(bool draining, bool p
 
                 received_any_frame = true;
                 VideoFrame& frame = *receive_result.frame_;
+
+                // 解出一帧就说明输入重新可解码，连续错误链中断
+                consecutive_skippable_errors_ = 0;
 
                 if (!IsCurrentEpoch(frame.epoch_)) {
                     continue;

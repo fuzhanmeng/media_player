@@ -432,6 +432,66 @@ private:
     static constexpr int kMinBufferMs = 5;
     static constexpr int kMaxBufferMs = 2000;
 
+public:
+    /**
+     * @brief 查询设备环形缓冲区当前还能立即接收多少采样帧
+     * @return 设备真实空闲帧数；设备不在可写状态时返回 0
+     * @details
+     * 用 snd_pcm_avail_update() 而不是 snd_pcm_delay()：后者在 PulseAudio/PipeWire
+     * 插件下会把服务器端缓冲也算进去，可能大于本对象实际提交的总量，
+     * 把这种虚高的 delay 当成"设备占用"会让上层可用量恒为 0 而永久停写。
+     * avail_update 反映的正是 writei 能否立即接受新数据的空间，语义与写入口径一致。
+     */
+    std::int64_t WritableFrames() override {
+        RequireOpen();
+
+        if (pcm_ == nullptr) {
+            return 0;
+        }
+
+        // 设备处于 XRUN/SUSPENDED 等异常状态时 avail_update 会返回负的 errno：
+        // 先走一次恢复，再重试；恢复失败则报告 0，由上层按"暂时写不进去"处理
+        snd_pcm_sframes_t available = snd_pcm_avail_update(pcm_);
+        if (available < 0) {
+            Recover(static_cast<int>(available));
+            available = snd_pcm_avail_update(pcm_);
+        }
+
+        if (available < 0) {
+            return 0;
+        }
+
+        return static_cast<std::int64_t>(available);
+    }
+
+    /**
+     * @brief 汇总 ALSA 侧的可观测状态，供上层在疑似卡死时打日志
+     * @return 形如 "state=RUNNING shadow=9600 submitted=9600 delay=9600 paused=0 hw_pause=0" 的一行文本
+     * @note 只做查询，不推进重送、不恢复设备；pcm_ 为空时返回 "closed"
+     */
+    std::string DescribeState() const override {
+        if (pcm_ == nullptr) {
+            return "closed";
+        }
+
+        snd_pcm_sframes_t device_delay = -1;
+        const int delay_result = snd_pcm_delay(pcm_, &device_delay);
+
+        std::string text = "state=";
+        text += snd_pcm_state_name(snd_pcm_state(pcm_));
+        text += " shadow=" + std::to_string(ShadowFrames());
+        text += " submitted=" + std::to_string(submitted_pending_frames_);
+        text += " device_delay=" + std::to_string(device_delay);
+        if (delay_result < 0) {
+            text += "(err " + std::to_string(delay_result) + ")";
+        }
+        text += " paused=" + std::to_string(paused_ ? 1 : 0);
+        text += " hw_pause=" + std::to_string(hardware_pause_active_ ? 1 : 0);
+        return text;
+    }
+
+private:
+
     /**
      * @brief 配置 PCM 的硬件参数、软件参数与起播阈值
      * @details
@@ -623,48 +683,64 @@ private:
     }
 
     /**
-     * @brief 尝试重送 shadow 中还未重新提交给 ALSA 的后缀 of the function
+     * @brief 尝试重送 shadow 中还未重新提交给 ALSA 的后缀
      * @details
+     * 用途：软件暂停调用 snd_pcm_drop() 清空设备缓冲后，shadow_samples_ 保留了未播完的数据，
+     * 恢复时通过本函数分批写回 ALSA，确保声音无缝续播。
+     *
      * shadow_samples_ 布局为：
      *   [0, submitted_pending_frames_)               已提交、尚未确认完成的前缀
      *   [submitted_pending_frames_, ShadowFrames())   等待重送的后缀
      *
      * 指针按 "采样值" 偏移，因此帧偏移必须乘声道数，重送的数据副本本来就已经在 shadow 中
      * 不能再次 insert 也不能作为新接受的数据重复向上游报告
+     *
+     * 单次调用预算限制（重要）：
+     * 为避免长时间占用工作线程（影响 Stop/Seek 响应），单次调用最多重送 kMaxReplayFramesPerCall 帧。
+     * 若 shadow 中剩余帧数超过此值，本次只发送部分，剩余部分留给下次 DelayFrames() 继续。
+     * 默认预算 960 帧 (4 × 240) ≈ 20 ms，即使设备空闲也不会一口气写满 200 ms 缓冲。
+     *
+     * 退出条件：
+     * 1. submitted_pending_frames_ == ShadowFrames()：全部重送完成
+     * 2. snd_pcm_writei 返回 -EAGAIN 或 0：设备暂时写不下
+     * 3. snd_pcm_writei 返回其他负值：调用 Recover() 处理错误
+     * 4. 达到单次调用预算上限：留待下次继续
      */
     void PumpReplay() {
         if (paused_) {
             return;
         }
 
-        // 获取 shadow 中的采样帧数
-        const std::size_t total_shadow_frames = ShadowFrames();
-        if (submitted_pending_frames_ >= total_shadow_frames) {
-            // 如果已经提交给 ALSA 的总帧数 >= shadow 的容量，说明 shadow 已全部提交
-            return;
-        }
+        // 单次调用最多重送的帧数（48 kHz 下约 20 ms）
+        // 避免一次性写满整段 shadow（默认 9600 帧/200 ms）导致 Stop/Seek 响应延迟过大
+        constexpr std::size_t kMaxReplayFramesPerCall = 4 * kMaxReplayFrames;  // 960 帧
+        std::size_t replayed_this_call = 0;
 
-        const std::size_t frames_waiting_for_replay = total_shadow_frames - submitted_pending_frames_;
+        while (submitted_pending_frames_ < ShadowFrames() && replayed_this_call < kMaxReplayFramesPerCall) {
+            const std::size_t waiting = ShadowFrames() - submitted_pending_frames_;
+            const auto chunk = static_cast<snd_pcm_uframes_t>(
+                std::min<std::size_t>(kMaxReplayFrames, waiting));
 
-        const auto frames_to_write =
-            static_cast<snd_pcm_uframes_t>(std::min<std::size_t>(kMaxReplayFrames, frames_waiting_for_replay));
+            const std::size_t sample_offset = submitted_pending_frames_ * PcmFrame::kChannels;
+            const std::int16_t* replay_data = shadow_samples_.data() + sample_offset;
 
-        const std::size_t sample_offset = submitted_pending_frames_ * PcmFrame::kChannels;
-        const std::int16_t* replay_data = shadow_samples_.data() + sample_offset;
+            const snd_pcm_sframes_t written = snd_pcm_writei(pcm_, replay_data, chunk);
 
-        const snd_pcm_uframes_t written = snd_pcm_writei(pcm_, replay_data, frames_to_write);
-
-        if (written < 0) {
-            if (written != -EAGAIN) {
-                Recover(static_cast<int>(written));
+            if (written < 0) {
+                if (written != -EAGAIN) {
+                    Recover(static_cast<int>(written));
+                }
+                // 负 errno 不是写入帧数；设备暂时写不下，留到下一次调用重试
+                return;
             }
 
-            // 负 errno 不是写入帧数；本轮没有提交数据，留到下一次 Write()/恢复轮询重试。
-            return;
-        }
+            if (written == 0) {
+                return;
+            }
 
-        // 只推进提交边界，不改变 shadow 大小，短写后，下一次从新的边界继续重送
-        submitted_pending_frames_ += static_cast<std::size_t>(written);
+            submitted_pending_frames_ += static_cast<std::size_t>(written);
+            replayed_this_call += static_cast<std::size_t>(written);
+        }
     }
 
     /**
@@ -686,7 +762,10 @@ private:
                 submitted_pending_frames_,
                 ShadowFrames() - submitted_pending_frames_);
 
-            // XRUN 时无法可靠定位设备究竟消费到了哪一帧，本策略不重送已提交的数据
+            // XRUN（播放欠载）意味着设备把缓冲区里的数据播完才饿死：已提交的前缀帧确实发过声，
+            // 因此这里只删除副本，不把它们计为"丢弃"。删除后 ShadowFrames() 只剩待重送后缀，
+            // 上层算出的 played = next_frame_ - ShadowFrames() 正好等于真实播放位置。
+            // 若在此处额外让上层回退 next_frame_，会凭空补出一段静音并把后续音频整体后移。
             RemoveSubmittedPrefix(submitted_pending_frames_);
             Check(snd_pcm_prepare(pcm_), "prepare after underrun");
             suspend_warning_logged_ = false;
@@ -710,7 +789,7 @@ private:
                 return;
             }
 
-            if (resumed == EAGAIN) {
+            if (resumed == -EAGAIN) {
                 // 设备仍未恢复；不在这里阻塞循环，以便上层继续处理停止等控制请求。
                 return;
             }
@@ -739,19 +818,22 @@ private:
      * 可重试的 -EAGAIN 和本类专门处理的 -EPIPE / -ESTRPIPE 已经在调用分支处理
      */
     void Check(int result, const char* operation) const {
-        if (result < 0) {
-            // 日志失败不应该覆盖原始的 ALSA 错误，异常中会包含错误码和文本
-            try {
-                LOG_DEBUG("ALSA device '{}' operation '{}' failed, code {} ({})",
-                          device_,
-                          operation,
-                          result,
-                          snd_strerror(result));
-            } catch (...) {
-                throw std::runtime_error("ALSA " + std::string(operation) + " [" + device_ + "] (" +
-                                         std::to_string(result) + "): " + snd_strerror(result));
-            }
+        if (result >= 0) {
+            return;
         }
+
+        const std::string message = std::string("ALSA ") + operation + " [" + device_ + "] (" + std::to_string(result) +
+            "): " + snd_strerror(result);
+
+        // 日志失败不能阻止异常抛出
+        try {
+            LOG_DEBUG("{}", message);
+        } catch (...) {
+            // 忽略日志异常
+        }
+
+        // 无条件抛出：ALSA 的原始错误必须上报，不能被日志层的异常掩盖
+        throw std::runtime_error(message);
     }
 
     /**
@@ -763,6 +845,8 @@ private:
 
     /**
      * @brief 关闭 PCM 句柄，析构和 Open 失败时，清理路径使用
+     * @note 先 drop 把设备从 RUNNING 拉回 SETUP，避免某些插件在 close 时尝试
+     *       冲刷待播数据；随后 close 真正释放句柄与设备资源。
      */
     void ClosePcmNoThrow() noexcept {
         if (pcm_ == nullptr) {
@@ -770,8 +854,7 @@ private:
         }
 
         (void)snd_pcm_drop(pcm_);
-        (void)snd_pcm_prepare(pcm_);
-
+        (void)snd_pcm_close(pcm_);
         pcm_ = nullptr;
     }
 

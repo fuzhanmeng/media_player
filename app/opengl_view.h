@@ -131,7 +131,7 @@ private:
 private:
     std::mutex frame_mutex_;  ///< 互斥锁：保护 current_frame_ 信箱的跨线程读写访问
     std::shared_ptr<mediacore::VideoFrame> current_frame_{nullptr};  ///< 视频帧信箱：始终仅保留最新到达的一帧画面
-    QOpenGLShaderProgram shader_program_;  ///< 着色器程序对象（承载 YUV 转 RGB 片段着色器）
+    std::unique_ptr<QOpenGLShaderProgram> shader_program_;  ///< 着色器程序对象（承载 YUV 转 RGB 片段着色器）
     std::array<GLuint, 3> texture_ids_{0, 0, 0};  ///< Y/U/V 三个平面的 OpenGL 2D 纹理句柄（0: Y, 1: U, 2: V）
     QOpenGLVertexArrayObject vao_;  ///< 顶点数组对象（VAO），保存顶点属性解析格式
     QOpenGLBuffer vbo_{QOpenGLBuffer::VertexBuffer};  ///< 顶点缓冲对象（VBO），存储网格顶点与纹理坐标

@@ -53,6 +53,9 @@ FfmpegAudioDecoderNode::FfmpegAudioDecoderNode(std::shared_ptr<SyncContext> sync
  * 所以需要入队后再次检查状态
  */
 bool FfmpegAudioDecoderNode::ForWard(PcmFrame frame) {
+    // 先保存 move 之后仍需使用的字段
+    const std::uint64_t frame_epoch = frame.epoch_;
+
     // 1. 检查状态
     if (IsStopRequested() || !IsCurrentEpoch(frame.epoch_)) {
         return false;
@@ -64,7 +67,7 @@ bool FfmpegAudioDecoderNode::ForWard(PcmFrame frame) {
     }
 
     // 3. 入队后再次检查状态
-    return !IsStopRequested() && IsCurrentEpoch(frame.epoch_);
+    return !IsStopRequested() && IsCurrentEpoch(frame_epoch);
 }
 
 /**
@@ -164,14 +167,15 @@ TickResult FfmpegAudioDecoderNode::HandleStreamReset(const StreamReset& reset) {
     // 2. 重置 FFmpeg 解码器与重采样器，清理缓存
     audio_decoder_->Flush();
 
-    // 3. 更新本地输出世代并重置 EOS 标记
-    output_epoch_ = reset.epoch_;
-    eos_forwarded_ = false;
+    // 3. 将 Reset 标志发送到下游 AudioSinkNode，确保下游在接收到新数据的时候先清空播放缓冲区
 
-    // 4. 将 Reset 标志发送到下游 AudioSinkNode，确保下游在接收到新数据的时候先清空播放缓冲区
     if (!SendOutput(StreamItem<PcmFrame>{reset})) {
         return CancelledResult();
     }
+
+    // 4. 更新本地输出世代并重置 EOS 标记
+    output_epoch_ = reset.epoch_;
+    eos_forwarded_ = false;
 
     LOG_DEBUG("Audio decoder node forwarded Reset for epoch {}, target {} us", reset.epoch_, reset.target_us_);
 

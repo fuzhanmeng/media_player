@@ -278,6 +278,11 @@ public:
         return queue_.PopFor(timeout);
     }
 
+    /**
+     * @brief 查询队列是否已被 Pipeline 终止
+     * @note 用于区分"限时接收超时"与"Link 已 Abort"
+     */
+    bool IsAborted() const { return queue_.IsAborted(); }
 
 private:
     // Pipeline 可以通过 ILinkControl 和具体 Link 执行统一管理操作

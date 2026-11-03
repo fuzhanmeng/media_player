@@ -413,6 +413,8 @@ FfmpegDecoderReceiveResult FfmpegVideoDecoder::ReceiveFrame(std::uint64_t epoch)
  * 6. 将转码后的像素深拷贝至新分配的连续内存 VideoFrame 中，消除外部对 FFmpeg 底层缓冲的依赖。
  */
 FfmpegDecoderReceiveResult FfmpegVideoDecoder::ConvertCurrentFrame(std::uint64_t epoch) {
+    // 第 1 步：基础校验。宽高必须为正，format 必须是合法的 AVPixelFormat
+    // 这些字段来自 avcodec_receive_frame 填充的 AVFrame，
     if (decoded_frame_->width <= 0 || decoded_frame_->height <= 0 || decoded_frame_->format < 0) {
         LOG_ERROR("Decoder '{}' produced an invalid frame for epoch {}: {}x{}, format {}",
                   codec_name_,
@@ -425,7 +427,13 @@ FfmpegDecoderReceiveResult FfmpegVideoDecoder::ConvertCurrentFrame(std::uint64_t
                 MakeDecoderError(kReceiveFrameOperation, AVERROR_INVALIDDATA)};
     }
 
+    // 把 int 形式的 format 转成枚举，后面要用它做两件事：
+    //   1. 判断是不是已经是 YUV420P（决定走直通还是 sws_scale）
+    //   2. 传给 sws_getCachedContext（决定建哪个转换器）
     const AVPixelFormat source_format = static_cast<AVPixelFormat>(decoded_frame_->format);
+
+    // 第 2 步：确认 libswscale 认识这个源格式。
+    // sws_isSupportedInput 返回 <= 0 表示无法转换，此时无论直通还是sws_scale 都没有意义，直接报错
     if (sws_isSupportedInput(source_format) <= 0) {
         LOG_ERROR("Decoder '{}' produced unsupported swscale input format {} for epoch {}",
                   codec_name_,
@@ -436,6 +444,9 @@ FfmpegDecoderReceiveResult FfmpegVideoDecoder::ConvertCurrentFrame(std::uint64_t
                 MakeDecoderError(kReceiveFrameOperation, AVERROR(EINVAL))};
     }
 
+    // 第 3 步：预计算输出帧的字节数，只用于"防御性检查"，
+    // 这个值实际上没有被用于分配（VideoFrame 内部自己算），
+    // 这里只用它来验证 width/height 是否会导致尺寸溢出，返回负值说明宽高组合非法
     const int output_buffer_size =
         av_image_get_buffer_size(AV_PIX_FMT_YUV420P, decoded_frame_->width, decoded_frame_->height, 1);
     if (output_buffer_size < 0) {
@@ -450,48 +461,125 @@ FfmpegDecoderReceiveResult FfmpegVideoDecoder::ConvertCurrentFrame(std::uint64_t
                 MakeDecoderError(kValidateFrameSizeOperation, output_buffer_size)};
     }
 
-    // 复用或按需重建色彩空间与缩放上下文（处理 Dynamic Resolution Change）
-    sws_context_ = sws_getCachedContext(sws_context_,
-                                        decoded_frame_->width,
-                                        decoded_frame_->height,
-                                        source_format,
-                                        decoded_frame_->width,
-                                        decoded_frame_->height,
-                                        AV_PIX_FMT_YUV420P,
-                                        SWS_BILINEAR,
-                                        nullptr,
-                                        nullptr,
-                                        nullptr);
-
-    if (sws_context_ == nullptr) {
-        LOG_ERROR("sws_getCachedContext failed for decoder '{}', epoch {}, {}x{}, source format {}",
-                  codec_name_,
-                  epoch,
-                  decoded_frame_->width,
-                  decoded_frame_->height,
-                  static_cast<int>(source_format));
-        return {FfmpegDecoderReceiveStatus::kError,
-                std::nullopt,
-                MakeDecoderError(kConvertFrameOperation, AVERROR(ENOMEM))};
-    }
-
+    // 第 4 步：提取时间戳
+    // best_effort_timestamp 是 FFmpeg 根据容器时间戳、帧序、B 帧重排等信息
+    // "尽力推算"出来的显示时间；直接用 pts 可能在有 B 帧时不准
+    // 两者都没有（AV_NOPTS_VALUE）时，TimestampToMicroseconds 返回 nullopt，
+    // 下游 AvSyncNode 会用"上一帧 PTS + 帧时长"补齐。
     const std::int64_t timestamp = decoded_frame_->best_effort_timestamp != AV_NOPTS_VALUE
         ? decoded_frame_->best_effort_timestamp
         : decoded_frame_->pts;
-
     const std::optional<std::int64_t> pts_us = TimestampToMicroseconds(timestamp, video_stream_time_base_);
 
+    // 第 5 步：判断能否跳过 sws_scale
+    // 条件：源格式已经是 YUV420P，且三个平面的 stride 都是正的
+    const bool direct_copy = source_format == AV_PIX_FMT_YUV420P && decoded_frame_->linesize[0] > 0 &&
+        decoded_frame_->linesize[1] > 0 && decoded_frame_->linesize[2] > 0;
+
     try {
-        // 分配自持连续内存的 VideoFrame
+        // 第 6 步：分配输出帧
         VideoFrame output(FrameSize{decoded_frame_->width, decoded_frame_->height});
         output.pts_us_ = pts_us;
         output.epoch_ = epoch;
 
-        // 绑定 YUV420P 平面目标地址与行跨度（保留第 4 槽位为 nullptr 满足 FFmpeg 规范）
+        // 映射 FFmpeg 的色彩空间枚举到项目枚举（FFmpeg 值与项目枚举不一致，不能直接 cast）
+        // AVCOL_SPC_BT709=1, AVCOL_SPC_UNSPECIFIED=2, AVCOL_SPC_BT470BG/SMPTE170M=5/6, AVCOL_SPC_BT2020_NCL=9
+        switch (decoded_frame_->colorspace) {
+            case AVCOL_SPC_BT709:
+                output.color_space_ = VideoColorSpace::kBt709;
+                break;
+            case AVCOL_SPC_BT470BG:
+            case AVCOL_SPC_SMPTE170M:
+                output.color_space_ = VideoColorSpace::kBt601;
+                break;
+            case AVCOL_SPC_BT2020_NCL:
+            case AVCOL_SPC_BT2020_CL:
+                output.color_space_ = VideoColorSpace::kBt2020;
+                break;
+            default:
+                output.color_space_ = VideoColorSpace::kUnspecified;
+                break;
+        }
+
+        // 取值范围枚举值恰好对齐：AVCOL_RANGE_UNSPECIFIED=0, MPEG=1, JPEG=2
+        output.color_range_ = static_cast<VideoColorRange>(decoded_frame_->color_range);
+
+        // 分支 A：源已经是 YUV420P —— 只拷贝，不转换
+        if (direct_copy) {
+            const int frame_width = decoded_frame_->width;
+            const int frame_height = decoded_frame_->height;
+
+            // 色度平面是亮度平面的一半（2:1 下采样）。
+            // 宽高为奇数时向上取整，保证最后一行/列不越界。
+            const int uv_width = (frame_width + 1) / 2;
+            const int uv_height = (frame_height + 1) / 2;
+
+            // 逐平面拷贝，av_image_copy_plane 的签名：
+            //   av_image_copy_plane(dst, dst_linesize, src, src_linesize, bytewidth, height)
+            // 它每一行拷贝 bytewidth 个字节，行与行之间分别走 dst/src 的 linesize。
+            av_image_copy_plane(output.data_[0],
+                                output.linesize_[0],
+                                decoded_frame_->data[0],
+                                decoded_frame_->linesize[0],
+                                frame_width,
+                                frame_height);  // Y 平面
+            av_image_copy_plane(output.data_[1],
+                                output.linesize_[1],
+                                decoded_frame_->data[1],
+                                decoded_frame_->linesize[1],
+                                uv_width,
+                                uv_height);  // U 平面
+            av_image_copy_plane(output.data_[2],
+                                output.linesize_[2],
+                                decoded_frame_->data[2],
+                                decoded_frame_->linesize[2],
+                                uv_width,
+                                uv_height);  // V 平面
+
+            // 不需要 sws_scale，直接返回成功
+            return {FfmpegDecoderReceiveStatus::kFrame, std::optional<VideoFrame>(std::move(output)), {}};
+        }
+
+        // 分支 B：源是其它格式（NV12 / YUV422P / P010 / YUVJ420P …）
+        //  —— 必须真正做格式转换
+
+        // sws_getCachedContext 的行为：
+        //   - 参数没变 → 返回已有的 context（0 开销）
+        //   - 参数变了（例如分辨率变化、像素格式变化）→ 释放旧的、新建一个
+        // 所以它能自动处理"流中途分辨率变化"的情况，
+        // 不需要调用方额外判断。
+        sws_context_ = sws_getCachedContext(sws_context_,
+                                            decoded_frame_->width,
+                                            decoded_frame_->height,
+                                            source_format,  // 源格式
+                                            decoded_frame_->width,
+                                            decoded_frame_->height,
+                                            AV_PIX_FMT_YUV420P,  // 目标格式
+                                            SWS_BILINEAR,  // 缩放算法；因为不缩放，实际不生效
+                                            nullptr,
+                                            nullptr,
+                                            nullptr);
+
+        if (sws_context_ == nullptr) {
+            // 分配失败（内存不足）或参数非法
+            LOG_ERROR("sws_getCachedContext failed for decoder '{}', epoch {}, {}x{}, source format {}",
+                      codec_name_,
+                      epoch,
+                      decoded_frame_->width,
+                      decoded_frame_->height,
+                      static_cast<int>(source_format));
+            return {FfmpegDecoderReceiveStatus::kError,
+                    std::nullopt,
+                    MakeDecoderError(kConvertFrameOperation, AVERROR(ENOMEM))};
+        }
+
+        // sws_scale 要求第 4 个槽位是 nullptr（YUV420P 只有 3 个平面），
+        // linesize 的第 4 个槽位填 0，这是 FFmpeg 的约定。
         std::array<std::uint8_t*, 4> destination_data{output.data_[0], output.data_[1], output.data_[2], nullptr};
         std::array<int, 4> destination_linesize{output.linesize_[0], output.linesize_[1], output.linesize_[2], 0};
 
-        // 执行色彩空间转换与数据深拷贝
+        // 执行转换。返回"转换了多少行"，正常应该等于 height。
+        // src_slice_y = 0、src_slice_h = height 表示处理整帧。
         const int converted_height = sws_scale(sws_context_,
                                                decoded_frame_->data,
                                                decoded_frame_->linesize,
@@ -501,6 +589,7 @@ FfmpegDecoderReceiveResult FfmpegVideoDecoder::ConvertCurrentFrame(std::uint64_t
                                                destination_linesize.data());
 
         if (converted_height != decoded_frame_->height) {
+            // 返回行数不对，说明转换中途失败
             LOG_ERROR("sws_scale produced {} rows for decoder '{}' at epoch {}, expected {}",
                       converted_height,
                       codec_name_,
@@ -513,16 +602,19 @@ FfmpegDecoderReceiveResult FfmpegVideoDecoder::ConvertCurrentFrame(std::uint64_t
 
         return {FfmpegDecoderReceiveStatus::kFrame, std::optional<VideoFrame>(std::move(output)), {}};
     } catch (const std::bad_alloc&) {
+        // VideoFrame 构造里 av_mallocz 失败会抛这个
         LOG_ERROR("Failed to allocate output frame for decoder '{}' at epoch {}", codec_name_, epoch);
         return {FfmpegDecoderReceiveStatus::kError,
                 std::nullopt,
                 MakeDecoderError(kConvertFrameOperation, AVERROR(ENOMEM))};
     } catch (const std::length_error&) {
+        // std::vector 等容器请求了非法长度（VideoFrame 目前不用 vector，属防御性保留）
         LOG_ERROR("Output frame size is invalid for decoder '{}' at epoch {}", codec_name_, epoch);
         return {FfmpegDecoderReceiveStatus::kError,
                 std::nullopt,
                 MakeDecoderError(kConvertFrameOperation, AVERROR(EINVAL))};
     } catch (const std::invalid_argument&) {
+        // 参数非法（例如 FrameSize 宽高为 0）
         LOG_ERROR(
             "Failed to create output frame for decoder '{}' at epoch {} due to invalid arguments", codec_name_, epoch);
         return {FfmpegDecoderReceiveStatus::kError,

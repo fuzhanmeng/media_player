@@ -68,7 +68,7 @@ struct DecodeConfig final {
  */
 struct AudioConfig final {
     int device_buffer_ms_{200};  ///< 请求的 PCM buffer 时长（毫秒，允许范围 [5, 2000]）
-    int max_buffer_ms_{500};  ///< 音频缓存总预算（毫秒，允许范围 [5, 2000]）
+    int max_buffer_ms_{500};  ///< 音频缓存总预算（毫秒，[5, 2000]，仅用于配置校验，不限制运行时积压）
 };
 
 /**

@@ -87,20 +87,28 @@ public:
             throw std::invalid_argument("VideoSinkDispatcher requires a non-null IVideoSink");
         }
 
-        // 3. 若目标 Sink 与当前已绑定的完全一致，直接幂等返回
+        // 3. 取锁后再读 closed_：closed_ 由 mutex_ 保护，Close() 在锁内写它，
+        //    在锁外读取属于数据竞争
         std::unique_lock<std::mutex> lock(mutex_);
-        if (sink_ == sink) {
+
+        // 4. 如果分发器已永久关闭：拒绝重新挂载，避免析构后仍有新帧投递
+        if (closed_) {
+            LOG_WARN("VideoSinkDispatcher::Attach ignored: dispatcher is closed");
             return;
         }
 
-        // 4. 断开当前旧显示端的新帧入口
+        // 5. 若目标 Sink 与当前已绑定的完全一致，直接幂等返回
+        if (sink_ == sink) {
+            return;
+        }
+        // 6. 断开当前旧显示端的新帧入口
         IVideoSink* const previous = sink_;
         sink_ = nullptr;
 
-        // 5. 释放对旧 Sink 的投递，并阻塞等待已进入其回调的在途线程全部归零
+        // 6. 释放对旧 Sink 的投递，并阻塞等待已进入其回调的在途线程全部归零
         WaitForNoInFlight(lock, previous);
 
-        // 6. 挂载并启用新显示端
+        // 7. 挂载并启用新显示端
         sink_ = sink;
     }
 

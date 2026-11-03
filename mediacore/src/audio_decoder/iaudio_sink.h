@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 
@@ -68,6 +69,17 @@ public:
     virtual std::int64_t DelayFrames() = 0;
 
     /**
+     * @brief 查询设备当前还能立即接收多少采样帧（真实空闲空间）
+     * @return 设备环形缓冲区剩余可写帧数；默认返回最大值表示实现不限制
+     * @note 流控必须用它，不能用 DelayFrames()：
+     *       PulseAudio / PipeWire 的 ALSA 插件会把服务器端缓冲计入 snd_pcm_delay，
+     *       delay 可能大于实际写入量（例如缓冲 9600 帧却报告 10333 帧待播）。
+     *       此时把 delay 当作"设备占用"会让可用量恒为 0，上层停止写入，
+     *       设备随即欠载，整条音频链（以及被它拖住的解封装/视频链）永久停摆。
+     */
+    virtual std::int64_t WritableFrames() { return std::numeric_limits<std::int64_t>::max(); }
+
+    /**
      * @brief 轮询排空底层缓冲区中剩余的音频数据
      * @return 硬件缓冲区全部播完返回 true；仍有残存音频正在回放返回 false
      * @note 非阻塞操作，流结束时由调用方轮询调用，确保尾音完整播放而且不会阻塞主线程
@@ -86,6 +98,13 @@ public:
      * @note  ALSA 实现优先使用设备暂停；暂停时必须保留已写入缓冲但未发声的数据，恢复时从暂停处无缝续播
      */
     virtual void Pause(bool pause) = 0;
+
+    /**
+     * @brief 返回设备当前内部状态的简短描述，仅用于诊断日志
+     * @return 人类可读的状态描述；默认返回空串表示实现不提供
+     * @note 非阻塞、允许在任意节点线程调用；实现不得抛异常
+     */
+    virtual std::string DescribeState() const { return {}; }
 };
 
 /**

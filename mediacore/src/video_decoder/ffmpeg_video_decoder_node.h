@@ -131,6 +131,14 @@ private:
      */
     TickResult FailIfEpochIsCurrent(const MediaError& error, std::uint64_t epoch);
 
+    static constexpr int kMaxConsecutiveSkippableErrors = 30;  ///< 连续可跳过错误的上限
+    int consecutive_skippable_errors_{0};
+
+    /**
+     * @brief 判断错误是否属于"跳过当前数据即可继续"的类型
+     */
+    static bool IsSkippableDecodeError(const MediaError& error) noexcept;
+
     std::unique_ptr<FfmpegVideoDecoder> video_decoder_;  ///< 独占的底层 FFmpeg 解码器包装实例
     std::uint64_t output_epoch_{0};  ///< 已由 StreamReset 建立、下游正在消费的世代号
     bool eos_forwarded_{false};  ///< 当前 output_epoch_ 是否已向下游发送过 EndOfStream

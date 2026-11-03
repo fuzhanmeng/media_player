@@ -276,9 +276,12 @@ void PlayerWidget::RefreshPlaybackState() {
         return;
     }
 
-    const mediacore::PlaybackState state = player_->GetState();
-    const std::int64_t duration_us = player_->GetDurationUs();
-    const std::int64_t position_us = player_->GetPositionUs();
+    // 一次性读取状态、时长与位置：三者来自同一瞬间，
+    // 避免分别查询时出现"新文件的时长 + 旧文件的位置"这种跨媒体错配
+    const mediacore::IPlayer::PlaybackSnapshot snapshot = player_->GetSnapshot();
+    const mediacore::PlaybackState state = snapshot.state_;
+    const std::int64_t duration_us = snapshot.duration_us_;
+    const std::int64_t position_us = snapshot.position_us_;
 
     // 同步真实播放时间和总时长；拖动时控制条内部改为显示滑块对应的预览时间。
     controller_->SetTimeDisplay(position_us, duration_us);

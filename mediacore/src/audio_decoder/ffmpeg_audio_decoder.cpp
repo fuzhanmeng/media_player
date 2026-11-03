@@ -281,13 +281,18 @@ struct FfmpegAudioDecoder::Impl final {
             return true;
         }
 
-        std::int16_t samples[kMaxInputFrameSamples * PcmFrame::kChannels]{};
+        // 240 帧 × 2 声道 × sizeof(int16_t) = 960 字节
+        std::int16_t samples[FfmpegAudioDecoder::kMaxOutputFrames * PcmFrame::kChannels]{};
 
         for (;;) {
             auto* output_data = reinterpret_cast<std::uint8_t*>(samples);
 
             // 空输入表示没有更多声音，继续取尾部的数据，返回值为生成的采样帧数，负值是错误
-            const int produced = swr_convert(resampler_.get(), &output_data, kMaxInputFrameSamples, nullptr, 0);
+            // 输出容量必须与上面的缓冲一致（240 帧）；
+            // 若继续传 kMaxInputFrameSamples（1<<20），swr_convert 会按 100 万帧写入，
+            // 一旦 drain 残留超过 240 帧就会踩穿这块 960 字节的栈缓冲
+            const int produced = swr_convert(
+                resampler_.get(), &output_data, FfmpegAudioDecoder::kMaxOutputFrames, nullptr, 0);
 
             if (produced < 0) {
                 ThrowFfmpeg("swr_convert(drain)", produced);
@@ -322,8 +327,28 @@ struct FfmpegAudioDecoder::Impl final {
             CreateResampler(*frame_);
         } else if (frame_->sample_rate != input_rate_ || frame_->format != input_format_ ||
                    av_channel_layout_compare(&frame_->ch_layout, &input_layout_.value_) != 0) {
-            // 当前实现不能在同一流中途切换声音规格，例如采样率从 44100 变成 48000。
-            throw AudioDecodeException(MakeStateError("Mid-stream audio format change is not supported"));
+
+            // 格式变化（HE-AAC 的 SBR/PS、拼接流）：先交付旧段尾部，再按新格式重建重采样器
+            LOG_WARN("Audio format changed mid-stream: {} Hz/{} -> {} Hz/{}; rebuilding resampler",
+                     input_rate_,
+                     static_cast<int>(input_format_),
+                     frame_->sample_rate,
+                     static_cast<int>(frame_->format));
+
+            if (!DrainResampler(epoch, output)) {
+                return false;
+            }
+
+            // expected_input_sample_ 是按旧采样率累计的，而 CreateResampler 会把 input_rate_ 换成新值。
+            // 若不换算，下面用新采样率计算的 input_sample 会与它差出 (新-旧) × 已播时长，
+            // 必然误判为时间戳跳变，再走一次 drain + 重建并把时间轴锚点回退。
+            if (frame_->sample_rate != input_rate_ && input_rate_ > 0) {
+                expected_input_sample_ = av_rescale_q(expected_input_sample_,
+                                                      AVRational{1, input_rate_},
+                                                      AVRational{1, frame_->sample_rate});
+            }
+
+            CreateResampler(*frame_);
         }
 
         // 先用 FFmpeg 根据输入信息推算的 best_effort_timestamp，再用原始 pts；
@@ -377,11 +402,15 @@ struct FfmpegAudioDecoder::Impl final {
         // swr_get_out_samples 估计本次转换的输出采样帧数上限，包含内部暂存数据；
         // 实际生成数量由 swr_convert 返回，二者不一定相等。负值表示失败。
         const int capacity = swr_get_out_samples(resampler_.get(), frame_->nb_samples);
+
+        // 只有负值才是真正的错误；把 capacity 本身当作错误码传进去会得到误导信息
         if (capacity < 0) {
             ThrowFfmpeg("swr_get_out_samples", capacity);
         }
 
-        // 输入数量即使合法，异常采样率比例仍可能要求过大输出，另设转换容量上限。
+        // 输出量可以合法地超过输入量（重采样升频，例如 8 kHz -> 48 kHz 约 6 倍），
+        // 因此上限按输入上限的 16 倍设置，而不是直接和 nb_samples 的上限比较——
+        // 后者会把合法的升频结果判成错误，也让这条检查本身永远无法命中。
         constexpr int kMaxConvertedSamples = 16 * kMaxInputFrameSamples;
         if (capacity > kMaxConvertedSamples) {
             ThrowFfmpeg("validate audio resampling output size", AVERROR(EINVAL));

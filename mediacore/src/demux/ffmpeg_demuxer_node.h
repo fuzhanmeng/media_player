@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <chrono>
 
 #include "av_sync/playback_timeline.h"
 #include "av_types/packet.h"
@@ -169,6 +170,12 @@ private:
     TickResult ExecuteSeek(PendingSeek request);
 
     /**
+     * @brief 向两条输出队列发送 StreamReset，等待过程中仍可响应 Stop 与更新的 Seek
+     * @return kContinue 全部发送完成或被更新的 Seek 取代；kStopped 收到停止；kError 队列终止
+     */
+    TickResult SendSeekReset(const PendingSeek& request);
+
+    /**
      * @brief 驱动双路 Seek 的预滚、等待就绪和最终重读校验流程
      * @details
      * 当视频、音频两个输出分支同时存在时，单个 Demuxer 读取游标会带来一个问题：
@@ -188,7 +195,14 @@ private:
      */
     TickResult RestartSeekPass();
 
+    /**
+     * @brief 稳态待发项成功入队后的记录
+     * @details 若待发项是 EndOfStream，标记对应轨道已发送，两路都发完后置 eos_sent_
+     */
+    void OnSteadyPendingPushed();
+
     struct SeekPreroll;
+
 
     std::unique_ptr<FfmpegDemuxer> demuxer_;  ///< 底层 FFmpeg 解复用器
 
@@ -207,6 +221,16 @@ private:
 
     bool eos_sent_{false};  ///< 当前 output_epoch_ 是否已经向所有存在的输出分支发送过 EndOfStream
 
+    /**
+     * @brief 稳态播放阶段因下游队列已满而暂存的待发项（Packet 或 EndOfStream）
+     * @details 与预滚的 SeekPreroll::pending_ 独立：稳态不校验前缀摘要，只保证一轮一个动作
+     */
+    std::optional<PacketStreamItem> steady_pending_;
+    std::uint64_t steady_pending_epoch_{0};  ///< 待发项所属世代
+    PlaybackTrack steady_pending_track_{PlaybackTrack::kVideo};  ///< 待发项应进入哪条输出队列
+    bool video_eos_sent_{false};  ///< 当前世代视频队列是否已收到 EOS
+    bool audio_eos_sent_{false};  ///< 当前世代音频队列是否已收到 EOS
+
     // -------------------- 外部控制请求 --------------------
     mutable std::mutex control_mutex_;
     ///< 保护 pending_seek_ 的互斥锁，也用于协调“登记新 Seek”与“建立下一次 I/O 中断基准”
@@ -219,6 +243,8 @@ private:
 
     std::condition_variable eof_cv_;
     ///< EOF 等待条件变量。RequestSeek() 和停止钩子会通知它，唤醒挂起的工作线程
+
+
 };
 
 }  // namespace mediacore

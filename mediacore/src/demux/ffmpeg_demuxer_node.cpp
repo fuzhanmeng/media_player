@@ -33,7 +33,11 @@ namespace mediacore {
 
 namespace {
 constexpr const char* kNodeName = "Demuxer";
-constexpr auto kSeekSendWait = std::chrono::milliseconds(5);
+
+// 稳态发送与预滚发送用同样的等待上限：队列满时定期回到主循环，
+// 以便检查 Stop、新的 Seek 和过期待发项
+const auto kSeekSendWait = std::chrono::milliseconds(5);
+const auto kSteadySendWait = std::chrono::milliseconds(5);
 
 using PacketDigest = std::array<std::uint8_t, 32>;
 
@@ -336,22 +340,52 @@ void FfmpegDemuxerNode::RequestSeek(std::uint64_t epoch, std::int64_t target_us)
  * 4. 否则读一个包按 stream_index 分发
  */
 TickResult FfmpegDemuxerNode::Tick() {
-    // 1. 判断是否有音频或视频
-    if (demuxer_->GetVideoStreamIndex() >= 0 && !video_output_ ||
-        demuxer_->GetAudioStreamIndex() >= 0 && !audio_output_) {
+    // 1. 拓扑自检必须最先执行：后续任何一步都可能访问输出队列
+    if ((demuxer_->GetVideoStreamIndex() >= 0 && !video_output_) ||
+        (demuxer_->GetAudioStreamIndex() >= 0 && !audio_output_)) {
         return Fail("Every selected demux stream must have an output link", output_epoch_);
     }
 
+    // 2. 丢弃跨越 Seek 的待发项：它的世代已经不是当前世代
+    if (steady_pending_ && steady_pending_epoch_ != GetCurrentEpoch()) {
+        LOG_DEBUG("Demuxer drops stale steady pending item for epoch {}", steady_pending_epoch_);
+
+        steady_pending_.reset();
+    }
+
+    // 3. 优先重试待发项；无论成功还是超时都返回，保持"一轮只做一个动作"
+    if (steady_pending_) {
+        auto& output = steady_pending_track_ == PlaybackTrack::kVideo ? video_output_ : audio_output_;
+
+        switch (output->SendFor(*steady_pending_, kSteadySendWait)) {
+            case QueuePushResult::kTimedOut:
+                // 队列仍然满；下一轮再试，期间可以响应 Stop 与新的 Seek
+                return TickResult::kContinue;
+
+            case QueuePushResult::kAborted:
+                if (IsStopRequested()) {
+                    return TickResult::kStopped;
+                }
+                return Fail("Demuxer output link aborted while sending a steady item", steady_pending_epoch_);
+
+            case QueuePushResult::kPushed:
+                OnSteadyPendingPushed();
+                steady_pending_.reset();
+                return TickResult::kContinue;
+        }
+    }
+
+    // 4. 预滚优先于普通读包
     if (seek_preroll_) {
         return TickSeekPreroll();
     }
 
-    // 2. 如果当前世代已读完并发送过 EOS：挂起，不再调用 Read，避免在文件末尾空转
+    // 5. 本世代已读完并发出 EOS：挂起等待 Seek 或 Stop
     if (eos_sent_) {
         return WaitAtEof();
     }
 
-    // 3. 读之前先看有没有新的 Seek，有就本轮不读取，让基类去处理新的 Seek
+    // 6. 读之前先看有没有新的 Seek，有就本轮不读取，让基类去处理
     std::uint64_t read_epoch = 0;
     {
         std::lock_guard<std::mutex> lock(control_mutex_);
@@ -360,110 +394,74 @@ TickResult FfmpegDemuxerNode::Tick() {
             return TickResult::kContinue;
         }
 
-        // 记录本次读取的中断基准：之后达到的 Seek 会让这次 Read 返回 kSeekInterrupted
         demuxer_->PrepareNextIoForSeekInterrupt();
-
-        // 记录本次读取属于哪个世代，读完后再用它判断结果是否过期
         read_epoch = output_epoch_;
     }
 
-    // 4. 读一个包，按结果分流所有分支都先确认结果是否已过期——Read 可能阻塞很久
+    // 7. 读一个包
     Packet packet;
     FfmpegReadResult read_result = demuxer_->Read(packet);
 
     switch (read_result.status_) {
         case mediacore::FfmpegReadStatus::kPacket: {
-            // 读到了一个包，如果读的过程中发生了 Seek，那么直接丢弃
             if (read_epoch != GetCurrentEpoch()) {
                 return TickResult::kContinue;
             }
 
             packet.SetEpoch(read_epoch);
 
-            // 同一个 AVPacket 直送一条队列：按流号区别音频/视频
-            auto& output = packet.GetStreamIndex() == demuxer_->GetVideoStreamIndex() ? video_output_ : audio_output_;
+            steady_pending_track_ = packet.GetStreamIndex() == demuxer_->GetVideoStreamIndex() ? PlaybackTrack::kVideo
+                                                                                               : PlaybackTrack::kAudio;
+            steady_pending_epoch_ = read_epoch;
+            steady_pending_ = PacketStreamItem{std::in_place_type<Packet>, std::move(packet)};
 
-            // 如果发送失败
-            if (!output || !output->Send(PacketStreamItem{std::in_place_type<Packet>, std::move(packet)})) {
-                // 确认是否因为停止
-                if (IsStopRequested()) {
-                    LOG_DEBUG(
-                        "Demuxer stopped sending packet for epoch {}, "
-                        "output link was interrupted by stop",
-                        read_epoch);
-                    return TickResult::kStopped;
-                }
-
-                // 否则就是真实报错
-                LOG_ERROR(
-                    "Demuxer could not send packet for epoch {}, "
-                    "output link is unavailable",
-                    read_epoch);
-                return Fail("Demuxer output link is unavailable", read_epoch);
-            }
-
+            // 本轮只负责读；真正的发送留到下一轮的第 3 步
             return TickResult::kContinue;
         }
-        case mediacore::FfmpegReadStatus::kSkipped:
-            // 读到字幕或未选中的其它流，包已自行释放，直接进入下一轮
-            return TickResult::kContinue;
-        case mediacore::FfmpegReadStatus::kSeekInterrupted:
-            // 被更新的 Seek 打断了
-            LOG_DEBUG("Demuxer read for epoch {} was interrupted by a newer seek", read_epoch);
 
+        case mediacore::FfmpegReadStatus::kSkipped:
             return TickResult::kContinue;
+
+        case mediacore::FfmpegReadStatus::kSeekInterrupted:
+            LOG_DEBUG("Demuxer read for epoch {} was interrupted by a newer seek", read_epoch);
+            return TickResult::kContinue;
+
         case mediacore::FfmpegReadStatus::kStopInterrupted:
-            // 读取被停止指令打断
             LOG_INFO("Demuxer read for epoch {} was interrupted by stop", read_epoch);
             return TickResult::kStopped;
-        case mediacore::FfmpegReadStatus::kEndOfStream:
-            // 度过读取期间发生了 Seek，这个 EOF 属于旧位置，忽略
+
+        case mediacore::FfmpegReadStatus::kEndOfStream: {
             if (read_epoch != GetCurrentEpoch()) {
                 LOG_DEBUG("Ignoring stale EndOfStream for epoch {}", read_epoch);
                 return TickResult::kContinue;
             }
 
-            // 两路各自 Drain，Player 只在所有存在的轨道都报告结束后进入 Ended
-            for (const auto& output : {video_output_, audio_output_}) {
-                if (output && !output->Send(PacketStreamItem{EndOfStream{read_epoch}})) {
-                    if (IsStopRequested()) {
-                        LOG_DEBUG(
-                            "Demuxer could not send EndOfStream for epoch {}"
-                            "output link was interrupted by stop",
-                            read_epoch);
+            const bool need_video = video_output_ && !video_eos_sent_;
+            const bool need_audio = audio_output_ && !audio_eos_sent_;
 
-                        return TickResult::kStopped;
-                    }
-
-                    LOG_ERROR(
-                        "Demuxer could not send EndOfStream for epoch {}, "
-                        "output link is unavailable",
-                        read_epoch);
-                    return Fail("Demuxer output link is unavailable while sending EndOfStream", read_epoch);
-                }
-            }
-
-            eos_sent_ = true;
-            LOG_INFO(
-                "Demuxer reached end of stream for epoch {}; "
-                "waiting for seek or stop",
-                read_epoch);
-            return TickResult::kContinue;
-        case mediacore::FfmpegReadStatus::kError:
-            // 如果报错是过期的世代，直接忽略
-            if (read_epoch != GetCurrentEpoch()) {
-                LOG_DEBUG("Ignoring stale Demuxer read error for epoch {}", read_epoch);
-
+            if (need_video || need_audio) {
+                // 两条队列的 EOS 逐个投递，同样走待发机制，避免阻塞
+                steady_pending_track_ = need_video ? PlaybackTrack::kVideo : PlaybackTrack::kAudio;
+                steady_pending_epoch_ = read_epoch;
+                steady_pending_ = PacketStreamItem{EndOfStream{read_epoch}};
                 return TickResult::kContinue;
             }
 
-            // 否则就是真的报错了
+            eos_sent_ = true;
+            LOG_INFO("Demuxer reached end of stream for epoch {}; waiting for seek or stop", read_epoch);
+            return TickResult::kContinue;
+        }
+
+        case mediacore::FfmpegReadStatus::kError:
+            if (read_epoch != GetCurrentEpoch()) {
+                LOG_DEBUG("Ignoring stale Demuxer read error for epoch {}", read_epoch);
+                return TickResult::kContinue;
+            }
             LOG_ERROR("Demuxer read error for epoch {}: {}", read_epoch, read_result.error_.Message());
             return Fail(read_result.error_, read_epoch);
     }
 
     LOG_ERROR("FfmpegDemuxer returned an unknown read status for epoch {}", read_epoch);
-
     return Fail("FfmpegDemuxer returned an unknown read status", read_epoch);
 }
 
@@ -586,44 +584,42 @@ TickResult FfmpegDemuxerNode::ExecuteSeek(PendingSeek request) {
 
     // 5. 若执行失败
     if (seek_result.status_ != FfmpegSeekStatus::kSucceeded) {
-        // 但该世代已经被后续的更新 Seek 取代，则忽略此失效错误
         if (request.epoch_ != GetCurrentEpoch()) {
             LOG_DEBUG("Ignoring failed superseded seek for epoch {}", request.epoch_);
-
             return TickResult::kContinue;
         }
-
         LOG_ERROR("Demuxer seek failed: {}", seek_result.error_.Message());
         return Fail(seek_result.error_, request.epoch_);
     }
 
-    // 6. 如果 Seek 成功返回期间又有新的 Seek 发生，不切换输出状态，直接交给后续的 Seek 处理
+    // 6. 如果 Seek 成功返回期间又有新的 Seek 发生
     if (request.epoch_ != GetCurrentEpoch()) {
         LOG_DEBUG("Ignoring successful seek because a newer seek arrived for epoch {}", request.epoch_);
-
         return TickResult::kContinue;
     }
 
     // 7. 本次 Seek 成功：更新世代号，并重置 EOF 标记
     output_epoch_ = request.epoch_;
     eos_sent_ = false;
+    video_eos_sent_ = false;
+    audio_eos_sent_ = false;
+    steady_pending_.reset();
 
-    // 8. 两条 FIFO 队列必须先各自收到 Reset 再收到新的包，避免音频解码器残留上一世代的延迟样本
-    for (const auto& output : {video_output_, audio_output_}) {
-        if (output && !output->Send(PacketStreamItem{StreamReset{request.epoch_, request.target_us_}})) {
-            if (IsStopRequested()) {
-                LOG_DEBUG("Demuxer could not send StreamReset for epoch {}; output link was interrupted by stop",
-                          request.epoch_);
-                return TickResult::kStopped;
-            }
-
-            LOG_ERROR("Demuxer could not send StreamReset for epoch {}, output link is unavailable", request.epoch_);
-            return Fail("Demuxer Send StreamReset failed", output_epoch_);
-        }
+    // 8. 两条 FIFO 队列先各自收到 Reset，再接收新包；改为限时发送，
+    //    发送过程中仍可响应 Stop 与更新的 Seek
+    const TickResult reset_result = SendSeekReset(request);
+    if (reset_result != TickResult::kContinue) {
+        return reset_result;
     }
 
-    // 9. 两条有界队列都有可能在就绪后停住，单游标若继续给该分支发送数据，则会阻断另一个分支的数据发送
-    // 分别预滚并重置已经交付的前缀，保留每个解码器的顺序和状态，不借无界缓存绕过背压
+    // SendSeekReset 用 kContinue 同时表示"两条队列都发完了"和"被更新的 Seek 取代"，
+    // 后者会在这里再校验一次世代，避免为已经过期的 request 建立预滚对象
+    if (request.epoch_ != GetCurrentEpoch()) {
+        LOG_DEBUG("Demuxer skips preroll setup for superseded epoch {}", request.epoch_);
+        return TickResult::kContinue;
+    }
+
+    // 9. 双路都有输出时才建立预滚状态
     if (timeline_ && video_output_ && audio_output_) {
         seek_preroll_ = std::make_unique<SeekPreroll>(request);
         LOG_INFO("Demuxer starting bounded video/audio seek preroll at epoch {}", request.epoch_);
@@ -635,15 +631,61 @@ TickResult FfmpegDemuxerNode::ExecuteSeek(PendingSeek request) {
                  request.target_us_,
                  *seek_result.best_effort_position_us_);
     } else {
-        LOG_INFO(
-            "Demuxer completed seek for epoch {}; target {} us; "
-            "actual presentation position will be determined by decoded output",
-            request.epoch_,
-            request.target_us_);
+        LOG_INFO("Demuxer completed seek for epoch {}; target {} us; "
+                 "actual presentation position will be determined by decoded output",
+                 request.epoch_,
+                 request.target_us_);
     }
 
     return TickResult::kContinue;
 }
+
+/**
+ * @brief 向两条输出队列发送 StreamReset，等待过程中仍可响应 Stop 与更新的 Seek
+ * @return kContinue 全部发送完成或被更新的 Seek 取代；kStopped 收到停止；kError 队列终止
+ */
+TickResult FfmpegDemuxerNode::SendSeekReset(const PendingSeek& request) {
+    for (const auto& output : {video_output_, audio_output_}) {
+        if (!output) {
+            continue;
+        }
+
+        PacketStreamItem item{StreamReset{request.epoch_, request.target_us_}};
+
+        for (;;) {
+
+            // 1. 如果停止了直接返回
+            if (IsStopRequested()) {
+                return TickResult::kStopped;
+            }
+
+            // 2. 如果不是当前世代
+            if (request.epoch_ != GetCurrentEpoch()) {
+                LOG_DEBUG("Demuxer abandoned StreamReset for superseded epoch {}", request.epoch_);
+                return TickResult::kContinue;
+            }
+
+            // 3. 非阻塞发送
+            switch (output->SendFor(item, kSeekSendWait)) {   // 已有常量，5 ms
+                case QueuePushResult::kPushed:
+                    break;
+
+                case QueuePushResult::kTimedOut:
+                    continue;
+
+                case QueuePushResult::kAborted:
+                    return IsStopRequested()
+                        ? TickResult::kStopped
+                        : Fail("Demuxer output link aborted while sending StreamReset", request.epoch_);
+            }
+
+            break;   // kPushed 跳到下一条队列
+        }
+    }
+
+    return TickResult::kContinue;
+}
+
 
 /**
  * @brief 将 FFmpeg 读取位置重新定位到本次 Seek 目标，开始下一阶段预滚
@@ -662,8 +704,8 @@ TickResult FfmpegDemuxerNode::ExecuteSeek(PendingSeek request) {
 TickResult FfmpegDemuxerNode::RestartSeekPass() {
     auto& seek = *seek_preroll_;
     const char* const pass_name = seek.phase_ == SeekPreroll::Phase::kAudio ? "audio preroll"
-                                 : seek.phase_ == SeekPreroll::Phase::kReplay ? "verified replay"
-                                                                              : "video preroll";
+        : seek.phase_ == SeekPreroll::Phase::kReplay                        ? "verified replay"
+                                                                            : "video preroll";
     {
         std::lock_guard<std::mutex> lock(control_mutex_);
         if (pending_seek_ || !IsCurrentEpoch(seek.request_.epoch_)) {
@@ -680,10 +722,8 @@ TickResult FfmpegDemuxerNode::RestartSeekPass() {
         demuxer_->PrepareNextIoForSeekInterrupt();
     }
 
-    LOG_DEBUG("Demuxer relocating to {} us for {} (epoch {})",
-              seek.request_.target_us_,
-              pass_name,
-              seek.request_.epoch_);
+    LOG_DEBUG(
+        "Demuxer relocating to {} us for {} (epoch {})", seek.request_.target_us_, pass_name, seek.request_.epoch_);
 
     // 解锁后再进入 FFmpeg：Seek 期间外部仍可提交更新的目标
     const auto result = demuxer_->Seek(seek.request_.target_us_);
@@ -694,17 +734,14 @@ TickResult FfmpegDemuxerNode::RestartSeekPass() {
     }
 
     if (result.status_ == FfmpegSeekStatus::kSeekInterrupted || !IsCurrentEpoch(seek.request_.epoch_)) {
-        LOG_DEBUG("Demuxer {} relocation for epoch {} abandoned: a newer seek arrived",
-                  pass_name,
-                  seek.request_.epoch_);
+        LOG_DEBUG(
+            "Demuxer {} relocation for epoch {} abandoned: a newer seek arrived", pass_name, seek.request_.epoch_);
         return TickResult::kContinue;
     }
 
     if (!result.IsSucceeded()) {
-        LOG_ERROR("Demuxer {} relocation failed for epoch {}: {}",
-                  pass_name,
-                  seek.request_.epoch_,
-                  result.error_.Message());
+        LOG_ERROR(
+            "Demuxer {} relocation failed for epoch {}: {}", pass_name, seek.request_.epoch_, result.error_.Message());
         return Fail(result.error_, seek.request_.epoch_);
     }
 
@@ -717,6 +754,33 @@ TickResult FfmpegDemuxerNode::RestartSeekPass() {
              seek.video_.delivered_packet_count_,
              seek.audio_.delivered_packet_count_);
     return TickResult::kContinue;
+}
+
+/**
+ * @brief 稳态待发项成功入队后的记账
+ * @details 只有 EndOfStream 需要额外处理：标记对应轨道已发送，并在两路都发完后置 eos_sent_
+ */
+void FfmpegDemuxerNode::OnSteadyPendingPushed() {
+    if (!std::holds_alternative<EndOfStream>(*steady_pending_)) {
+        return;
+    }
+
+    if (steady_pending_track_ == PlaybackTrack::kVideo) {
+        video_eos_sent_ = true;
+    } else {
+        audio_eos_sent_ = true;
+    }
+
+    const bool video_done = !video_output_ || video_eos_sent_;
+    const bool audio_done = !audio_output_ || audio_eos_sent_;
+
+    if (video_done && audio_done) {
+        eos_sent_ = true;
+    }
+
+    LOG_INFO("Demuxer sent EndOfStream to {} queue at epoch {}",
+             steady_pending_track_ == PlaybackTrack::kVideo ? "video" : "audio",
+             steady_pending_epoch_);
 }
 
 /**
@@ -832,11 +896,12 @@ TickResult FfmpegDemuxerNode::TickSeekPreroll() {
             seek.pending_ = PacketStreamItem{EndOfStream{epoch}};
         } else if (seek.phase_ == SeekPreroll::Phase::kReplay) {
             // Replay 完成，恢复普通 EOF 等待流程
-            LOG_INFO("Demuxer replay finished at epoch {}: prefixes verified (video {}, audio {} packets); "
-                     "resuming normal EOF wait",
-                     epoch,
-                     seek.video_.delivered_packet_count_,
-                     seek.audio_.delivered_packet_count_);
+            LOG_INFO(
+                "Demuxer replay finished at epoch {}: prefixes verified (video {}, audio {} packets); "
+                "resuming normal EOF wait",
+                epoch,
+                seek.video_.delivered_packet_count_,
+                seek.audio_.delivered_packet_count_);
             seek_preroll_.reset();
             eos_sent_ = true;
         } else {
@@ -917,12 +982,13 @@ TickResult FfmpegDemuxerNode::TickSeekPreroll() {
         // 已交付前缀必须逐包匹配；匹配成功后跳过，避免重复送入解码器
         if (prefix.compared_packet_count_ < prefix.delivered_packet_count_) {
             if (!prefix.MatchesDeliveredPrefix(digest)) {
-                LOG_ERROR("Demuxer replay could not reproduce the {} packet prefix at epoch {} "
-                          "({} of {} compared)",
-                          video ? "video" : "audio",
-                          epoch,
-                          prefix.compared_packet_count_,
-                          prefix.delivered_packet_count_);
+                LOG_ERROR(
+                    "Demuxer replay could not reproduce the {} packet prefix at epoch {} "
+                    "({} of {} compared)",
+                    video ? "video" : "audio",
+                    epoch,
+                    prefix.compared_packet_count_,
+                    prefix.delivered_packet_count_);
                 return Fail("Seek cannot reproduce the delivered packet prefix; refusing to drop unknown packets",
                             epoch);
             }

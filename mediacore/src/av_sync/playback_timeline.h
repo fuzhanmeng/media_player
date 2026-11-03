@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -358,6 +359,33 @@ public:
         });
     }
 
+    /**
+     * @brief 等待播放位置到达目标时间，或控制状态发生变化
+     * @param state_version 调用方上次从 Get() 处读到的控制更新次数
+     * @param target_us 目标播放位置（微秒）
+     * @param duration 最长等待时间，默认 5 毫秒
+     * @details
+     * 视频节点用它替代"反复 Get() 重算 delta"的自旋：位置由 PublishAudio（音频）或
+     * 系统时钟外推推进，两者都会在状态变化时通知条件变量；纯视频场景下由 duration 兜底
+     */
+    void WaitForPosition(std::uint64_t state_version,
+                         std::int64_t target_us,
+                         std::chrono::milliseconds duration = std::chrono::milliseconds(5)) {
+        std::unique_lock<std::mutex> lock(state_mutex_);
+
+        state_changed_cv_.wait_for(lock, duration, [&]() {
+            return playback_state_.state_version_ != state_version || playback_state_.stopped_ ||
+                PositionLocked() >= target_us;
+        });
+    }
+
+    /**
+     * @brief 无锁读取控制版本号
+     * @note 仅用于快速判断"是否需要进入完整的 Get()"，不保证与其他字段一致
+     */
+    std::uint64_t GetStateVersion() const noexcept { return state_version_atomic_.load(std::memory_order_acquire); }
+
+
 private:
     // 一个单调时钟，只测量经过的时间，不受修改系统日期和时间的影响，不是现实时间
     using SteadyClock = std::chrono::steady_clock;
@@ -404,6 +432,10 @@ private:
      */
     void ChangedLocked() {
         ++playback_state_.state_version_;
+        // 同步无锁副本：AudioSinkNode 的 HasPendingControl 每轮都要读版本号，
+        // 若这里不更新，GetStateVersion() 会永远返回 0，HasPendingControl 恒为真，
+        // 音频工作线程会一直停留在控制处理分支，永远到不了 Tick()
+        state_version_atomic_.store(playback_state_.state_version_, std::memory_order_release);
         state_changed_cv_.notify_all();
     }
 
@@ -432,6 +464,8 @@ private:
     SteadyClock::time_point last_audio_progress_time_{SteadyClock::now()};  ///< 音频进度最近一次向前推进的系统物理时刻
 
     std::int64_t last_audio_position_us_{0};  ///< 上次确认的音频实际发声进度位置
+
+    std::atomic<std::uint64_t> state_version_atomic_{0};
 };
 
 }  // namespace mediacore

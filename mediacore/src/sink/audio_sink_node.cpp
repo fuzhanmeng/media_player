@@ -91,7 +91,7 @@ std::int64_t AudioSinkNode::TargetSample(std::int64_t targrt_us) {
  * @return 时间轴中的播放、暂停、Seek 或停止状态比本节点记录的新时返回 true
  */
 bool AudioSinkNode::HasPendingControl() const noexcept {
-    return timeline_->Get().state_version_ != applied_version_;
+    return timeline_->GetStateVersion() != applied_version_;
 }
 
 /**
@@ -198,6 +198,10 @@ void AudioSinkNode::PublishClock() {
         return;
     }
 
+    // 欠载（XRUN）后不要把 next_frame_ 往回减：
+    // 设备缓冲区被播空才会欠载，已提交的帧确实发过声；AlsAudioSink 在 Recover(-EPIPE) 中
+    // 删除 shadow 前缀后，下面 next_frame_ - DelayFrames() 已经等于真实播放位置。
+    // 若再额外回退，ProcessFrame 会按"时间戳空档"补出一段静音，把后续音频整体后移。
     const auto delay = std::max<std::int64_t>(0, sink_->DelayFrames());
 
     // 起播阶段设备排队量可能超过已写入量，位置至少从 0 开始，不能发布负时间
@@ -294,7 +298,7 @@ std::size_t AudioSinkNode::SubmitFrames(const std::int16_t* samples, std::size_t
  * 原因是，音频设备每次可能一次性接收当前的一块音频，在这块音频没有交付之前必须从同一个位置继续处理
  */
 void AudioSinkNode::ProcessFrame(const PlaybackTimeline::Snapshot& state) {
-    auto frame = *pending_frame_;
+    const auto& frame = *pending_frame_;
     const auto count = frame.FrameCount();
 
     // 1. 数据合法性校验：确保为成对的立体声采样点、单包未超限，且时间戳未溢出
@@ -339,11 +343,42 @@ void AudioSinkNode::ProcessFrame(const PlaybackTimeline::Snapshot& state) {
         return;
     }
 
-    // 7. 流控：设备中已排队的帧数不能超过预算，否则提前写入只会增加起播延迟 Seek 后的清场量
-    const auto delay = std::max<std::int64_t>(0, sink_->DelayFrames());
-    const auto available = std::max<std::int64_t>(0, max_buffer_frames_ - delay);
+    // 7. 流控：本轮能写多少帧，取"设备真实空闲空间"与"本地积压预算"的较小值
+    //
+    //    关键：不能用 DelayFrames() 判断设备是否还能写
+    //    PulseAudio / PipeWire 的 ALSA 插件会把服务器端缓冲计入 snd_pcm_delay，
+    //    其返回值可能超过本对象实际提交的总量（实测缓冲 9600 帧却报告 10333 帧待播）
+    //    用 max_buffer_frames_ - delay 计算可用量会得到 0，且永远保持 0：
+    //    上层不再写入 -> 设备欠载 -> 依然报高 delay -> 整个音频链以及被它拖住的
+    //    解封装/视频链一起永久停摆（本次"只有一瞬间有声、画面卡住"即此原因）
+    //
+    //    WritableFrames() 对应 snd_pcm_avail_update()，是设备环形缓冲区真正还能接收的帧数，
+    //    与 writei 的成功判据一致。max_buffer_frames_ 仍然作为上限，
+    //    防止在设备缓冲大于配置预算时一次塞进过多数据、拉长 Seek 后的清场时间。
+    const auto device_writable = sink_->WritableFrames();
+    const auto available = std::max<std::int64_t>(
+        0, std::min<std::int64_t>(device_writable, max_buffer_frames_));
 
     if (available == 0) {
+        // 设备暂时写不进去（缓冲满、刚 prepare 完尚未起播、或正在恢复）
+        // 这里也是最容易掩盖卡死的分支：若设备真的不再消费，上游解码器会一直阻塞
+        // 因此限频打印设备内部状态，便于从日志直接判断"设备不消费"还是"上层没送数据"
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_flow_stall_log_ >= std::chrono::seconds(1)) {
+            last_flow_stall_log_ = now;
+            LOG_WARN("Audio sink flow control idle: epoch {}, next_frame {}, device writable {} frames, "
+                     "budget {} frames, block start {} +{} of {}, pending {}, device [{}]",
+                     active_epoch_,
+                     next_frame_,
+                     device_writable,
+                     max_buffer_frames_,
+                     frame.start_sample_,
+                     frame_offset_,
+                     count,
+                     pending_frame_.has_value() ? "yes" : "no",
+                     sink_->DescribeState());
+        }
+
         timeline_->Wait(state.state_version_);
         return;
     }

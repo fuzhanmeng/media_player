@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -191,6 +192,7 @@ private:
     bool draining_{false};  ///< 已接收到 EOS，正在等待设备播放完剩余尾音
     bool ended_{false};  ///< 本世代是否已向时间轴报告音频轨道结束
     bool clock_ready_{false};  ///< 本世代是否已有声音交给设备，可用于估算音频播放进度
+    std::chrono::steady_clock::time_point last_flow_stall_log_{};  ///< 流控卡死诊断日志上次打印时刻，用于限频
 };
 
 }  // namespace mediacore

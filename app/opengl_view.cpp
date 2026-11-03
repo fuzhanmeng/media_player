@@ -128,24 +128,48 @@ constexpr std::array<unsigned int, 6> kIndices = {
 };
 
 /**
- * @brief ITU-R BT.709 标准 HDTV 色彩空间转换矩阵（按 OpenGL Column-Major 列优先存储）
+ * @brief ITU-R BT.709 标准 HDTV 色彩空间转换矩阵（列优先，Column-Major）
  * @details
- * 数学公式：
+ * 数学公式（full range）：
  * R = Y + 1.5748 * V
  * G = Y - 0.1873 * U - 0.4681 * V
  * B = Y + 1.8556 * U
+ *
+ * OpenGL/Qt 的 mat3 按列优先存储：第 1 列是 Y 系数，第 2 列 U 系数，第 3 列 V 系数
  */
 constexpr std::array<float, 9> kMatrixBt709 = {
-    1.0f,
-    1.0f,
-    1.0f,  // 第 1 列：Y 的加权系数
-    0.0f,
-    -0.1873f,
-    1.8556f,  // 第 2 列：U 的加权系数
-    1.5748f,
-    -0.4681f,
-    0.0f  // 第 3 列：V 的加权系数
+    1.0f,     1.0f,      1.0f,       // 第 1 列：Y 的加权系数（R/G/B 都需要 Y 分量）
+    0.0f,    -0.1873f,   1.8556f,    // 第 2 列：U 的加权系数（只影响 G 和 B）
+    1.5748f, -0.4681f,   0.0f        // 第 3 列：V 的加权系数（只影响 R 和 G）
 };
+
+/**
+ * @brief ITU-R BT.601 标准清晰度（SD）色彩空间转换矩阵（列优先）
+ * @details
+ * R = Y + 1.402 * V
+ * G = Y - 0.344136 * U - 0.714136 * V
+ * B = Y + 1.772 * U
+ */
+constexpr std::array<float, 9> kMatrixBt601 = {
+    1.0f,  1.0f,        1.0f,
+    0.0f, -0.344136f,   1.772f,
+    1.402f, -0.714136f, 0.0f
+};
+
+/**
+ * @brief ITU-R BT.2020 超高清（UHD）色彩空间转换矩阵（列优先）
+ * @details
+ * R = Y + 1.4746 * V
+ * G = Y - 0.164553 * U - 0.571353 * V
+ * B = Y + 1.8814 * U
+ */
+constexpr std::array<float, 9> kMatrixBt2020 = {
+    1.0f,  1.0f,         1.0f,
+    0.0f, -0.164553f,    1.8814f,
+    1.4746f, -0.571353f, 0.0f
+};
+
+
 
 }  // namespace
 
@@ -170,10 +194,24 @@ OpenGLView::OpenGLView(QWidget* parent) : QOpenGLWidget(parent) {
  * 4. 调用 doneCurrent() 解绑上下文。
  */
 OpenGLView::~OpenGLView() {
+    // 控件可能从未创建上下文（例如构造函数后立即销毁）；此时没有 GL 资源可释放
+    if (context() == nullptr) {
+        LOG_INFO("OpenGLView destroyed before context creation");
+        return;
+    }
+
     makeCurrent();
 
-    // 释放由 SetupTextures 创建的 Y/U/V 显存纹理句柄
-    glDeleteTextures(static_cast<GLsizei>(texture_ids_.size()), texture_ids_.data());
+    if (texture_ids_[0] != 0 || texture_ids_[1] != 0 || texture_ids_[2] != 0) {
+        glDeleteTextures(static_cast<GLsizei>(texture_ids_.size()), texture_ids_.data());
+        texture_ids_ = {0, 0, 0};
+    }
+
+    // ★ 必须在上下文仍然有效时销毁，否则句柄泄漏
+    shader_program_.reset();
+    vao_.destroy();
+    vbo_.destroy();
+    ebo_.destroy();
 
     doneCurrent();
     LOG_INFO("OpenGLView destroyed, OpenGL resources released");
@@ -261,7 +299,7 @@ void OpenGLView::resizeGL(int width, int height) {
 void OpenGLView::paintGL() {
     glClear(GL_COLOR_BUFFER_BIT);
 
-    if (!shader_ready_) {
+    if (!shader_ready_ || !shader_program_) {
         LOG_TRACE("Paint skipped because shader is not ready");
         return;
     }
@@ -279,15 +317,51 @@ void OpenGLView::paintGL() {
         return;
     }
 
-    // 2. 上传 Y/U/V 数据至对应 GPU 纹理
-    LOG_TRACE("Painting frame: {}x{}", frame->width_, frame->height_);
+    // 2. 根据帧的色彩空间选择转换矩阵
+    //    kUnspecified 时按分辨率推断：≥720p 用 BT.709，否则用 BT.601
+    const auto* matrix = &kMatrixBt709;  // 默认 BT.709
+    switch (frame->color_space_) {
+        case mediacore::VideoColorSpace::kBt709:
+            matrix = &kMatrixBt709;
+            break;
+        case mediacore::VideoColorSpace::kBt601:
+            matrix = &kMatrixBt601;
+            break;
+        case mediacore::VideoColorSpace::kBt2020:
+            matrix = &kMatrixBt2020;
+            break;
+        case mediacore::VideoColorSpace::kUnspecified:
+        default:
+            // 推断：高清及以上用 BT.709，标清用 BT.601
+            matrix = (frame->height_ >= 720) ? &kMatrixBt709 : &kMatrixBt601;
+            break;
+    }
+
+    // 3. 根据取值范围决定是否需要黑电平校正
+    //    Limited range (video range): Y [16,235], UV [16,240]
+    //    Full range (pc range): Y/UV [0,255]
+    //    kUnspecified 默认按 Limited 处理（最保守，大部分视频都是 Limited）
+    const bool is_full_range = (frame->color_range_ == mediacore::VideoColorRange::kFull);
+
+    // 4. 上传 Y/U/V 数据至对应 GPU 纹理
+    LOG_TRACE("Painting frame: {}x{}, color_space={}, color_range={}, using {}",
+              frame->width_,
+              frame->height_,
+              static_cast<int>(frame->color_space_),
+              static_cast<int>(frame->color_range_),
+              is_full_range ? "full-range" : "limited-range");
     UploadFrameTextures(*frame);
 
-    // 3. 激活着色器并传递色彩转换参数
-    shader_program_.bind();
-    shader_program_.setUniformValue("u_colorMatrix", QMatrix3x3(kMatrixBt709.data()));
+    // 5. 激活着色器并传递色彩转换参数
+    shader_program_->bind();
+    shader_program_->setUniformValue("u_colorMatrix", QMatrix3x3(matrix->data()));
 
-    // 4. 分别激活纹理单元并绑定对应的 2D 纹理对象
+    // 注意：当前着色器实现的矩阵是 full-range 形式，对 limited-range 片源会偏灰（黑位压缩）。
+    // 完整修复需要在着色器里增加 uniform vec3 u_yuvOffset/u_yuvScale，
+    // 计算 yuv = (yuv - offset) * scale 后再乘矩阵。当前实现仅演示矩阵选择。
+    // TODO: 增加着色器 uniform 支持 limited-range 的黑电平校正
+
+    // 6. 分别激活纹理单元并绑定对应的 2D 纹理对象
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, texture_ids_[0]);
 
@@ -303,7 +377,11 @@ void OpenGLView::paintGL() {
 
     // 6. 解绑恢复状态
     vao_.release();
-    shader_program_.release();
+    // 必须用 -> 调用 QOpenGLShaderProgram::release()（解除 GL 绑定）。
+    // shader_program_ 是 unique_ptr：写成 shader_program_.release() 会调用 unique_ptr::release()，
+    // 那会把裸指针丢出去并把成员置空——着色器既不会被 delete，下一帧也会因判空直接跳过，
+    // 表现为"只显示第一帧"。
+    shader_program_->release();
 }
 
 /**
@@ -314,27 +392,31 @@ void OpenGLView::paintGL() {
  * 与固定的纹理单元插槽（0, 1, 2）建立绑定映射。
  */
 bool OpenGLView::BuildShader() {
-    if (!shader_program_.addShaderFromSourceCode(QOpenGLShader::Vertex, kVertexShaderSource)) {
-        LOG_ERROR("Vertex shader compilation failed: {}", shader_program_.log().toStdString());
+    shader_program_ = std::make_unique<QOpenGLShaderProgram>();
+
+    if (!shader_program_->addShaderFromSourceCode(QOpenGLShader::Vertex, kVertexShaderSource)) {
+        LOG_ERROR("Vertex shader compilation failed: {}", shader_program_->log().toStdString());
+        shader_program_.reset();
         return false;
     }
 
-    if (!shader_program_.addShaderFromSourceCode(QOpenGLShader::Fragment, kFragmentShaderSource)) {
-        LOG_ERROR("Fragment shader compilation failed: {}", shader_program_.log().toStdString());
+    if (!shader_program_->addShaderFromSourceCode(QOpenGLShader::Fragment, kFragmentShaderSource)) {
+        LOG_ERROR("Fragment shader compilation failed: {}", shader_program_->log().toStdString());
+        shader_program_.reset();
         return false;
     }
 
-    if (!shader_program_.link()) {
-        LOG_ERROR("Shader program link failed: {}", shader_program_.log().toStdString());
+    if (!shader_program_->link()) {
+        LOG_ERROR("Shader program link failed: {}", shader_program_->log().toStdString());
+        shader_program_.reset();
         return false;
     }
 
-    // 建立片元着色器 Uniform 采样器与对应纹理单元的静态绑定
-    shader_program_.bind();
-    shader_program_.setUniformValue("texY", 0);
-    shader_program_.setUniformValue("texU", 1);
-    shader_program_.setUniformValue("texV", 2);
-    shader_program_.release();
+    shader_program_->bind();
+    shader_program_->setUniformValue("texY", 0);
+    shader_program_->setUniformValue("texU", 1);
+    shader_program_->setUniformValue("texV", 2);
+    shader_program_->release();
 
     LOG_INFO("Shader program compiled and linked");
     return true;
