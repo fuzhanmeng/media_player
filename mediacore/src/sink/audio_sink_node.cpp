@@ -16,6 +16,7 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <variant>
 
@@ -40,23 +41,23 @@ constexpr const char* kModuleName = "audio_sink_node";
  * @param event_callbacks 用于向 Pipeline 报告错误和状态的事件回调
  * @param playback_timeline 与视频和控制线程共享的播放时间轴
  * @param audio_output IAudioSink 用于和 ALSA 交互的播放后端
- * @param max_audio_buffer_ms 已经被后端接受但是还未播放的数据时长预算，单位毫秒
- * @throw std::invalid_argument 参数为空或缓冲预算超出[5,2000)
+ * @param device_buffer_ms 音频输出实现请求的设备缓冲时长，也用于限制单次写入量
+ * @throw std::invalid_argument 参数为空或设备缓冲请求超出 [5, 2000] ms
  */
 AudioSinkNode::AudioSinkNode(std::shared_ptr<SyncContext> sync_ctx,
                              PipelineEventCallbacks evrnt_callbacks,
                              std::shared_ptr<PlaybackTimeline> timeline,
                              std::unique_ptr<IAudioSink> audio_output,
-                             int max_buffer_ms)
+                             int device_buffer_ms)
     : INode(kModuleName, std::move(sync_ctx), std::move(evrnt_callbacks)),
       timeline_(std::move(timeline)),
       sink_(std::move(audio_output)),
-      max_buffer_frames_(static_cast<std::int64_t>(max_buffer_ms) * PcmFrame::kSampleRate / 1000) {
-    if (!timeline_ || !sink_ || max_buffer_ms < 5 || max_buffer_ms > 2000) {
+      write_chunk_cap_frames_(static_cast<std::int64_t>(device_buffer_ms) * PcmFrame::kSampleRate / 1000) {
+    if (!timeline_ || !sink_ || device_buffer_ms < 5 || device_buffer_ms > 2000) {
         LOG_ERROR(
-            "Audio sink node requires a timeline, an output device and a buffer budget in [5, 2000] ms; got {} ms",
-            max_buffer_ms);
-        throw std::invalid_argument("AudioSinkNode: invalid timeline/device/buffer budget");
+            "Audio sink node requires a timeline, an output device and a device buffer in [5, 2000] ms; got {} ms",
+            device_buffer_ms);
+        throw std::invalid_argument("AudioSinkNode: invalid timeline/device/buffer duration");
     }
 
     // 以构造时刻的时间轴状态作为起点：之后只有版本号变化才会触发 Seek 清理
@@ -104,6 +105,11 @@ void AudioSinkNode::ClearStreamState() {
     pending_frame_.reset();
     frame_offset_ = 0;
     seek_ready_ = draining_ = ended_ = clock_ready_ = false;
+
+    // 停滞计时属于"这一世代设备还愿不愿意收数据"的判断，必须随世代一起清空：
+    // 旧世代积累的起始时刻若跨过 Seek 保留下来，新世代刚 Flush 完的第一轮
+    // 就可能在设备只是短暂满缓冲时立刻触发看门狗误报。
+    stall_since_.reset();
 }
 
 /**
@@ -180,10 +186,10 @@ void AudioSinkNode::EnsureOpen(const PlaybackTimeline::Snapshot& state) {
     is_opened_ = true;
     sink_->Pause(paused);
 
-    LOG_INFO("Audio sink device ready at epoch {}, buffer budget {} frames ({} ms), initially {}",
+    LOG_INFO("Audio sink device ready at epoch {}, write chunk cap {} frames ({} ms), initially {}",
              active_epoch_,
-             max_buffer_frames_,
-             max_buffer_frames_ * 1000 / PcmFrame::kSampleRate,
+             write_chunk_cap_frames_,
+             write_chunk_cap_frames_ * 1000 / PcmFrame::kSampleRate,
              paused ? "paused" : "playing");
 }
 
@@ -194,7 +200,7 @@ void AudioSinkNode::EnsureOpen(const PlaybackTimeline::Snapshot& state) {
  * StreamReset 到达之前不发布，避免旧位置把时间轴拉回去
  */
 void AudioSinkNode::PublishClock() {
-    if (!is_opened_ || !clock_ready_ || await_reset_) {
+    if (!is_opened_ || !clock_ready_ || await_reset_ || ended_) {
         return;
     }
 
@@ -343,35 +349,64 @@ void AudioSinkNode::ProcessFrame(const PlaybackTimeline::Snapshot& state) {
         return;
     }
 
-    // 7. 流控：本轮能写多少帧，取"设备真实空闲空间"与"本地积压预算"的较小值
+    // 7. 流控：本轮能写多少帧，取设备可写空间与单次写入上限的较小值
     //
-    //    关键：不能用 DelayFrames() 判断设备是否还能写
-    //    PulseAudio / PipeWire 的 ALSA 插件会把服务器端缓冲计入 snd_pcm_delay，
-    //    其返回值可能超过本对象实际提交的总量（实测缓冲 9600 帧却报告 10333 帧待播）
-    //    用 max_buffer_frames_ - delay 计算可用量会得到 0，且永远保持 0：
-    //    上层不再写入 -> 设备欠载 -> 依然报高 delay -> 整个音频链以及被它拖住的
-    //    解封装/视频链一起永久停摆（本次"只有一瞬间有声、画面卡住"即此原因）
+    //    硬闸门只认 WritableFrames()（snd_pcm_avail_update），因为它与 writei
+    //    能否接纳数据严格一致。绝不能用 DelayFrames()（snd_pcm_delay）来算可用量：
+    //    PulseAudio / PipeWire 的 ALSA 插件会把服务器端缓冲也算进去，
+    //    实测出现过"本对象只持有 9600 帧，device_delay 却报 19999 帧"，
+    //    甚至在 Flush 清空之后 delay 依然不回落（见 Flush 里的诊断日志）。
+    //    更关键的是 DelayFrames() 返回的影子缓冲长度只在
+    //    "device_delay < 已提交量" 时才缩短，用 delay 当闸门会让可用量恒为 0
+    //    且永不恢复：上层停写 -> 设备欠载 -> delay 依旧偏高 -> 整条音频链
+    //    连同被它拖住的解封装/视频链一起永久停摆
+    //    （"只有一瞬间有声、画面卡住"就是这个原因）。
     //
-    //    WritableFrames() 对应 snd_pcm_avail_update()，是设备环形缓冲区真正还能接收的帧数，
-    //    与 writei 的成功判据一致。max_buffer_frames_ 仍然作为上限，
-    //    防止在设备缓冲大于配置预算时一次塞进过多数据、拉长 Seek 后的清场时间。
+    //    设备缓冲请求值只作为单次写入上限，不约束累计在队量；插件实际缓冲可能更大。
+    //
+    //    delay 只进诊断日志（outstanding），不参与"是否写入"的判定。
+    const auto outstanding = std::max<std::int64_t>(0, sink_->DelayFrames());
     const auto device_writable = sink_->WritableFrames();
-    const auto available = std::max<std::int64_t>(
-        0, std::min<std::int64_t>(device_writable, max_buffer_frames_));
+    const auto available =
+        std::max<std::int64_t>(0, std::min<std::int64_t>(device_writable, write_chunk_cap_frames_));
 
     if (available == 0) {
-        // 设备暂时写不进去（缓冲满、刚 prepare 完尚未起播、或正在恢复）
-        // 这里也是最容易掩盖卡死的分支：若设备真的不再消费，上游解码器会一直阻塞
-        // 因此限频打印设备内部状态，便于从日志直接判断"设备不消费"还是"上层没送数据"
         const auto now = std::chrono::steady_clock::now();
-        if (now - last_flow_stall_log_ >= std::chrono::seconds(1)) {
+
+        // 走到这里只可能是一种情况：device_writable == 0，即设备当前一点空间都没有。
+        // 看门狗：设备迟迟不接受新数据，说明它已经停止消费。此时上游音频解码器会
+        // 永久阻塞在无超时的 Link::Send 上，音频包队列被填满，解封装随之卡住，
+        // 视频链也一起断供——整张图静默僵死且没有任何错误上报。
+        // 与其静默等待，不如主动失败，让 Player 进入 kError 并把原因交给用户。
+        if (!stall_since_.has_value()) {
+            // 首次进入"设备满、写不进去"的状态，从此刻开始计时
+            stall_since_ = now;
+        } else if (now - *stall_since_ >= kDeviceStallTimeout) {
+            const std::string detail = sink_->DescribeState();
+            LOG_ERROR("Audio device stopped consuming: epoch {}, no write for {} ms, next_frame {}, "
+                      "outstanding {} frames, writable {} frames, write chunk cap {} frames, device [{}]",
+                      active_epoch_,
+                      std::chrono::duration_cast<std::chrono::milliseconds>(now - *stall_since_).count(),
+                      next_frame_,
+                      outstanding,
+                      device_writable,
+                      write_chunk_cap_frames_,
+                      detail);
+            // ProcessFrame 返回 void，错误通过异常上抛；AudioSinkNode::Tick 会捕获并转成 Fail，
+            // 与前面"PCM 块非法""时间戳溢出"两条错误路径保持同一处理方式。
+            throw std::runtime_error("audio device stopped consuming audio data");
+        }
+
+        // 设备暂时不可写时限频记录状态，便于区分正常背压与设备停滞。
+        if (now - last_flow_stall_log_ >= std::chrono::seconds(5)) {
             last_flow_stall_log_ = now;
-            LOG_WARN("Audio sink flow control idle: epoch {}, next_frame {}, device writable {} frames, "
-                     "budget {} frames, block start {} +{} of {}, pending {}, device [{}]",
+            LOG_DEBUG("Audio sink flow control idle: epoch {}, next_frame {}, outstanding {} frames, "
+                      "device writable {} frames, write chunk cap {} frames, block start {} +{} of {}, pending {}, device [{}]",
                      active_epoch_,
                      next_frame_,
+                     outstanding,
                      device_writable,
-                     max_buffer_frames_,
+                     write_chunk_cap_frames_,
                      frame.start_sample_,
                      frame_offset_,
                      count,
@@ -408,7 +443,12 @@ void AudioSinkNode::ProcessFrame(const PlaybackTimeline::Snapshot& state) {
         frame_offset_ = 0;
     }
 
-    // 12. 设备此刻一点也接收不了数据：让出本轮等待下一轮继续
+    // 12. 只要本次写进去了数据，就说明设备仍在消费，清零停滞计时
+    if (written != 0) {
+        stall_since_.reset();
+    }
+
+    // 13. 设备此刻一点也接收不了数据：让出本轮等待下一轮继续
     if (written == 0) {
         timeline_->Wait(state.state_version_);
     }
@@ -448,34 +488,36 @@ TickResult AudioSinkNode::ProcessTick() {
     // 3. 打开音频设备，并把初始播放/暂停状态对齐到时间轴,如果已经打开了音频设备会直接返回
     EnsureOpen(state);
 
-    // 4. 用设备待播放量估算实际的发声位置，然后同步到时间轴
-    PublishClock();
-
-    // 5. 如果本轨道播放结束，那么就挂起本线程，直到下一次 Seek 或停止到来
+    // 4. 已报告结束后不再发布设备时钟。Drain 会把设备 delay 清零，继续发布会将
+    //    next_frame_ 一次性推进整个尾部缓冲，造成 AVSync 把视频帧误判为严重迟到。
     if (ended_) {
         timeline_->Wait(state.state_version_);
         return TickResult::kContinue;
     }
 
-    // 6. 如果已经收到上游 EOS，等待设备把已接收的尾音播完，期间不再写入新数据
+    // 5. 如果已经收到上游 EOS，先排空设备。成功时不能再发布清零后的 delay，
+    //    否则 next_frame_ 会一步跳到尾部并让 AVSync 丢弃视频帧。
     if (draining_) {
         if (!state.playing_ || state.seeking_) {
             // 暂停或 Seek 时，不排空，应该停留在原处，跳转则会直接 Flush 丢弃尾音
             timeline_->Wait(state.state_version_);
         } else if (sink_->Drain()) {
-            // 设备已经彻底播放完毕：先刷新一次时钟，再宣告音频彻底播放结束
+            // ReportEnded() 从最后一次平滑的音频位置切换到单调时钟，供视频收尾。
             LOG_INFO("Audio sink finished draining device at epoch {}", active_epoch_);
-            PublishClock();
             ReportEnded();
         } else {
-            // 尾音仍在播放：稍后继续轮询
+            // 尾音仍在播放：更新时钟并稍后继续轮询
+            PublishClock();
             timeline_->Wait(state.state_version_);
         }
 
         return TickResult::kContinue;
     }
 
-    // 7. 优先消费未写完的当前块，防止毒案写后新数据插队导致声音顺序错乱
+    // 6. 设备尚未进入 EOS 排空阶段时，按待播量更新音频主时钟
+    PublishClock();
+
+    // 7. 优先消费未写完的当前块，防止短写后新数据插队导致声音顺序错乱
     if (pending_frame_) {
         ProcessFrame(state);
         PublishClock();

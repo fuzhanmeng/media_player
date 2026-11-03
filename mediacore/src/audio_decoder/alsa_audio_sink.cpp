@@ -21,6 +21,7 @@
 
 #include <algorithm>  ///< 标准算法库 std::min、std::max、std::clamp
 #include <cerrno>
+#include <chrono>
 #include <cstddef>  ///< size_t
 #include <cstdint>
 #include <limits>
@@ -37,6 +38,9 @@
 namespace mediacore {
 
 namespace {
+constexpr std::size_t kDelayMismatchToleranceFrames = PcmFrame::kSampleRate / 100;  // 10 ms
+constexpr auto kDelayMismatchLogInterval = std::chrono::seconds(2);
+
 /**
  * @class AlsaAudioSink
  * @brief 实现 IAudioSink，把统一格式的声音数据写入 ALSA
@@ -273,7 +277,12 @@ public:
         suspend_warning_logged_ = false;
 
         // hardware_pause_supported_ 是设备能力，不是当前状态，因此 Flush 后不必清零。
-        LOG_DEBUG("ALSA device '{}' Flush completed; ready for new audio", device_);
+        //
+        // 这里打印一次设备状态用于诊断：snd_pcm_drop() 清的是本进程可见的 PCM 流，
+        // 但对 PulseAudio / PipeWire 这类用户态插件，服务器端队列是否随之清空并不保证。
+        // 若日志里 shadow=0 而 device_delay 仍接近缓冲容量，说明插件侧还压着旧数据，
+        // 之后的 Seek 起播会有可听出来的旧声音残响，且 DelayFrames() 会持续偏大。
+        LOG_DEBUG("ALSA device '{}' Flush completed; ready for new audio, state [{}]", device_, DescribeState());
     }
 
     /**
@@ -656,6 +665,22 @@ private:
         const auto remaining_device_frames =
             static_cast<std::size_t>(std::max<snd_pcm_sframes_t>(0, device_delay_frames));
 
+        if (remaining_device_frames > submitted_pending_frames_ &&
+            remaining_device_frames - submitted_pending_frames_ > kDelayMismatchToleranceFrames) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_delay_mismatch_log_ >= kDelayMismatchLogInterval) {
+                last_delay_mismatch_log_ = now;
+                LOG_WARN("ALSA device '{}' reports {} delay frames, above {} submitted frames "
+                         "(shadow {}, excess {}, state {}); tracking unchanged",
+                         device_,
+                         remaining_device_frames,
+                         submitted_pending_frames_,
+                         ShadowFrames(),
+                         remaining_device_frames - submitted_pending_frames_,
+                         snd_pcm_state_name(state));
+            }
+        }
+
         // 本对象只根据 delay 的减少量估算已完成帧数：
         // 例如本对象追踪 100 帧，设备报告剩余 60 帧，就移除副本最前面的 40 帧。
         // 如果设备报告值不小于追踪值，则不凭空增加副本，也不删除数据。
@@ -876,6 +901,8 @@ private:
     snd_pcm_t* pcm_{nullptr};  ///< 本节点的 ALSA PCM 句柄
     std::vector<std::int16_t> shadow_samples_;  ///< 保存所有尚未确认播放完成的帧副本
     std::size_t submitted_pending_frames_{0};  ///< shadow_samples_ 已经提交给 ALSA 但是尚未确认播放完的帧数
+
+    std::chrono::steady_clock::time_point last_delay_mismatch_log_{};  ///< delay 不一致日志限频
 
     bool hardware_pause_supported_{false};  ///< 当前 PCM 配置声明是否支持硬件暂停
     bool hardware_pause_active_{false};  ///< 本对象是否成功请求了硬件暂停

@@ -250,7 +250,7 @@ public:
 
         // 1. 忽略上一轮迟到的报告，以及跳转中、暂停中、已停止时的报告
         if (epoch != playback_state_.epoch_ || playback_state_.seeking_ || !playback_state_.playing_ ||
-            playback_state_.stopped_) {
+            playback_state_.stopped_ || audio_finished_) {
             return;
         }
 

@@ -38,7 +38,7 @@ public:
      * @param event_callbacks 用于向 Pipeline 上报错误与状态的事件回调
      * @param timeline 共享播放时间轴管理器
      * @param sink 独占的音频输出硬件接口（通过 unique_ptr 转移所有权）
-     * @param max_buffer_ms 声卡待播缓冲区的逻辑时长预算（单位：毫秒，合法区间：[5, 2000]）
+     * @param device_buffer_ms 请求的设备缓冲时长，并作为单次写入上限（单位：毫秒，[5, 2000]）
      * @throw std::invalid_argument 时间轴或底层设备为空，或缓冲时长超出合法区间
      * @throw std::overflow_error 初始时间转换采样帧序号时发生数值溢出
      */
@@ -46,7 +46,7 @@ public:
                   PipelineEventCallbacks event_callbacks,
                   std::shared_ptr<PlaybackTimeline> timeline,
                   std::unique_ptr<IAudioSink> sink,
-                  int max_buffer_ms);
+                  int device_buffer_ms);
 
     ~AudioSinkNode() override = default;
 
@@ -172,9 +172,12 @@ private:
     /// 上游解码器一次最多交付的采样帧数（5 ms @ 48 kHz）；校验和补静音缓冲区共用。
     static constexpr std::size_t kMaxFramesPerBlock = PcmFrame::kMaxBlockFrames;
 
+    /// 设备持续"写不进去"多久就判定为停止消费并上报错误，避免整张图静默僵死
+    static constexpr std::chrono::milliseconds kDeviceStallTimeout{2000};
+
     std::shared_ptr<PlaybackTimeline> timeline_;  ///< 音频、视频和播放控制共同使用的时间轴
     std::unique_ptr<IAudioSink> sink_;  ///< 实际接收并播放 PCM 的音频设备接口
-    const std::int64_t max_buffer_frames_{0};  ///< 允许提前交给设备、但还没有播放的声音上限（采样帧）
+    const std::int64_t write_chunk_cap_frames_{0};  ///< 单次最多交给设备的声音量（采样帧）
 
     std::optional<PcmFrame> pending_frame_;  ///< 已取出但尚未全部交给设备的一段声音
     std::size_t frame_offset_{0};  ///< pending_frame_ 中已经交给设备的采样帧数，下一轮从此处继续
@@ -192,7 +195,9 @@ private:
     bool draining_{false};  ///< 已接收到 EOS，正在等待设备播放完剩余尾音
     bool ended_{false};  ///< 本世代是否已向时间轴报告音频轨道结束
     bool clock_ready_{false};  ///< 本世代是否已有声音交给设备，可用于估算音频播放进度
-    std::chrono::steady_clock::time_point last_flow_stall_log_{};  ///< 流控卡死诊断日志上次打印时刻，用于限频
+    std::chrono::steady_clock::time_point last_flow_stall_log_{};  ///< 流控诊断日志上次打印时刻，用于限频
+    std::optional<std::chrono::steady_clock::time_point>
+        stall_since_{};  ///< 设备连续"写不进去"的起始时刻，供停滞看门狗计时
 };
 
 }  // namespace mediacore
