@@ -24,6 +24,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -37,6 +38,7 @@
 #include "mediacore/av_types/video_frame.h"
 #include "mediacore/media_error.h"
 #include "mediacore/player_config.h"
+#include "mediacore/perf_metrics.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -131,6 +133,7 @@ struct HardwarePixelFormatSelection {
 
     // FFmpeg 是否已经选择 AV_PIX_FMT_VAAPI,只有实际选择 VA-API 格式后才会变为 true
     bool is_vappi_selected_{false};
+    AVPixelFormat logged_format_{AV_PIX_FMT_NONE};
 };
 
 /**
@@ -236,10 +239,27 @@ public:
 
     /** @brief 输出解码统计；EOS 摘要由 Decoder Node 在完成 Drain 后调用。 */
     void LogStatistics(const char* reason, bool summary);
+    void SetStatisticsEpoch(std::uint64_t epoch);
+    void RecordSkippedCorruptInput() noexcept;
 
 private:
     struct Statistics final {
         std::uint64_t accepted_packets_{0};
+        std::uint64_t packet_bytes_{0};
+        std::uint64_t send_eagain_{0};
+        std::uint64_t receive_eagain_{0};
+        std::uint64_t software_decode_frames_{0};
+        std::uint64_t vaapi_decode_frames_{0};
+        std::uint64_t export_api_attempts_{0};
+        std::uint64_t export_api_success_{0};
+        std::uint64_t export_api_failures_{0};
+        std::uint64_t export_pipeline_attempts_{0};
+        std::uint64_t export_pipeline_failures_{0};
+        std::uint64_t cpu_download_bytes_{0};
+        std::uint64_t skipped_corrupt_inputs_{0};
+        std::array<std::uint64_t, 4> fallback_frames_{};
+        perf::Timing decode_call_wall_{};
+        perf::Timing decode_call_cpu_{};
         std::uint64_t codec_frames_{0};
         std::uint64_t decoded_frames_{0};
         std::uint64_t errors_{0};
@@ -253,8 +273,11 @@ private:
         std::uint64_t software_frames_{0};
         std::uint64_t decoder_thread_cpu_ns_{0};
         double send_api_ms_{0.0};
+        double max_send_api_ms_{0.0};
         double drain_send_api_ms_{0.0};
+        double max_drain_send_api_ms_{0.0};
         double receive_api_ms_{0.0};
+        double max_receive_api_ms_{0.0};
         double frame_processing_ms_{0.0};
         double max_frame_processing_ms_{0.0};
         double va_sync_ms_{0.0};
@@ -283,14 +306,26 @@ private:
                            int decoded_height);
     void MaybeLogIntervalStatistics();
     void ResetIntervalStatistics() noexcept;
-    void RecordSend(double elapsed_ms, std::uint64_t cpu_ns, bool accepted) noexcept;
-    void RecordDrainSend(double elapsed_ms, std::uint64_t cpu_ns) noexcept;
-    void RecordReceive(double elapsed_ms, std::uint64_t cpu_ns, bool produced_frame) noexcept;
+    void RecordSend(double elapsed_ms, bool accepted, int bytes, bool eagain) noexcept;
+    void RecordDrainSend(double elapsed_ms) noexcept;
+    void RecordReceive(double elapsed_ms, bool produced_frame) noexcept;
     void RecordFrameProcessing(double elapsed_ms) noexcept;
     void RecordOutputPath(AVPixelFormat decoded_pixel_format, const VideoFrame& output_frame) noexcept;
     void RecordVaSync(double elapsed_ms) noexcept;
     void RecordHardwareTransfer(double elapsed_ms) noexcept;
     void RecordError() noexcept;
+    void RecordDecodeCall(std::int64_t wall_ns, std::int64_t cpu_ns) noexcept;
+    void LogHardwareExportFailure(const char* stage, std::uint64_t epoch, int va_status = -1);
+    void RecordDownloadFallback(std::size_t reason, std::uint64_t epoch);
+    class DecodeCallMeasurement final {
+    public:
+        explicit DecodeCallMeasurement(FfmpegVideoDecoder& owner) noexcept;
+        ~DecodeCallMeasurement();
+    private:
+        FfmpegVideoDecoder& owner_;
+        std::int64_t wall_started_ns_;
+        std::int64_t cpu_started_ns_;
+    };
 
     /**
      * @brief FFmpeg 请求项目选择解码输出像素格式时调用的回调
@@ -399,10 +434,35 @@ private:
      */
     std::string codec_name_{};
 
+    std::uint64_t diagnostic_stream_id_{0};
     HardwareAccel requested_acceleration_{HardwareAccel::kAuto};
     bool hardware_device_initialized_{false};
     bool first_frame_logged_{false};
     bool summary_logged_{false};
+    bool statistics_epoch_set_{false};
+    bool first_epoch_frame_logged_{false};
+    bool thread_cpu_available_{true};
+    std::uint64_t statistics_epoch_{0};
+    std::array<int, 3> first_hardware_layout_{};
+    bool hardware_frame_logged_{false};
+    std::array<std::uint64_t, 128> logged_export_layout_{};
+    bool export_layout_logged_{false};
+    struct ExportFailureCounter {
+        const char* stage;
+        std::uint64_t count{0};
+    };
+    // Fixed storage: recording the bad_alloc failure itself must not allocate.
+    std::array<ExportFailureCounter, 16> export_failure_reasons_{{
+        {"invalid_hardware_frame"}, {"invalid_frames_device"}, {"invalid_va_display"}, {"invalid_surface"},
+        {"vaSyncSurface"}, {"vaExportSurfaceHandle"}, {"unsupported_descriptor_layout"},
+        {"inconsistent_va_drm_pixel_format"}, {"invalid_dma_buf_object"}, {"repeated_dma_buf_fd"},
+        {"dup_fd"}, {"unsupported_format_modifier_plane_bounds"}, {"av_frame_ref"}, {"bad_alloc"},
+        {"length_error"}, {"other"}}};
+    const char* last_export_failure_stage_{nullptr};
+    std::chrono::steady_clock::time_point last_export_failure_logged_at_{};
+    std::array<std::chrono::steady_clock::time_point, 4> fallback_logged_at_{};
+    std::int64_t process_cpu_started_ns_{-1};
+    std::int64_t process_interval_started_ns_{-1};
     std::string actual_mode_{"pending"};
     std::string input_pixel_format_{"pending"};
     std::string output_pixel_format_{"pending"};

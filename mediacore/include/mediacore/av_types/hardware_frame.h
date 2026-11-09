@@ -356,4 +356,12 @@ private:
  */
 const char* GetDrmFourccName(std::uint32_t drm_format) noexcept;
 
+// Process-lifetime observations of existing releases, not an ownership registry.
+struct HardwareFrameReleaseStats {
+    std::uint64_t fd_close_success{0};
+    std::uint64_t fd_close_failed{0};
+    std::uint64_t av_frame_refs_released{0};
+};
+HardwareFrameReleaseStats GetHardwareFrameReleaseStats() noexcept;
+
 }  // namespace mediacore

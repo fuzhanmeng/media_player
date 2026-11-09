@@ -18,6 +18,7 @@
 #include <array>
 #include <cerrno>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <new>
@@ -25,6 +26,7 @@
 #include <stdexcept>
 #include <string>
 #include <time.h>
+#include <thread>
 #include <utility>
 
 #include "mediacore/av_types/hardware_frame.h"
@@ -66,6 +68,8 @@ namespace mediacore {
 
 namespace {
 
+std::atomic<std::uint64_t> next_decoder_diagnostic_stream_id{1};
+
 constexpr const char* kFindDecoderOperation = "avcodec_find_decoder(video)";
 constexpr const char* kAllocateContextOperation = "avcodec_alloc_context3(video)";
 constexpr const char* kCopyParametersOperation = "avcodec_parameters_to_context(video)";
@@ -106,7 +110,7 @@ constexpr std::size_t kMaxVaapiExportObjects = kMaxHardwareDmaBufObjects;
 constexpr const char* kVaapiRenderNode = "/dev/dri/renderD128";
 
 // av-hwdevice_ctx_create 的操作名，只用于错误文本
-constexpr const char* kCreateHardwareDeviceOperation = "av_hwdevice_ctx_create)vaapi";
+constexpr const char* kCreateHardwareDeviceOperation = "av_hwdevice_ctx_create(vaapi)";
 constexpr const char* kTransferFrameOperation = "av_hwframe_transfer_data(vaapi)";
 constexpr const char* kCopyFramePropertiesOperation = "av_frame_copy_props(vaapi)";
 
@@ -118,15 +122,6 @@ constexpr const char* kCopyFramePropertiesOperation = "av_frame_copy_props(vaapi
  */
 MediaError CreateVideoDecoderError(const char* operation_name, int ffmpeg_error_code) {
     return ffmpeg_detail::MakeFfmpegMediaError(kModuleName, ffmpeg_error_code, operation_name);
-}
-
-std::uint64_t CurrentThreadCpuTimeNanoseconds() noexcept {
-    timespec cpu_time{};
-    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_time) != 0) {
-        return 0;
-    }
-    return static_cast<std::uint64_t>(cpu_time.tv_sec) * 1000000000ULL +
-        static_cast<std::uint64_t>(cpu_time.tv_nsec);
 }
 
 const char* HardwareAccelName(HardwareAccel acceleration) noexcept {
@@ -411,8 +406,9 @@ FfmpegVideoDecoder::FfmpegVideoDecoder(
       hardware_device_initialized_(hardware_device_context_ref != nullptr),
       statistics_started_at_(std::chrono::steady_clock::now()),
       interval_started_at_(statistics_started_at_) {
+    diagnostic_stream_id_ = next_decoder_diagnostic_stream_id.fetch_add(1, std::memory_order_relaxed);
     LOG_INFO("VideoDecoderOpen codec={} resolution={}x{} frame_rate={:.3f} requested_mode={} "
-             "hardware_device_type={} hardware_device_initialized={} hardware_fallback={}",
+             "hardware_device_type={} hardware_device_initialized={} hardware_fallback={} stream_id={}",
              codec_name_,
              codec_context_ != nullptr ? codec_context_->width : 0,
              codec_context_ != nullptr ? codec_context_->height : 0,
@@ -420,7 +416,7 @@ FfmpegVideoDecoder::FfmpegVideoDecoder(
              HardwareAccelName(requested_acceleration_),
              hardware_device_initialized_ ? "vaapi" : "none",
              hardware_device_initialized_,
-             requested_acceleration_ == HardwareAccel::kAuto && !hardware_device_initialized_);
+             requested_acceleration_ == HardwareAccel::kAuto && !hardware_device_initialized_, diagnostic_stream_id_);
 }
 
 /**
@@ -459,43 +455,77 @@ FfmpegVideoDecoder::~FfmpegVideoDecoder() {
     }
 }
 
-void FfmpegVideoDecoder::RecordSend(double elapsed_ms, std::uint64_t cpu_ns, bool accepted) noexcept {
-    auto update = [elapsed_ms, cpu_ns, accepted](Statistics& stats) {
-        ++stats.send_calls_;
-        stats.send_api_ms_ += elapsed_ms;
-        stats.decoder_thread_cpu_ns_ += cpu_ns;
+FfmpegVideoDecoder::DecodeCallMeasurement::DecodeCallMeasurement(FfmpegVideoDecoder& owner) noexcept
+    : owner_(owner), wall_started_ns_(perf::SteadyNs()), cpu_started_ns_(perf::ThreadCpuNs()) {}
+
+FfmpegVideoDecoder::DecodeCallMeasurement::~DecodeCallMeasurement() {
+    const auto cpu_end = perf::ThreadCpuNs();
+    owner_.RecordDecodeCall(perf::SteadyNs() - wall_started_ns_,
+                           cpu_started_ns_ >= 0 && cpu_end >= cpu_started_ns_ ? cpu_end - cpu_started_ns_ : -1);
+    owner_.MaybeLogIntervalStatistics();
+}
+
+void FfmpegVideoDecoder::RecordDecodeCall(std::int64_t wall_ns, std::int64_t cpu_ns) noexcept {
+    for (auto* stats : {&total_statistics_, &interval_statistics_}) {
+        stats->decode_call_wall_.Add(wall_ns);
+        stats->decode_call_cpu_.Add(cpu_ns);
+        if (cpu_ns >= 0) stats->decoder_thread_cpu_ns_ += static_cast<std::uint64_t>(cpu_ns);
+    }
+    if (cpu_ns < 0) thread_cpu_available_ = false;
+}
+
+void FfmpegVideoDecoder::SetStatisticsEpoch(std::uint64_t epoch) {
+    if (statistics_epoch_set_ && statistics_epoch_ == epoch) return;
+    if (statistics_epoch_set_ && !summary_logged_) LogStatistics("epoch_change", true);
+    total_statistics_ = {};
+    interval_statistics_ = {};
+    statistics_epoch_ = epoch;
+    statistics_epoch_set_ = true;
+    first_epoch_frame_logged_ = false;
+    summary_logged_ = false;
+    thread_cpu_available_ = true;
+    statistics_started_at_ = std::chrono::steady_clock::now();
+    interval_started_at_ = statistics_started_at_;
+    process_cpu_started_ns_ = perf::ProcessCpuNs();
+    process_interval_started_ns_ = process_cpu_started_ns_;
+    fallback_logged_at_ = {};
+    for (auto& entry : export_failure_reasons_) entry.count = 0;
+}
+
+void FfmpegVideoDecoder::RecordSkippedCorruptInput() noexcept {
+    ++total_statistics_.skipped_corrupt_inputs_;
+    ++interval_statistics_.skipped_corrupt_inputs_;
+}
+
+void FfmpegVideoDecoder::RecordSend(double elapsed_ms, bool accepted, int bytes, bool eagain) noexcept {
+    for (auto* stats : {&total_statistics_, &interval_statistics_}) {
+        ++stats->send_calls_;
+        stats->send_api_ms_ += elapsed_ms;
+        stats->max_send_api_ms_ = std::max(stats->max_send_api_ms_, elapsed_ms);
+        if (eagain) ++stats->send_eagain_;
         if (accepted) {
-            ++stats.accepted_packets_;
+            ++stats->accepted_packets_;
+            stats->packet_bytes_ += static_cast<std::uint64_t>(bytes);
         }
-    };
-    update(total_statistics_);
-    update(interval_statistics_);
-    if (accepted) {
-        summary_logged_ = false;
+    }
+    if (accepted) summary_logged_ = false;
+}
+
+void FfmpegVideoDecoder::RecordDrainSend(double elapsed_ms) noexcept {
+    for (auto* stats : {&total_statistics_, &interval_statistics_}) {
+        ++stats->drain_send_calls_;
+        stats->drain_send_api_ms_ += elapsed_ms;
+        stats->max_drain_send_api_ms_ = std::max(stats->max_drain_send_api_ms_, elapsed_ms);
     }
 }
 
-void FfmpegVideoDecoder::RecordDrainSend(double elapsed_ms, std::uint64_t cpu_ns) noexcept {
-    auto update = [elapsed_ms, cpu_ns](Statistics& stats) {
-        ++stats.drain_send_calls_;
-        stats.drain_send_api_ms_ += elapsed_ms;
-        stats.decoder_thread_cpu_ns_ += cpu_ns;
-    };
-    update(total_statistics_);
-    update(interval_statistics_);
-}
-
-void FfmpegVideoDecoder::RecordReceive(double elapsed_ms, std::uint64_t cpu_ns, bool produced_frame) noexcept {
-    auto update = [elapsed_ms, cpu_ns, produced_frame](Statistics& stats) {
-        ++stats.receive_calls_;
-        stats.receive_api_ms_ += elapsed_ms;
-        stats.decoder_thread_cpu_ns_ += cpu_ns;
-        if (produced_frame) {
-            ++stats.codec_frames_;
-        }
-    };
-    update(total_statistics_);
-    update(interval_statistics_);
+void FfmpegVideoDecoder::RecordReceive(double elapsed_ms, bool produced_frame) noexcept {
+    for (auto* stats : {&total_statistics_, &interval_statistics_}) {
+        ++stats->receive_calls_;
+        stats->receive_api_ms_ += elapsed_ms;
+        stats->max_receive_api_ms_ = std::max(stats->max_receive_api_ms_, elapsed_ms);
+        if (produced_frame) ++stats->codec_frames_;
+    }
 }
 
 void FfmpegVideoDecoder::RecordFrameProcessing(double elapsed_ms) noexcept {
@@ -512,15 +542,12 @@ void FfmpegVideoDecoder::RecordFrameProcessing(double elapsed_ms) noexcept {
 void FfmpegVideoDecoder::RecordOutputPath(AVPixelFormat decoded_pixel_format,
                                           const VideoFrame& output_frame) noexcept {
     auto update = [decoded_pixel_format, &output_frame](Statistics& stats) {
-        if (decoded_pixel_format == AV_PIX_FMT_VAAPI) {
-            if (output_frame.hardware_ != nullptr) {
-                ++stats.vaapi_export_frames_;
-            } else {
-                ++stats.vaapi_download_frames_;
-            }
-        } else {
-            ++stats.software_frames_;
+        if (decoded_pixel_format == AV_PIX_FMT_VAAPI && output_frame.hardware_ != nullptr) {
+            ++stats.vaapi_export_frames_;
         }
+        // Software output includes successful VA-API downloads; actual software
+        // decoding is counted independently immediately after receive_frame.
+        if (output_frame.hardware_ == nullptr) ++stats.software_frames_;
     };
     update(total_statistics_);
     update(interval_statistics_);
@@ -554,13 +581,15 @@ void FfmpegVideoDecoder::RecordError() noexcept {
 void FfmpegVideoDecoder::ResetIntervalStatistics() noexcept {
     interval_statistics_ = Statistics{};
     interval_started_at_ = std::chrono::steady_clock::now();
+    process_interval_started_ns_ = perf::ProcessCpuNs();
 }
 
 void FfmpegVideoDecoder::LogFirstFrameInfo(const VideoFrame& output_frame,
                                            AVPixelFormat decoded_pixel_format,
                                            int decoded_width,
                                            int decoded_height) {
-    if (first_frame_logged_) {
+    if (first_frame_logged_ && decoded_frame_width_ == decoded_width && decoded_frame_height_ == decoded_height &&
+        input_pixel_format_ == (av_get_pix_fmt_name(decoded_pixel_format) ? av_get_pix_fmt_name(decoded_pixel_format) : "unknown")) {
         return;
     }
 
@@ -580,9 +609,9 @@ void FfmpegVideoDecoder::LogFirstFrameInfo(const VideoFrame& output_frame,
     }
 
     const bool hardware_fallback = requested_acceleration_ == HardwareAccel::kAuto && actual_mode_ != "VAAPI";
-    LOG_INFO("VideoDecoderFirstFrame mode={} output_path={} codec={} resolution={}x{} frame_rate={:.3f} "
-             "input_pixel_format={} output_pixel_format={} hardware_device_type={} "
-             "hardware_device_initialized={} hardware_fallback={}",
+    LOG_INFO("[VideoDecoder][Init] selected_mode={} output_path={} codec={} resolution={}x{} source_fps={:.3f} "
+             "input_pixel_format={} output_pixel_format={} hw_device_type={} "
+             "hw_device_initialized={} fallback={} requested_mode={} time_base={}/{} hw_frames_initialized={} epoch={} stream_id={}",
              actual_mode_,
              output_path,
              codec_name_,
@@ -593,77 +622,82 @@ void FfmpegVideoDecoder::LogFirstFrameInfo(const VideoFrame& output_frame,
              output_pixel_format_,
              hardware_device_initialized_ ? "vaapi" : "none",
              hardware_device_initialized_,
-             hardware_fallback);
+             hardware_fallback, HardwareAccelName(requested_acceleration_), video_stream_time_base_.numerator_,
+             video_stream_time_base_.denominator_, decoded_pixel_format == AV_PIX_FMT_VAAPI && hardware_frame_logged_,
+             statistics_epoch_, diagnostic_stream_id_);
 }
 
 void FfmpegVideoDecoder::LogStatistics(const char* reason, bool summary) {
+    if (!statistics_epoch_set_) return;
     const auto now = std::chrono::steady_clock::now();
-    const auto elapsed = summary ? now - statistics_started_at_ : now - interval_started_at_;
-    const double elapsed_seconds = std::chrono::duration<double>(elapsed).count();
-    if (!summary && elapsed_seconds < 5.0) {
-        return;
-    }
-
+    const auto start = summary ? statistics_started_at_ : interval_started_at_;
+    const double elapsed_seconds = std::chrono::duration<double>(now - start).count();
+    if (!summary && elapsed_seconds < 5.0) return;
     const Statistics& stats = summary ? total_statistics_ : interval_statistics_;
-    const double wall_fps = elapsed_seconds > 0.0
-        ? static_cast<double>(stats.decoded_frames_) / elapsed_seconds
-        : 0.0;
-    const double elapsed_ms = elapsed_seconds * 1000.0;
-    const double cpu_pct = elapsed_ms > 0.0
-        ? (static_cast<double>(stats.decoder_thread_cpu_ns_) / 1000000.0) / elapsed_ms * 100.0
-        : 0.0;
-    const auto average = [](double total, std::uint64_t count) { return count == 0 ? 0.0 : total / count; };
-    const bool hardware_fallback = requested_acceleration_ == HardwareAccel::kAuto && actual_mode_ == "Software";
-
-    LOG_INFO("VideoDecoderStats reason={} scope={} rate_basis=wall_clock mode={} requested_mode={} codec={} resolution={}x{} "
-             "frame_rate={:.3f} input_pixel_format={} output_pixel_format={} hardware_device_type={} "
-             "hardware_device_initialized={} hardware_fallback={} interval_s={:.3f} input_packets={} "
-             "codec_frames={} decoded_frames={} decoder_output_wall_fps={:.3f} cumulative_frames={} "
-             "software_frames={} vaapi_cpu_download_frames={} vaapi_dma_buf_frames={} "
-             "avg_send_api_ms={:.3f} avg_drain_send_api_ms={:.3f} avg_receive_api_ms={:.3f} "
-             "avg_total_frame_wall_ms={:.3f} max_total_frame_wall_ms={:.3f} "
-             "va_sync_scope=explicit_dma_export_only avg_va_sync_ms={:.3f} max_va_sync_ms={:.3f} "
-             "avg_hw_transfer_wall_ms={:.3f} max_hw_transfer_wall_ms={:.3f} "
-             "decoder_timed_thread_cpu_pct={:.2f} errors={}",
-             reason,
-             summary ? "total" : "interval",
-             actual_mode_,
-             HardwareAccelName(requested_acceleration_),
-             codec_name_,
+    const auto avg = [](double total, std::uint64_t count) { return count ? total / count : 0.0; };
+    const double fps = elapsed_seconds > 0 ? stats.decoded_frames_ / elapsed_seconds : 0.0;
+    const auto cpu_end = perf::ProcessCpuNs();
+    const auto cpu_start = summary ? process_cpu_started_ns_ : process_interval_started_ns_;
+    const double process_pct = cpu_start >= 0 && cpu_end >= cpu_start && elapsed_seconds > 0
+        ? (cpu_end - cpu_start) / 1e9 / elapsed_seconds * 100.0 : -1.0;
+    const auto start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count();
+    const auto end_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+    LOG_INFO("[VideoPerf][{}] component=decoder reason={} epoch={} stream_id={} window_start_ns={} window_end_ns={} "
+             "elapsed_sec={:.6f} rate_basis=wall_clock_not_max_throughput mode={} requested_mode={} codec={} "
+             "resolution={}x{} source_fps={:.3f} packet_count={} packet_bytes={} decoded_frames={} "
+             "cumulative_decoded_frames={} decode_fps={:.3f} software_decode_frames={} vaapi_decode_frames={} "
+             "decode_errors={} skipped_corrupt_inputs={} reorder_drop_frames=unavailable "
+             "decode_scope=SendPacket_BeginDrain_ReceiveFrame_including_conversion_excluding_queue_wait "
+             "decode_call_count={} decode_wall_ms={:.6f} decode_call_avg_ms={:.6f} decode_call_max_ms={:.6f} "
+             "decode_wall_per_output_frame_ms={:.6f} decode_thread_cpu_ms={:.6f} decode_thread_cpu_calls={} "
+             "decode_thread_cpu_avg_ms={:.6f} decode_thread_cpu_max_ms={:.6f} thread_cpu_available={} "
+             "thread_cpu_scope=calling_thread_excludes_ffmpeg_workers "
+             "process_cpu_one_core_pct={:.3f} logical_cpu_count={}",
+             summary ? "Summary" : "Interval", reason, statistics_epoch_, diagnostic_stream_id_, start_ns, end_ns,
+             elapsed_seconds, actual_mode_, HardwareAccelName(requested_acceleration_), codec_name_,
              decoded_frame_width_ > 0 ? decoded_frame_width_ : GetCodedWidth(),
-             decoded_frame_height_ > 0 ? decoded_frame_height_ : GetCodedHeight(),
-             video_frame_rate_.ToDouble(),
-             input_pixel_format_,
-             output_pixel_format_,
-             hardware_device_initialized_ ? "vaapi" : "none",
-             hardware_device_initialized_,
-             hardware_fallback,
-             elapsed_seconds,
-             stats.accepted_packets_,
-             stats.codec_frames_,
-             stats.decoded_frames_,
-             wall_fps,
-             total_statistics_.decoded_frames_,
-             stats.software_frames_,
-             stats.vaapi_download_frames_,
-             stats.vaapi_export_frames_,
-             average(stats.send_api_ms_, stats.send_calls_),
-             average(stats.drain_send_api_ms_, stats.drain_send_calls_),
-             average(stats.receive_api_ms_, stats.receive_calls_),
-             average(stats.frame_processing_ms_, stats.decoded_frames_),
-             stats.max_frame_processing_ms_,
-             average(stats.va_sync_ms_, stats.va_sync_calls_),
-             stats.max_va_sync_ms_,
-             average(stats.hw_transfer_ms_, stats.hw_transfer_calls_),
-             stats.max_hw_transfer_ms_,
-             cpu_pct,
-             stats.errors_);
-
+             decoded_frame_height_ > 0 ? decoded_frame_height_ : GetCodedHeight(), video_frame_rate_.ToDouble(),
+             stats.accepted_packets_, stats.packet_bytes_, stats.decoded_frames_, total_statistics_.decoded_frames_, fps,
+             stats.software_decode_frames_, stats.vaapi_decode_frames_, stats.errors_, stats.skipped_corrupt_inputs_,
+             stats.decode_call_wall_.calls, stats.decode_call_wall_.TotalMs(), stats.decode_call_wall_.AvgMs(),
+             stats.decode_call_wall_.MaxMs(), avg(stats.decode_call_wall_.TotalMs(), stats.decoded_frames_),
+             stats.decoder_thread_cpu_ns_ / 1e6, stats.decode_call_cpu_.calls, stats.decode_call_cpu_.AvgMs(),
+             stats.decode_call_cpu_.MaxMs(), thread_cpu_available_, process_pct, std::thread::hardware_concurrency());
+    LOG_INFO("[VideoPerf][{}] component=decoder_api epoch={} stream_id={} window_start_ns={} window_end_ns={} "
+             "send_packet_calls={} send_packet_eagain={} send_packet_total_ms={:.6f} send_packet_avg_ms={:.6f} "
+             "send_packet_max_ms={:.6f} drain_send_calls={} drain_send_total_ms={:.6f} drain_send_avg_ms={:.6f} "
+             "drain_send_max_ms={:.6f} receive_frame_calls={} receive_frame_eagain={} receive_frame_total_ms={:.6f} "
+             "receive_frame_avg_ms={:.6f} receive_frame_max_ms={:.6f} "
+             "va_sync_scope=existing_export_wait_only_not_full_gpu_decode va_sync_count={} va_sync_total_ms={:.6f} "
+             "va_sync_avg_ms={:.6f} va_sync_max_ms={:.6f} cpu_download_calls={} cpu_download_total_ms={:.6f} "
+             "cpu_download_avg_ms={:.6f} cpu_download_max_ms={:.6f} cpu_download_bytes={} "
+             "cpu_download_bytes_basis=visible_pixel_payload_excludes_padding "
+             "vaapi_export_attempt_frames={} vaapi_export_success_frames={} vaapi_export_failed_frames={} "
+             "hardware_frame_export_attempts={} hardware_frame_export_failed={} hardware_frame_output_frames={} "
+             "vaapi_cpu_download_frames={} software_output_frames={} "
+             "fallback_renderer_unavailable_frames={} fallback_export_disabled_frames={} "
+             "fallback_export_failed_frames={} fallback_vaapi_export_not_built_frames={}",
+             summary ? "Summary" : "Interval", statistics_epoch_, diagnostic_stream_id_, start_ns, end_ns,
+             stats.send_calls_, stats.send_eagain_, stats.send_api_ms_, avg(stats.send_api_ms_, stats.send_calls_),
+             stats.max_send_api_ms_, stats.drain_send_calls_, stats.drain_send_api_ms_,
+             avg(stats.drain_send_api_ms_, stats.drain_send_calls_), stats.max_drain_send_api_ms_,
+             stats.receive_calls_, stats.receive_eagain_, stats.receive_api_ms_, avg(stats.receive_api_ms_, stats.receive_calls_),
+             stats.max_receive_api_ms_, stats.va_sync_calls_, stats.va_sync_ms_, avg(stats.va_sync_ms_, stats.va_sync_calls_),
+             stats.max_va_sync_ms_, stats.hw_transfer_calls_, stats.hw_transfer_ms_,
+             avg(stats.hw_transfer_ms_, stats.hw_transfer_calls_), stats.max_hw_transfer_ms_, stats.cpu_download_bytes_,
+             stats.export_api_attempts_, stats.export_api_success_, stats.export_api_failures_,
+             stats.export_pipeline_attempts_, stats.export_pipeline_failures_, stats.vaapi_export_frames_,
+             stats.vaapi_download_frames_, stats.software_frames_, stats.fallback_frames_[0], stats.fallback_frames_[1],
+             stats.fallback_frames_[2], stats.fallback_frames_[3]);
     if (summary) {
+        for (const auto& entry : export_failure_reasons_) {
+            if (entry.count != 0) {
+                LOG_INFO("[VideoPerf][FallbackSummary] component=decoder epoch={} stream_id={} stage={} failed_frames={}",
+                         statistics_epoch_, diagnostic_stream_id_, entry.stage, entry.count);
+            }
+        }
         summary_logged_ = true;
-    } else {
-        ResetIntervalStatistics();
-    }
+    } else ResetIntervalStatistics();
 }
 
 void FfmpegVideoDecoder::MaybeLogIntervalStatistics() {
@@ -785,6 +819,16 @@ FfmpegVideoDecoderOpenResult FfmpegVideoDecoder::Open(VideoCodecParameters param
     // ① 创建 VA-API 设备 ② 分配上下文  ③ 拷贝流参数  ④ 创建格式协商状态
     // ⑤ 上下文持有设备引用  ⑥ 注册 get_format  ⑦ avcodec_open2  ⑧ 构造解码器并移交所有权
 
+    bool codec_supports_vaapi = false;
+    for (int index = 0; const auto* config = avcodec_get_hw_config(codec, index); ++index) {
+        if (config->device_type == AV_HWDEVICE_TYPE_VAAPI && config->pix_fmt == AV_PIX_FMT_VAAPI)
+            codec_supports_vaapi = true;
+    }
+    LOG_INFO("[VideoDecoder][Decision] requested={} codec={} codec_supports_vaapi={} candidate={} "
+             "frames_context=pending_first_frame",
+             HardwareAccelName(hardware_acceleration), codec_name, codec_supports_vaapi,
+             hardware_acceleration == HardwareAccel::kOff ? "software" : "vaapi");
+
     enum class HardwareOpenResult : std::uint8_t {
         kOpened,  // 解码器已构造完成，result 可直接返回
         kFallbackToSoftware,  // 仅 kAuto：硬解失败，转入软解
@@ -796,10 +840,15 @@ FfmpegVideoDecoderOpenResult FfmpegVideoDecoder::Open(VideoCodecParameters param
         // is_forced 是否强制使用硬解码
         const bool is_forced = hardware_acceleration == HardwareAccel::kVaapi;
 
-        LOG_WARN("VA-API step failed for '{}' : {}, {}",
-                 codec_name,
-                 ffmpeg_detail::DescribeFfmpegError(operation_name, error_code),
-                 is_forced ? "aborting forced hardware decode" : "falling back to software decoding");
+        if (is_forced) {
+            LOG_ERROR("[VideoDecoder][Decision] requested=VAAPI codec={} failed_stage={} averror={} message={} "
+                      "selected=none fallback=false", codec_name, operation_name, error_code,
+                      ffmpeg_detail::DescribeFfmpegError(operation_name, error_code));
+        } else {
+            LOG_WARN("[VideoDecoder][Fallback] requested=Auto candidate=vaapi codec={} failed_stage={} averror={} "
+                     "message={} fallback_to=software", codec_name, operation_name, error_code,
+                     ffmpeg_detail::DescribeFfmpegError(operation_name, error_code));
+        }
 
         if (is_forced) {
             result.error_ = CreateVideoDecoderError(operation_name, error_code);
@@ -824,7 +873,7 @@ FfmpegVideoDecoderOpenResult FfmpegVideoDecoder::Open(VideoCodecParameters param
                                            device_result < 0 ? device_result : AVERROR(ENOMEM));
         }
 
-        LOG_INFO("VA-API hardware device created on {}", kVaapiRenderNode);
+        LOG_INFO("[VideoDecoder][Decision] api=av_hwdevice_ctx_create result=0 device_create=success device={} codec={}", kVaapiRenderNode, codec_name);
 
         // ② 硬解专用上下文：失败后随本函数返回自动释放，软解会另建新的
         AvCodecContextOwner codec_context_owner(avcodec_alloc_context3(codec));
@@ -872,8 +921,9 @@ FfmpegVideoDecoderOpenResult FfmpegVideoDecoder::Open(VideoCodecParameters param
         }
 
         // 日志必须放在 if 之外：原来写在 return 之后，永远执行不到
-        LOG_INFO("Video decoder '{}' opened with VA-API configured; hardware format selection is pending",
-                 codec_name);
+        LOG_INFO("[VideoDecoder][Decision] api=avcodec_open2 result=0 codec={} requested={} "
+                 "device_create=success selected=pending_get_format frames_context=pending_first_frame",
+                 codec_name, HardwareAccelName(hardware_acceleration));
 
         // ⑧ 构造 FfmpegVideoDecoder 并移交上下文、AVFrame、设备引用的所有权
         return create_video_decoder(codec_context_owner, &device_ref_owner) ? HardwareOpenResult::kOpened
@@ -922,7 +972,8 @@ FfmpegVideoDecoderOpenResult FfmpegVideoDecoder::Open(VideoCodecParameters param
         return result;
     }
 
-    LOG_INFO("Video decoder '{}' opened with software decoding", codec_name);
+    LOG_INFO("[VideoDecoder][Decision] api=avcodec_open2 result=0 codec={} requested={} selected=software",
+             codec_name, HardwareAccelName(hardware_acceleration));
 
     // 软解路径没有设备，也没有格式协商状态
     (void)create_video_decoder(software_codec_context_owner, nullptr);
@@ -959,7 +1010,12 @@ enum AVPixelFormat FfmpegVideoDecoder::SelectDecoderPixelFormat(AVCodecContext* 
          ++candidate_pixel_format) {
         if (*candidate_pixel_format == AV_PIX_FMT_VAAPI) {
             pixel_format_selection->is_vappi_selected_ = true;
-            LOG_DEBUG("Decoder format negotiation selected VAAPI");
+            if (pixel_format_selection->logged_format_ != AV_PIX_FMT_VAAPI) {
+                LOG_INFO("[VideoDecoder][Decision] api=get_format codec={} requested={} selected=vaapi "
+                         "frames_context=pending_first_frame",
+                         codec_context->codec->name, HardwareAccelName(pixel_format_selection->acceleration_mode_));
+                pixel_format_selection->logged_format_ = AV_PIX_FMT_VAAPI;
+            }
 
             return AV_PIX_FMT_VAAPI;
         }
@@ -978,8 +1034,12 @@ enum AVPixelFormat FfmpegVideoDecoder::SelectDecoderPixelFormat(AVCodecContext* 
          *candidate_pixel_format != AV_PIX_FMT_NONE;
          ++candidate_pixel_format) {
         if (*candidate_pixel_format == AV_PIX_FMT_YUV420P || *candidate_pixel_format == AV_PIX_FMT_YUVJ420P) {
-            LOG_WARN("VA-API unavailable for this stream, using software format {}",
-                     av_get_pix_fmt_name(*candidate_pixel_format));
+            if (pixel_format_selection->logged_format_ != *candidate_pixel_format) {
+                LOG_WARN("[VideoDecoder][Fallback] api=get_format requested={} codec={} reason=vaapi_not_offered "
+                         "fallback_to=software selected_format={}", HardwareAccelName(pixel_format_selection->acceleration_mode_),
+                         codec_context->codec->name, av_get_pix_fmt_name(*candidate_pixel_format));
+                pixel_format_selection->logged_format_ = *candidate_pixel_format;
+            }
             return *candidate_pixel_format;
         }
     }
@@ -989,7 +1049,12 @@ enum AVPixelFormat FfmpegVideoDecoder::SelectDecoderPixelFormat(AVCodecContext* 
          *candidate_pixel_format != AV_PIX_FMT_NONE;
          ++candidate_pixel_format) {
         if (sws_isSupportedInput(*candidate_pixel_format) > 0) {
-            LOG_WARN("Neither VA-API nor YUV420P is available, using {}", av_get_pix_fmt_name(*candidate_pixel_format));
+            if (pixel_format_selection->logged_format_ != *candidate_pixel_format) {
+                LOG_WARN("[VideoDecoder][Fallback] api=get_format requested={} codec={} reason=vaapi_not_offered "
+                         "fallback_to=software selected_format={}", HardwareAccelName(pixel_format_selection->acceleration_mode_),
+                         codec_context->codec->name, av_get_pix_fmt_name(*candidate_pixel_format));
+                pixel_format_selection->logged_format_ = *candidate_pixel_format;
+            }
             return *candidate_pixel_format;
         }
     }
@@ -1003,6 +1068,8 @@ enum AVPixelFormat FfmpegVideoDecoder::SelectDecoderPixelFormat(AVCodecContext* 
  * @brief 向底层解码器提交压缩数据包
  */
 FfmpegDecoderSendResult FfmpegVideoDecoder::SendPacket(const Packet& packet) {
+    SetStatisticsEpoch(packet.GetEpoch());
+    DecodeCallMeasurement measurement(*this);
     if (codec_context_ == nullptr || decoded_frame_ == nullptr) {
         LOG_ERROR(
             "Video Decoder '{}' cannot send packet to AVCodecContext because its internal FFmpeg objects are "
@@ -1023,14 +1090,10 @@ FfmpegDecoderSendResult FfmpegVideoDecoder::SendPacket(const Packet& packet) {
     }
 
     const auto send_started_at = std::chrono::steady_clock::now();
-    const std::uint64_t send_cpu_started_ns = CurrentThreadCpuTimeNanoseconds();
     const int send_result = avcodec_send_packet(codec_context_, packet.GetAVPacket());
     const auto send_elapsed_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - send_started_at).count();
-    const std::uint64_t send_cpu_finished_ns = CurrentThreadCpuTimeNanoseconds();
-    RecordSend(send_elapsed_ms,
-               send_cpu_finished_ns >= send_cpu_started_ns ? send_cpu_finished_ns - send_cpu_started_ns : 0,
-               send_result == 0);
+    RecordSend(send_elapsed_ms, send_result == 0, packet.GetAVPacket()->size, send_result == AVERROR(EAGAIN));
 
     if (send_result == 0) {
         return {FfmpegDecoderSendStatus::kAccepted, {}};
@@ -1047,10 +1110,9 @@ FfmpegDecoderSendResult FfmpegVideoDecoder::SendPacket(const Packet& packet) {
         return {FfmpegDecoderSendStatus::kDrained, {}};
     }
 
-    LOG_ERROR("avcodec_send_packet failed for decoder '{}', packet epoch {}, code {}",
-              codec_name_,
-              packet.GetEpoch(),
-              send_result);
+    LOG_ERROR("[VideoDecoder][Error] api=avcodec_send_packet averror={} message={} codec={} mode={} epoch={}",
+              send_result, ffmpeg_detail::DescribeFfmpegError(kSendPacketOperation, send_result),
+              codec_name_, actual_mode_, packet.GetEpoch());
     RecordError();
 
     return {FfmpegDecoderSendStatus::kError, CreateVideoDecoderError(kSendPacketOperation, send_result)};
@@ -1060,6 +1122,7 @@ FfmpegDecoderSendResult FfmpegVideoDecoder::SendPacket(const Packet& packet) {
  * @brief 发送 nullptr packet，令解码器进入 Drain 排空模式
  */
 FfmpegDecoderSendResult FfmpegVideoDecoder::BeginDrain() {
+    DecodeCallMeasurement measurement(*this);
     if (codec_context_ == nullptr || decoded_frame_ == nullptr) {
         LOG_ERROR("Video Decoder '{}' cannot begin drain because its internal FFmpeg objects are unavailable",
                   codec_name_);
@@ -1073,13 +1136,10 @@ FfmpegDecoderSendResult FfmpegVideoDecoder::BeginDrain() {
 
     // 传入 nullptr packet 发送 EOF 信号，排空内部暂存的延迟帧（如 B 帧重排队列）
     const auto send_started_at = std::chrono::steady_clock::now();
-    const std::uint64_t send_cpu_started_ns = CurrentThreadCpuTimeNanoseconds();
     const int send_result = avcodec_send_packet(codec_context_, nullptr);
     const double send_elapsed_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - send_started_at).count();
-    const std::uint64_t send_cpu_finished_ns = CurrentThreadCpuTimeNanoseconds();
-    RecordDrainSend(send_elapsed_ms,
-                    send_cpu_finished_ns >= send_cpu_started_ns ? send_cpu_finished_ns - send_cpu_started_ns : 0);
+    RecordDrainSend(send_elapsed_ms);
 
     if (send_result == 0) {
         drain_started_ = true;
@@ -1088,6 +1148,8 @@ FfmpegDecoderSendResult FfmpegVideoDecoder::BeginDrain() {
     }
 
     if (send_result == AVERROR(EAGAIN)) {
+        ++total_statistics_.send_eagain_;
+        ++interval_statistics_.send_eagain_;
         return {FfmpegDecoderSendStatus::kNeedReceive, {}};
     }
 
@@ -1097,7 +1159,9 @@ FfmpegDecoderSendResult FfmpegVideoDecoder::BeginDrain() {
         return {FfmpegDecoderSendStatus::kDrained, {}};
     }
 
-    LOG_ERROR("avcodec_send_packet(nullptr) failed while draining decoder '{}', code {}", codec_name_, send_result);
+    LOG_ERROR("[VideoDecoder][Error] api=avcodec_send_packet_null averror={} message={} codec={} mode={} epoch={}",
+              send_result, ffmpeg_detail::DescribeFfmpegError(kSendPacketOperation, send_result),
+              codec_name_, actual_mode_, statistics_epoch_);
     RecordError();
     return {FfmpegDecoderSendStatus::kError, CreateVideoDecoderError(kSendPacketOperation, send_result)};
 }
@@ -1111,6 +1175,46 @@ FfmpegDecoderSendResult FfmpegVideoDecoder::BeginDrain() {
  * 并保存图像布局信息和 AVFrame 引用，供 Renderer 后续导入和使用
  * 后续 EGLImage 导入和 OpenGL Texture 创建由 Renderer 负责
  */
+void FfmpegVideoDecoder::LogHardwareExportFailure(const char* stage, std::uint64_t epoch, int va_status) {
+    auto found = std::find_if(export_failure_reasons_.begin(), export_failure_reasons_.end(),
+                              [stage](const ExportFailureCounter& entry) { return std::strcmp(entry.stage, stage) == 0; });
+    auto& counter = found != export_failure_reasons_.end() ? *found : export_failure_reasons_.back();
+    ++counter.count;
+    const auto now = std::chrono::steady_clock::now();
+    if (last_export_failure_stage_ != stage || now - last_export_failure_logged_at_ >= std::chrono::seconds(5)) {
+        last_export_failure_stage_ = stage;
+        last_export_failure_logged_at_ = now;
+#ifdef MEDIACORE_HAVE_VAAPI
+        const char* status_text = va_status >= 0 ? vaErrorStr(va_status) : "not_a_VA_status";
+#else
+        const char* status_text = "VAAPI_not_built";
+#endif
+        try {
+            LOG_ERROR("[VideoDecoder][ExportError] stage={} va_status={} message={} epoch={} codec={} mode={} "
+                      "surface_id={} pixel_format={} resolution={}x{} failed_frames={}", stage, va_status, status_text,
+                      epoch, codec_name_, actual_mode_, decoded_frame_ ? reinterpret_cast<std::uintptr_t>(decoded_frame_->data[3]) : 0,
+                      decoded_frame_ ? decoded_frame_->format : -1, decoded_frame_ ? decoded_frame_->width : 0,
+                      decoded_frame_ ? decoded_frame_->height : 0, counter.count);
+        } catch (const std::bad_alloc&) {
+            // Logging is best effort under OOM; the fixed counter above is retained.
+        }
+    }
+}
+
+void FfmpegVideoDecoder::RecordDownloadFallback(std::size_t reason, std::uint64_t epoch) {
+    static constexpr const char* reasons[] = {"renderer_capability_unavailable", "export_disabled_after_failures",
+                                             "hardware_frame_export_failed", "vaapi_export_not_built"};
+    ++total_statistics_.fallback_frames_[reason];
+    ++interval_statistics_.fallback_frames_[reason];
+    const auto now = std::chrono::steady_clock::now();
+    if (total_statistics_.fallback_frames_[reason] == 1 || now - fallback_logged_at_[reason] >= std::chrono::seconds(5)) {
+        fallback_logged_at_[reason] = now;
+        LOG_WARN("[VideoRender][Fallback] component=decoder from=VAAPI_DMA_BUF to=CPU_UPLOAD reason={} "
+                 "epoch={} frames={} export_stage={}", reasons[reason], epoch,
+                 total_statistics_.fallback_frames_[reason], last_export_failure_stage_ ? last_export_failure_stage_ : "none");
+    }
+}
+
 std::unique_ptr<HardwareFrame> FfmpegVideoDecoder::ExportHardwareFrame(std::uint64_t epoch) {
     try {
 #ifdef MEDIACORE_HAVE_VAAPI
@@ -1124,6 +1228,7 @@ std::unique_ptr<HardwareFrame> FfmpegVideoDecoder::ExportHardwareFrame(std::uint
         if (decoded_frame_ == nullptr || decoded_frame_->format != AV_PIX_FMT_VAAPI || decoded_frame_->width <= 0 ||
             decoded_frame_->height <= 0 || decoded_frame_->buf[0] == nullptr ||
             decoded_frame_->hw_frames_ctx == nullptr || decoded_frame_->hw_frames_ctx->data == nullptr) {
+            LogHardwareExportFailure("invalid_hardware_frame", epoch);
             return nullptr;
         }
 
@@ -1132,11 +1237,13 @@ std::unique_ptr<HardwareFrame> FfmpegVideoDecoder::ExportHardwareFrame(std::uint
 
         if (hardware_frames_context == nullptr || hardware_frames_context->device_ctx == nullptr ||
             hardware_frames_context->device_ctx->type != AV_HWDEVICE_TYPE_VAAPI) {
+            LogHardwareExportFailure("invalid_frames_device", epoch);
             return nullptr;
         }
 
         auto* vaapi_device_context = static_cast<AVVAAPIDeviceContext*>(hardware_frames_context->device_ctx->hwctx);
         if (vaapi_device_context == nullptr || vaapi_device_context->display == nullptr) {
+            LogHardwareExportFailure("invalid_va_display", epoch);
             return nullptr;
         }
 
@@ -1144,6 +1251,7 @@ std::unique_ptr<HardwareFrame> FfmpegVideoDecoder::ExportHardwareFrame(std::uint
         const std::uintptr_t surface_handle = reinterpret_cast<std::uintptr_t>(decoded_frame_->data[3]);
 
         if (surface_handle > std::numeric_limits<VASurfaceID>::max() || surface_handle == VA_INVALID_SURFACE) {
+            LogHardwareExportFailure("invalid_surface", epoch);
             return nullptr;
         }
 
@@ -1161,8 +1269,7 @@ std::unique_ptr<HardwareFrame> FfmpegVideoDecoder::ExportHardwareFrame(std::uint
                          .count());
 
         if (sync_status != VA_STATUS_SUCCESS) {
-            LOG_WARN(
-                "vaSyncSurface failed on decoder '{}' at epoch {}: {}", codec_name_, epoch, vaErrorStr(sync_status));
+            LogHardwareExportFailure("vaSyncSurface", epoch, sync_status);
             return nullptr;
         }
 
@@ -1175,6 +1282,8 @@ std::unique_ptr<HardwareFrame> FfmpegVideoDecoder::ExportHardwareFrame(std::uint
         // 获取导出的图像信息
         auto& export_descriptor = exported_dma_buf_owner.GetExportDescriptor();
 
+        ++total_statistics_.export_api_attempts_;
+        ++interval_statistics_.export_api_attempts_;
         const VAStatus export_status =
             vaExportSurfaceHandle(vaapi_device_context->display,
                                   surface_id,
@@ -1183,11 +1292,60 @@ std::unique_ptr<HardwareFrame> FfmpegVideoDecoder::ExportHardwareFrame(std::uint
                                   &export_descriptor);
 
         if (export_status != VA_STATUS_SUCCESS) {
-            LOG_WARN("vaExportSurfaceHandle failed on decoder '{}' at epoch {}: {}",
-                     codec_name_,
-                     epoch,
-                     vaErrorStr(export_status));
+            ++total_statistics_.export_api_failures_;
+            ++interval_statistics_.export_api_failures_;
+            LogHardwareExportFailure("vaExportSurfaceHandle", epoch, export_status);
             return nullptr;
+        }
+
+        ++total_statistics_.export_api_success_;
+        ++interval_statistics_.export_api_success_;
+        // Compare descriptor layout without FDs/surface IDs, which vary per frame.
+        std::array<std::uint64_t, 128> layout{};
+        std::size_t cursor = 0;
+        layout[cursor++] = export_descriptor.fourcc;
+        layout[cursor++] = export_descriptor.width;
+        layout[cursor++] = export_descriptor.height;
+        layout[cursor++] = export_descriptor.num_objects;
+        layout[cursor++] = export_descriptor.num_layers;
+        const auto objects = std::min<std::size_t>(export_descriptor.num_objects, std::size(export_descriptor.objects));
+        const auto layers = std::min<std::size_t>(export_descriptor.num_layers, std::size(export_descriptor.layers));
+        for (std::uint32_t i = 0; i < objects; ++i) {
+            layout[cursor++] = export_descriptor.objects[i].size;
+            layout[cursor++] = export_descriptor.objects[i].drm_format_modifier;
+            layout[cursor++] = export_descriptor.objects[i].fd >= 0;
+        }
+        for (std::uint32_t i = 0; i < layers; ++i) {
+            const auto& layer = export_descriptor.layers[i];
+            layout[cursor++] = layer.drm_format;
+            layout[cursor++] = layer.num_planes;
+            for (std::uint32_t plane = 0; plane < std::min<std::size_t>(layer.num_planes, std::size(layer.object_index)); ++plane) {
+                layout[cursor++] = layer.object_index[plane];
+                layout[cursor++] = layer.offset[plane];
+                layout[cursor++] = layer.pitch[plane];
+            }
+        }
+        if (!export_layout_logged_ || layout != logged_export_layout_) {
+            export_layout_logged_ = true;
+            logged_export_layout_ = layout;
+            LOG_INFO("[VideoDecoder][DmaBufExport] api=vaExportSurfaceHandle surface_id={} flags=0x{:x} "
+                     "va_status={} message={} epoch={} fourcc=0x{:08x} width={} height={} objects={} layers={}",
+                     surface_id, VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_COMPOSED_LAYERS,
+                     export_status, vaErrorStr(export_status), epoch, export_descriptor.fourcc,
+                     export_descriptor.width, export_descriptor.height, export_descriptor.num_objects, export_descriptor.num_layers);
+            for (std::uint32_t i = 0; i < objects; ++i) {
+                const auto& object = export_descriptor.objects[i];
+                LOG_INFO("[VideoDecoder][DmaBufObject] epoch={} object={} fd={} fd_valid={} size={} modifier=0x{:016x}",
+                         epoch, i, object.fd, object.fd >= 0, object.size, object.drm_format_modifier);
+            }
+            for (std::uint32_t i = 0; i < layers; ++i) {
+                const auto& layer = export_descriptor.layers[i];
+                for (std::uint32_t plane = 0; plane < std::min<std::size_t>(layer.num_planes, std::size(layer.object_index)); ++plane) {
+                    LOG_INFO("[VideoDecoder][DmaBufPlane] epoch={} layer={} layer_fourcc=0x{:08x} plane={} "
+                             "plane_fourcc=0x{:08x} object_index={} offset={} pitch={}", epoch, i, layer.drm_format, plane,
+                             GetDrmPlaneFourcc(layer.drm_format, plane), layer.object_index[plane], layer.offset[plane], layer.pitch[plane]);
+                }
+            }
         }
 
         // ---------- 第 4 步：把 VA-API 描述符转换成项目自己的 HardwareFrame ----------
@@ -1201,7 +1359,7 @@ std::unique_ptr<HardwareFrame> FfmpegVideoDecoder::ExportHardwareFrame(std::uint
             GetDrmPlaneFourcc(export_descriptor.layers[0].drm_format, 0) == 0 ||
             export_descriptor.width < static_cast<std::uint32_t>(decoded_frame_->width) ||
             export_descriptor.height < static_cast<std::uint32_t>(decoded_frame_->height)) {
-            LOG_WARN("Unsupported VA-API DMA-BUF layout on decoder '{}' at epoch {}", codec_name_, epoch);
+            LogHardwareExportFailure("unsupported_descriptor_layout", epoch);
             return nullptr;
         }
 
@@ -1213,8 +1371,7 @@ std::unique_ptr<HardwareFrame> FfmpegVideoDecoder::ExportHardwareFrame(std::uint
         const bool is_p010_export = export_descriptor.fourcc == VA_FOURCC_P010 &&
             exported_layer.drm_format == kDrmFormatP010 && hardware_frames_context->sw_format == AV_PIX_FMT_P010LE;
         if (!is_nv12_export && !is_p010_export) {
-            LOG_WARN(
-                "Inconsistent or unsupported VA/DRM pixel formats on decoder '{}' at epoch {}", codec_name_, epoch);
+            LogHardwareExportFailure("inconsistent_va_drm_pixel_format", epoch);
             return nullptr;
         }
 
@@ -1231,20 +1388,20 @@ std::unique_ptr<HardwareFrame> FfmpegVideoDecoder::ExportHardwareFrame(std::uint
         for (std::uint32_t object_index = 0; object_index < export_descriptor.num_objects; ++object_index) {
             const auto& exported_object = export_descriptor.objects[object_index];
             if (exported_object.fd < 0 || exported_object.size == 0) {
-                LOG_WARN("Invalid DMA-BUF object {} on decoder '{}'", object_index, codec_name_);
+                LogHardwareExportFailure("invalid_dma_buf_object", epoch);
                 return nullptr;
             }
             for (std::uint32_t previous_index = 0; previous_index < object_index; ++previous_index) {
                 if (exported_object.fd == export_descriptor.objects[previous_index].fd) {
-                    LOG_WARN("Repeated DMA-BUF fd in VA-API export on decoder '{}'", codec_name_);
+                    LogHardwareExportFailure("repeated_dma_buf_fd", epoch);
                     return nullptr;
                 }
             }
 
             ScopedDmaBufFileDescriptor duplicated_dma_buf_fd(::dup(exported_object.fd));
             if (duplicated_dma_buf_fd.GetDmaBufFileDescriptor() < 0) {
-                LOG_WARN(
-                    "dup() failed for DMA-BUF object {} on decoder '{}': errno {}", object_index, codec_name_, errno);
+                LogHardwareExportFailure("dup_fd", epoch);
+                LOG_ERROR("[VideoDecoder][FdError] api=dup object={} errno={} epoch={}", object_index, errno, epoch);
                 return nullptr;
             }
             DmaBufObject dma_buf_object;
@@ -1274,8 +1431,7 @@ std::unique_ptr<HardwareFrame> FfmpegVideoDecoder::ExportHardwareFrame(std::uint
         // 未支持的 modifier 或辅助平面布局必须失败；通过这里只说明描述可表示，
         // 不代表目标 EGLDisplay/GPU 支持，驱动格式查询由第三阶段 Renderer 负责。
         if (!hardware_frame->ValidateDmaBufLayout()) {
-            LOG_WARN(
-                "Unsupported DMA-BUF format/modifier/plane bounds on decoder '{}' at epoch {}", codec_name_, epoch);
+            LogHardwareExportFailure("unsupported_format_modifier_plane_bounds", epoch);
             return nullptr;
         }
 
@@ -1295,7 +1451,7 @@ std::unique_ptr<HardwareFrame> FfmpegVideoDecoder::ExportHardwareFrame(std::uint
         hardware_frame->av_frame_ref_ = av_frame_alloc();
         if (hardware_frame->av_frame_ref_ == nullptr ||
             av_frame_ref(hardware_frame->av_frame_ref_, decoded_frame_) < 0) {
-            LOG_WARN("av_frame_ref failed on decoder '{}' at epoch {}", codec_name_, epoch);
+            LogHardwareExportFailure("av_frame_ref", epoch);
             // HardwareFrame 析构会关闭已 dup 的 fd 并释放 av_frame_ref_
             return nullptr;
         }
@@ -1326,10 +1482,10 @@ std::unique_ptr<HardwareFrame> FfmpegVideoDecoder::ExportHardwareFrame(std::uint
     } catch (const std::bad_alloc&) {
         // 局部 RAII 先释放原始 fd、尚未移交的 dup fd、已构造的 HardwareFrame。
         // 返回 nullptr 后仍由 ConvertDecodedFrameToVideoFrame 执行原有下载回退。
-        LOG_WARN("Insufficient memory exporting DMA-BUF on decoder '{}' at epoch {}", codec_name_, epoch);
+        LogHardwareExportFailure("bad_alloc", epoch);
         return nullptr;
     } catch (const std::length_error&) {
-        LOG_WARN("Invalid DMA-BUF descriptor container size on decoder '{}' at epoch {}", codec_name_, epoch);
+        LogHardwareExportFailure("length_error", epoch);
         return nullptr;
     }
 }
@@ -1353,7 +1509,8 @@ void FfmpegVideoDecoder::SetHardwareRenderCapability(std::shared_ptr<std::atomic
  * 下游帧仍由各自持有的资源引用管理。
  */
 void FfmpegVideoDecoder::Flush() noexcept {
-    LOG_DEBUG("Video Decoder '{}' flushing cached frames", codec_name_);
+    if (statistics_epoch_set_ && !summary_logged_) LogStatistics("flush", true);
+    LOG_INFO("[Seek][DecoderFlush] codec={} previous_epoch={} api=avcodec_flush_buffers", codec_name_, statistics_epoch_);
     if (codec_context_ != nullptr) {
         avcodec_flush_buffers(codec_context_);
     }
@@ -1386,6 +1543,8 @@ int FfmpegVideoDecoder::GetCodedHeight() const noexcept {
  * @param epoch 目标帧所属的数据流世代版本号
  */
 FfmpegDecoderReceiveResult FfmpegVideoDecoder::ReceiveFrame(std::uint64_t epoch) {
+    SetStatisticsEpoch(epoch);
+    DecodeCallMeasurement measurement(*this);
     if (codec_context_ == nullptr || decoded_frame_ == nullptr) {
         LOG_ERROR("Video Decoder '{}' cannot receive frame for epoch {} because its internal FFmpeg objects are null",
                   codec_name_,
@@ -1398,7 +1557,6 @@ FfmpegDecoderReceiveResult FfmpegVideoDecoder::ReceiveFrame(std::uint64_t epoch)
 
     const auto frame_processing_started_at = std::chrono::steady_clock::now();
     const auto receive_started_at = frame_processing_started_at;
-    const std::uint64_t receive_cpu_started_ns = CurrentThreadCpuTimeNanoseconds();
     const int receive_result = avcodec_receive_frame(codec_context_, decoded_frame_);
     const double receive_elapsed_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - receive_started_at).count();
@@ -1407,63 +1565,69 @@ FfmpegDecoderReceiveResult FfmpegVideoDecoder::ReceiveFrame(std::uint64_t epoch)
         const AVPixelFormat decoded_pixel_format = static_cast<AVPixelFormat>(decoded_frame_->format);
         const int decoded_width = decoded_frame_->width;
         const int decoded_height = decoded_frame_->height;
+        for (auto* stats : {&total_statistics_, &interval_statistics_}) {
+            if (decoded_pixel_format == AV_PIX_FMT_VAAPI) ++stats->vaapi_decode_frames_;
+            else ++stats->software_decode_frames_;
+        }
+        if (decoded_pixel_format == AV_PIX_FMT_VAAPI && decoded_frame_->hw_frames_ctx != nullptr) {
+            const auto* frames = reinterpret_cast<const AVHWFramesContext*>(decoded_frame_->hw_frames_ctx->data);
+            const std::array<int, 3> layout = frames ? std::array<int, 3>{frames->width, frames->height, frames->sw_format}
+                                                   : std::array<int, 3>{};
+            if (frames && (!hardware_frame_logged_ || layout != first_hardware_layout_)) {
+                hardware_frame_logged_ = true;
+                first_hardware_layout_ = layout;
+                LOG_INFO("[VideoDecoder][HardwareFrame] epoch={} format=vaapi hw_frames_context={} sw_format={} "
+                         "surface_width={} surface_height={} visible_width={} visible_height={} surface_id={} device_type={}",
+                         epoch, static_cast<const void*>(frames), av_get_pix_fmt_name(frames->sw_format),
+                         frames->width, frames->height, decoded_width, decoded_height,
+                         reinterpret_cast<std::uintptr_t>(decoded_frame_->data[3]),
+                         frames->device_ctx ? av_hwdevice_get_type_name(frames->device_ctx->type) : "none");
+            }
+        }
         // 成功提取到解码帧：可能封装为 HardwareFrame，也可能转换为软件像素帧。
         FfmpegDecoderReceiveResult result = ConvertDecodedFrameToVideoFrame(epoch);
         const double frame_processing_elapsed_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - frame_processing_started_at).count();
-        const std::uint64_t receive_cpu_finished_ns = CurrentThreadCpuTimeNanoseconds();
         if (result.status_ == FfmpegDecoderReceiveStatus::kFrame && result.frame_.has_value()) {
+            result.frame_->diagnostic_stream_id_ = diagnostic_stream_id_;
             LogFirstFrameInfo(*result.frame_, decoded_pixel_format, decoded_width, decoded_height);
             RecordOutputPath(decoded_pixel_format, *result.frame_);
+            if (!first_epoch_frame_logged_) {
+                first_epoch_frame_logged_ = true;
+                LOG_INFO("[Seek][DecoderFirstFrame] epoch={} stream_id={} pts_us={} pts_valid={} format={}", epoch,
+                         diagnostic_stream_id_, result.frame_->pts_us_.value_or(0), result.frame_->pts_us_.has_value(),
+                         av_get_pix_fmt_name(decoded_pixel_format));
+            }
         }
         av_frame_unref(decoded_frame_);
-        RecordReceive(receive_elapsed_ms,
-                      receive_cpu_finished_ns >= receive_cpu_started_ns
-                          ? receive_cpu_finished_ns - receive_cpu_started_ns
-                          : 0,
-                      true);
+        RecordReceive(receive_elapsed_ms, true);
         if (result.status_ == FfmpegDecoderReceiveStatus::kFrame) {
             RecordFrameProcessing(frame_processing_elapsed_ms);
         } else if (result.status_ == FfmpegDecoderReceiveStatus::kError) {
             RecordError();
         }
-        MaybeLogIntervalStatistics();
         return result;
     }
 
     if (receive_result == AVERROR(EAGAIN)) {
-        const std::uint64_t receive_cpu_finished_ns = CurrentThreadCpuTimeNanoseconds();
-        RecordReceive(receive_elapsed_ms,
-                      receive_cpu_finished_ns >= receive_cpu_started_ns
-                          ? receive_cpu_finished_ns - receive_cpu_started_ns
-                          : 0,
-                      false);
-        MaybeLogIntervalStatistics();
+        ++total_statistics_.receive_eagain_;
+        ++interval_statistics_.receive_eagain_;
+        RecordReceive(receive_elapsed_ms, false);
         return {FfmpegDecoderReceiveStatus::kNeedInput, std::nullopt, {}};
     }
 
     if (receive_result == AVERROR_EOF) {
-        const std::uint64_t receive_cpu_finished_ns = CurrentThreadCpuTimeNanoseconds();
-        RecordReceive(receive_elapsed_ms,
-                      receive_cpu_finished_ns >= receive_cpu_started_ns
-                          ? receive_cpu_finished_ns - receive_cpu_started_ns
-                          : 0,
-                      false);
+        RecordReceive(receive_elapsed_ms, false);
         drained_ = true;
         LOG_DEBUG("Video Decoder '{}' drain completed for epoch {}", codec_name_, epoch);
-        MaybeLogIntervalStatistics();
         return {FfmpegDecoderReceiveStatus::kDrained, std::nullopt, {}};
     }
 
-    const std::uint64_t receive_cpu_finished_ns = CurrentThreadCpuTimeNanoseconds();
-    RecordReceive(receive_elapsed_ms,
-                  receive_cpu_finished_ns >= receive_cpu_started_ns
-                      ? receive_cpu_finished_ns - receive_cpu_started_ns
-                      : 0,
-                  false);
+    RecordReceive(receive_elapsed_ms, false);
     RecordError();
-    LOG_ERROR("avcodec_receive_frame failed for decoder '{}', epoch {}, code {}", codec_name_, epoch, receive_result);
-    MaybeLogIntervalStatistics();
+    LOG_ERROR("[VideoDecoder][Error] api=avcodec_receive_frame averror={} message={} codec={} mode={} epoch={}",
+              receive_result, ffmpeg_detail::DescribeFfmpegError(kReceiveFrameOperation, receive_result),
+              codec_name_, actual_mode_, epoch);
     return {FfmpegDecoderReceiveStatus::kError,
             std::nullopt,
             CreateVideoDecoderError(kReceiveFrameOperation, receive_result)};
@@ -1513,8 +1677,12 @@ FfmpegDecoderReceiveResult FfmpegVideoDecoder::ConvertDecodedFrameToVideoFrame(s
     const bool renderer_can_import_dma_buf =
         hardware_render_capability_ != nullptr && hardware_render_capability_->load(std::memory_order_acquire);
 
+    std::size_t download_reason = !renderer_can_import_dma_buf ? 0 : 1;
 #ifdef MEDIACORE_HAVE_VAAPI
     if (decoded_pixel_format == AV_PIX_FMT_VAAPI && dma_buf_export_enabled_ && renderer_can_import_dma_buf) {
+        ++total_statistics_.export_pipeline_attempts_;
+        ++interval_statistics_.export_pipeline_attempts_;
+        download_reason = 2;
         if (auto hardware_frame = ExportHardwareFrame(epoch); hardware_frame != nullptr) {
             // 导出成功：构造硬件帧 VideoFrame
             VideoFrame output_video_frame;
@@ -1540,6 +1708,8 @@ FfmpegDecoderReceiveResult FfmpegVideoDecoder::ConvertDecodedFrameToVideoFrame(s
         }
 
         // 导出失败：累加计数，超过阈值就关闭导出，避免每帧都白白尝试 + 刷日志
+        ++total_statistics_.export_pipeline_failures_;
+        ++interval_statistics_.export_pipeline_failures_;
         ++consecutive_export_failures_;
         constexpr int kMaxConsecutiveExportFailures = 30;
         if (consecutive_export_failures_ >= kMaxConsecutiveExportFailures) {
@@ -1549,16 +1719,10 @@ FfmpegDecoderReceiveResult FfmpegVideoDecoder::ConvertDecodedFrameToVideoFrame(s
                 "disabling zero-copy for this stream and using download path",
                 consecutive_export_failures_,
                 codec_name_);
-        } else {
-            LOG_WARN(
-                "DMA-BUF export failed on decoder '{}' at epoch {} ({}/{}), "
-                "falling back to download for this frame",
-                codec_name_,
-                epoch,
-                consecutive_export_failures_,
-                kMaxConsecutiveExportFailures);
         }
     }
+#else
+    download_reason = 3;
 #endif
 
     // ==================== ③ 回退：将 VA-API 硬件帧下载到 CPU 内存 ====================
@@ -1571,6 +1735,7 @@ FfmpegDecoderReceiveResult FfmpegVideoDecoder::ConvertDecodedFrameToVideoFrame(s
     // 只是把已经解码完成的像素数据复制到 CPU 内存，供后续软件格式转换使用
     // 导出成功的帧在上面已经返回，不会经过这里
     if (decoded_pixel_format == AV_PIX_FMT_VAAPI) {
+        RecordDownloadFallback(download_reason, epoch);
         AvFrameOwner downloaded_frame(av_frame_alloc());
         if (downloaded_frame == nullptr) {
             return {FfmpegDecoderReceiveStatus::kError,
@@ -1585,17 +1750,21 @@ FfmpegDecoderReceiveResult FfmpegVideoDecoder::ConvertDecodedFrameToVideoFrame(s
                                    std::chrono::steady_clock::now() - transfer_started_at)
                                    .count());
         if (transfer_result < 0) {
-            LOG_ERROR("{} failed for decoder '{}' at epoch {}: {}",
-                      kTransferFrameOperation,
-                      codec_name_,
-                      epoch,
-                      ffmpeg_detail::DescribeFfmpegError(kTransferFrameOperation, transfer_result));
+            LOG_ERROR("[VideoDecoder][Error] api=av_hwframe_transfer_data averror={} message={} codec={} mode=VAAPI epoch={}",
+                      transfer_result, ffmpeg_detail::DescribeFfmpegError(kTransferFrameOperation, transfer_result), codec_name_, epoch);
             // 运行期下载失败不自动切换软件解码器：
             // 切换需要重新打开解码器并 Seek 回合适的关键帧，还要处理已输出帧的时间戳连续性
             // 这里直接上报错误，由上层决定是否重建解码器
             return {FfmpegDecoderReceiveStatus::kError,
                     std::nullopt,
                     CreateVideoDecoderError(kTransferFrameOperation, transfer_result)};
+        }
+
+        const int downloaded_bytes = av_image_get_buffer_size(static_cast<AVPixelFormat>(downloaded_frame->format),
+                                                               downloaded_frame->width, downloaded_frame->height, 1);
+        for (auto* stats : {&total_statistics_, &interval_statistics_}) {
+            ++stats->vaapi_download_frames_;
+            if (downloaded_bytes > 0) stats->cpu_download_bytes_ += static_cast<std::uint64_t>(downloaded_bytes);
         }
 
         // av_hwframe_transfer_data 只搬像素，不搬帧属性

@@ -123,7 +123,7 @@ TickResult AudioSinkNode::ProcessPendingControl() {
 
         // 2. 根据 epoch_ 判断是否为同一轮的播放，如果不是，则清理节点和设备缓冲区
         if (state.epoch_ != latest_epoch_) {
-            LOG_DEBUG("Audio sink applaying seek: observed epoch_ {} -> {}, active epoch {}, target_{} us",
+            LOG_INFO("[Seek][AudioSink] stage=apply_control observed_epoch={} new_epoch={} active_epoch={} target_us={}",
                       latest_epoch_,
                       state.epoch_,
                       active_epoch_,
@@ -163,10 +163,10 @@ TickResult AudioSinkNode::ProcessPendingControl() {
                   state.stopped_);
         return TickResult::kContinue;
     } catch (const std::exception& error) {
-        LOG_ERROR("Audio sink control failed at active epoch {}, observed epoch {}: {}",
-                  active_epoch_,
-                  latest_epoch_,
-                  error.what());
+        const auto state = timeline_->Get();
+        LOG_ERROR("[AudioSink][Error] stage=control active_epoch={} observed_epoch={} playing={} seeking={} "
+                  "stopped={} draining={} error={}", active_epoch_, latest_epoch_, state.playing_, state.seeking_,
+                  state.stopped_, draining_, error.what());
 
         return Fail(error.what());
     }
@@ -469,7 +469,7 @@ void AudioSinkNode::ApplySeekReset(std::uint64_t epoch, std::int64_t target_us) 
     await_reset_ = false;
     ClearStreamState();
     next_frame_ = last_end_frame_ = TargetSample(target_us);
-    LOG_DEBUG("Audio sink accepted StreamReset at epoch {}, target {} us", active_epoch_, target_us);
+    LOG_INFO("[Seek][AudioSink] stage=stream_reset epoch={} target_us={}", active_epoch_, target_us);
 }
 
 /**
@@ -601,10 +601,10 @@ TickResult AudioSinkNode::Tick() {
     try {
         return ProcessTick();
     } catch (const std::exception& error) {
-        LOG_ERROR("AudioSinkNOde Processing failed at active epoch {}, latest epoch {}: {}",
-                  active_epoch_,
-                  latest_epoch_,
-                  error.what());
+        const auto state = timeline_->Get();
+        LOG_ERROR("[AudioSink][Error] stage=process active_epoch={} observed_epoch={} playing={} seeking={} "
+                  "stopped={} draining={} error={}", active_epoch_, latest_epoch_, state.playing_, state.seeking_,
+                  state.stopped_, draining_, error.what());
 
         return Fail(error.what());
     }

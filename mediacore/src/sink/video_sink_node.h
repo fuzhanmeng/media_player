@@ -104,6 +104,7 @@ private:
     ///< 当前 Seek 的目标时间，单位微秒
 
     std::optional<VideoFrame> fallback_frame_;
+    bool fallback_frame_delivered_{false};  // diagnostic only: optional remains engaged after move
     ///< 目标时间之前最近的一帧；到达 EOF 仍未找到目标帧时用作预览
 
     std::optional<StreamItem<VideoFrame>> pending_item_;
@@ -111,6 +112,11 @@ private:
 
     std::uint64_t sink_frames_total_{0};
     std::uint64_t sink_frames_interval_{0};
+    std::uint64_t received_frames_total_{0};
+    std::uint64_t received_frames_interval_{0};
+    std::uint64_t dropped_frames_total_{0};
+    std::uint64_t dropped_frames_interval_{0};
+    void RecordDroppedFrame();
     std::chrono::steady_clock::time_point sink_statistics_started_at_{};
     std::chrono::steady_clock::time_point sink_interval_started_at_{};
     bool sink_summary_logged_{false};

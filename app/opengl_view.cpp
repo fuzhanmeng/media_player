@@ -34,12 +34,15 @@
 
 #include <QtGui/qopenglcontext_platform.h>
 
+#include <QLibrary>
 #include <QMatrix3x3>
 #include <QOpenGLContext>
 #include <QOpenGLExtraFunctions>
 #include <QTimer>
+#include <QGuiApplication>
 #include <QVector2D>
 #include <QVector3D>
+#include <QWindow>
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -55,6 +58,8 @@
 extern "C" {
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/error.h>
 #include <libavutil/pixfmt.h>
 #include <libswscale/swscale.h>
 }
@@ -62,6 +67,17 @@ extern "C" {
 #include "mediacore/av_types/hardware_frame.h"
 #include "mediacore/av_types/video_frame.h"
 #include "mediacore/logger.h"
+
+// Diagnostics must not interrupt rollback, Fence registration, or resource retirement.
+// Keep argument evaluation inside the guard as formatting can allocate too.
+#define RENDER_LOG_NO_THROW(level, ...) \
+    do {                                \
+        try {                           \
+            level(__VA_ARGS__);         \
+        } catch (...) {                 \
+        }                               \
+    } while (false)
+
 namespace {
 
 /**
@@ -388,6 +404,60 @@ EGLint EncodeUint32AsEglInt(std::uint32_t value) {
     return encoded_value;
 }
 
+// Diagnostic queries only: do not import images or change the renderer's support cache.
+void LogEglDmaBufFormats(EGLDisplay display,
+                        PFNEGLQUERYDMABUFMODIFIERSEXTPROC query_modifiers,
+                        const std::vector<EGLint>& importable_formats) {
+    constexpr std::array<std::uint32_t, 6> formats = {
+        mediacore::kDrmFormatNv12, mediacore::kDrmFormatP010,
+        mediacore::kDrmFormatR8, mediacore::kDrmFormatGr88,
+        mediacore::kDrmFormatR16, mediacore::kDrmFormatGr1616};
+    for (const auto format : formats) {
+        const EGLint egl_format = EncodeUint32AsEglInt(format);
+        const bool listed = std::find(importable_formats.begin(), importable_formats.end(), egl_format) !=
+                            importable_formats.end();
+        LOG_INFO("EGL DMA-BUF format {} (0x{:08x}): listed={}",
+                 mediacore::GetDrmFourccName(format), format, listed);
+        if (!listed) {
+            continue;
+        }
+
+        EGLint count = 0;
+        const EGLBoolean count_result = query_modifiers(display, egl_format, 0, nullptr, nullptr, &count);
+        if (count_result != EGL_TRUE || count < 0) {
+            LOG_WARN("EGL modifier count query for {}: result={}, count={}, error=0x{:x}",
+                     mediacore::GetDrmFourccName(format), count_result, count, eglGetError());
+            continue;
+        }
+
+        // Bound diagnostic storage/output independently of the actual import implementation.
+        std::array<EGLuint64KHR, 64> modifiers{};
+        std::array<EGLBoolean, 64> external_only{};
+        LOG_INFO("EGL modifier count query for {}: result={}, count={}",
+                 mediacore::GetDrmFourccName(format), count_result, count);
+        if (count == 0 || static_cast<std::size_t>(count) > modifiers.size()) {
+            if (count > 0) {
+                LOG_INFO("EGL modifier diagnostic list exceeds capacity {}; list omitted", modifiers.size());
+            }
+            continue;
+        }
+        const EGLBoolean list_result = query_modifiers(
+            display, egl_format, static_cast<EGLint>(modifiers.size()), modifiers.data(), external_only.data(), &count);
+        if (list_result != EGL_TRUE || count < 0 || static_cast<std::size_t>(count) > modifiers.size()) {
+            LOG_WARN("EGL modifier list query for {}: result={}, count={}, error=0x{:x}",
+                     mediacore::GetDrmFourccName(format), list_result, count, eglGetError());
+            continue;
+        }
+        LOG_INFO("EGL modifier list query for {}: result={}, count={}",
+                 mediacore::GetDrmFourccName(format), list_result, count);
+        for (EGLint index = 0; index < count; ++index) {
+            const auto item = static_cast<std::size_t>(index);
+            LOG_INFO("EGL DMA-BUF {}: modifier=0x{:016x}, external_only={}",
+                     mediacore::GetDrmFourccName(format), modifiers[item], external_only[item] == EGL_TRUE);
+        }
+    }
+}
+
 }  // namespace
 
 class OpenGLView::DeferredGlFrameBatch final : public DeferredResourceBatch {
@@ -529,9 +599,42 @@ DeferredGlResourceReaper& GetDeferredGlResourceReaper() {
  * 确保后台工作线程无论何时 emit 该信号，最终的绘制驱动 update() 严格在 Qt GUI 主线程执行。
  */
 OpenGLView::OpenGLView(QWidget* parent) : QOpenGLWidget(parent) {
-    renderer_statistics_started_at_ = std::chrono::steady_clock::now();
-    renderer_interval_started_at_ = renderer_statistics_started_at_;
-    connect(this, &OpenGLView::FrameArrived, this, QOverload<>::of(&QOpenGLWidget::update), Qt::QueuedConnection);
+    connect(this, &OpenGLView::FrameArrived, this, &OpenGLView::OnFrameArrivedOnGuiThread, Qt::QueuedConnection);
+    // QWidget posts UpdateRequest to the top-level widget, not this GL child.
+    if (QWidget* top_level = window(); top_level != this) {
+        top_level->installEventFilter(this);
+    }
+    connect(this, &QOpenGLWidget::aboutToCompose, this, [this] {
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(frame_mutex_);
+        ++gui_diagnostics_.aboutToCompose_count;
+        gui_diagnostics_.compose_started_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
+    });
+    connect(this, &QOpenGLWidget::frameSwapped, this, [this] {
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(frame_mutex_);
+        ++gui_diagnostics_.frameSwapped_count;
+        const auto now_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
+        if (gui_diagnostics_.last_frame_swapped_ns != 0) {
+            gui_diagnostics_.frame_swapped_interval.Add(
+                static_cast<double>(now_ns - gui_diagnostics_.last_frame_swapped_ns) / 1e6);
+        }
+        if (gui_diagnostics_.compose_started_ns != 0) {
+            gui_diagnostics_.compose_duration.Add(
+                static_cast<double>(now_ns - gui_diagnostics_.compose_started_ns) / 1e6);
+            gui_diagnostics_.compose_started_ns = 0;
+        }
+        gui_diagnostics_.last_frame_swapped_ns = now_ns;
+    });
+    gui_diagnostics_interval_at_ = std::chrono::steady_clock::now();
+    gui_heartbeat_at_ = gui_diagnostics_interval_at_;
+    gui_diagnostics_timer_.setInterval(100);
+    gui_diagnostics_timer_.setTimerType(Qt::PreciseTimer);
+    gui_diagnostics_timer_.setSingleShot(false);
+    connect(&gui_diagnostics_timer_, &QTimer::timeout, this, &OpenGLView::OnGuiDiagnosticsHeartbeat);
+    gui_diagnostics_timer_.start();
 }
 
 /**
@@ -543,16 +646,16 @@ OpenGLView::OpenGLView(QWidget* parent) : QOpenGLWidget(parent) {
  * @note 不应假定析构函数执行时原 Context 一定仍可用。
  */
 OpenGLView::~OpenGLView() {
-    const double average_download_ms = renderer_download_count_ == 0
-        ? 0.0
-        : renderer_download_total_ms_ / static_cast<double>(renderer_download_count_);
-    LOG_INFO("RendererDownloadStats reason=destroyed downloads={} failures={} avg_download_ms={:.3f} "
-             "max_download_ms={:.3f}",
-             renderer_download_count_,
-             renderer_download_failures_,
-             average_download_ms,
-             renderer_download_max_ms_);
+    gui_diagnostics_timer_.stop();
+    LogGuiDiagnostics(true);
     ReleaseOpenGlResources();
+    LogRenderStatistics("destroyed", true);
+    RENDER_LOG_NO_THROW(LOG_INFO, "[VideoRender][Resources] images_created={} images_destroyed={} frame_references_released={} "
+             "resources_deferred={} pending={} pending_peak={} fence_polls={} fence_timeouts={} fence_signaled={} "
+             "fd_owner=HardwareFrame fd_close_observed=false",
+             lifetime_images_created_, lifetime_images_destroyed_, lifetime_frame_resources_released_,
+             lifetime_resources_deferred_, pending_frame_resources_.size(), lifetime_pending_peak_,
+             lifetime_fence_polls_, lifetime_fence_timeouts_, lifetime_fence_signaled_);
 }
 
 /**
@@ -573,11 +676,177 @@ void OpenGLView::OnReceiveVideoFrame(std::shared_ptr<mediacore::VideoFrame> vide
     //    move 只转移 shared_ptr，不复制视频像素；被替换的旧帧会减少一份引用。
     {
         std::lock_guard<std::mutex> lock(frame_mutex_);
+        ++mailbox_frames_received_;
+        ++gui_diagnostics_.video_dispatch_frames;
+        ++gui_diagnostics_.gui_mailbox_received_frames;
+        ++gui_diagnostics_.gui_update_requests;
+        if (current_frame_ != nullptr && mailbox_sequence_ > mailbox_claimed_sequence_) {
+            ++mailbox_superseded_before_paint_frames_;
+            ++gui_diagnostics_.gui_mailbox_overwritten_frames;
+        }
         current_frame_ = std::move(video_frame);
+        ++mailbox_sequence_;
+        gui_diagnostics_.latest_mailbox_receive_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
     }
 
     // 3. 释放互斥锁后再发送信号，避免 GUI 线程处理重绘时与信箱锁产生不必要的竞争。
     emit FrameArrived();
+}
+
+void OpenGLView::OnFrameArrivedOnGuiThread() {
+    const auto now = std::chrono::steady_clock::now();
+    const auto now_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
+    {
+        std::lock_guard<std::mutex> lock(frame_mutex_);
+        ++gui_diagnostics_.gui_update_queued;
+        if (gui_diagnostics_.latest_mailbox_receive_ns != 0 &&
+            now_ns >= gui_diagnostics_.latest_mailbox_receive_ns) {
+            gui_diagnostics_.mailbox_to_gui.Add(
+                static_cast<double>(now_ns - gui_diagnostics_.latest_mailbox_receive_ns) / 1e6);
+        }
+        if (gui_diagnostics_.update_pending) {
+            ++gui_diagnostics_.gui_update_while_pending;
+        } else {
+            gui_diagnostics_.update_pending = true;
+            gui_diagnostics_.update_pending_since_ns = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
+        }
+    }
+    update();
+}
+
+void OpenGLView::OnGuiDiagnosticsHeartbeat() {
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(now - gui_heartbeat_at_).count();
+    gui_heartbeat_at_ = now;
+    {
+        std::lock_guard<std::mutex> lock(frame_mutex_);
+        ++gui_diagnostics_.heartbeat_samples;
+        const double delay_ms = std::max(0.0, elapsed_ms - gui_diagnostics_timer_.interval());
+        gui_diagnostics_.heartbeat_delay_total_ms += delay_ms;
+        gui_diagnostics_.heartbeat_delay_max_ms = std::max(gui_diagnostics_.heartbeat_delay_max_ms, delay_ms);
+    }
+    LogGuiDiagnostics(false);
+}
+
+void OpenGLView::LogGuiDiagnostics(bool force) {
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed = std::chrono::duration<double>(now - gui_diagnostics_interval_at_).count();
+    if (!force && elapsed < 5.0) return;
+
+    GuiDiagnostics d;
+    GuiDiagnostics previous;
+    {
+        std::lock_guard<std::mutex> lock(frame_mutex_);
+        d = gui_diagnostics_;
+        d.mailbox_sequence = mailbox_sequence_;
+        previous = gui_diagnostics_last_logged_;
+        gui_diagnostics_last_logged_ = d;
+        gui_diagnostics_.mailbox_to_paint = {};
+        gui_diagnostics_.update_to_paint = {};
+        gui_diagnostics_.paintGL_interval = {};
+        gui_diagnostics_.paintGL_duration = {};
+        gui_diagnostics_.frame_swapped_interval = {};
+        gui_diagnostics_.mailbox_to_gui = {};
+        gui_diagnostics_.compose_duration = {};
+        gui_diagnostics_.heartbeat_samples = 0;
+        gui_diagnostics_.heartbeat_delay_total_ms = 0;
+        gui_diagnostics_.heartbeat_delay_max_ms = 0;
+    }
+    const auto delta = [](std::uint64_t value, std::uint64_t old) { return value - old; };
+    const QWidget* top_level = window();
+    const QWindow* native_window = top_level != nullptr ? top_level->windowHandle() : nullptr;
+    RENDER_LOG_NO_THROW(LOG_INFO,
+        "[GuiRender][Diagnostics] reason={} interval_sec={:.3f} qpa={} visible={} exposed={} active={} size={}x{} dpr={:.3f} context={} "
+        "video_dispatch_frames={} gui_mailbox_received_frames={} gui_mailbox_overwritten_frames={} "
+        "gui_update_requests={} gui_update_queued={} gui_update_while_pending={} update_later_events={} "
+        "view_update_request_events={} top_level_update_request_events={} paint_events={} paintGL_calls={} paintGL_new_frame_calls={} "
+        "paintGL_duplicate_frame_calls={} paintGL_no_frame_calls={} paintGL_unready_calls={} frameSwapped_count={} "
+        "total_mailbox_received={} total_mailbox_overwritten={} total_update_requests={} total_update_queued={} "
+        "total_paintGL_calls={} total_frameSwapped_count={} qt_update_coalesced=unavailable "
+        "mailbox_to_paint_avg_ms={:.3f} mailbox_to_paint_max_ms={:.3f} update_to_paint_avg_ms={:.3f} "
+        "update_to_paint_max_ms={:.3f} paintGL_interval_avg_ms={:.3f} paintGL_interval_max_ms={:.3f} "
+        "paintGL_duration_avg_ms={:.3f} paintGL_duration_max_ms={:.3f} frameSwapped_interval_avg_ms={:.3f} "
+        "frameSwapped_interval_max_ms={:.3f} heartbeat_delay_avg_ms={:.3f} heartbeat_delay_max_ms={:.3f} "
+        "last_painted_sequence={} mailbox_sequence={} update_pending={} last_resize_ns={} last_paint_start_ns={} "
+        "last_frame_swapped_ns={} aboutToCompose_count={} compose_duration_avg_ms={:.3f} compose_duration_max_ms={:.3f} "
+        "latest_mailbox_to_gui_avg_ms={:.3f} latest_mailbox_to_gui_max_ms={:.3f} heartbeat_interval_ms={}",
+        force ? "summary" : "interval", elapsed, QGuiApplication::platformName().toStdString(), isVisible(),
+        native_window != nullptr && native_window->isExposed(), top_level != nullptr && top_level->isActiveWindow(),
+        width(), height(), devicePixelRatioF(), static_cast<const void*>(context()),
+        delta(d.video_dispatch_frames, previous.video_dispatch_frames),
+        delta(d.gui_mailbox_received_frames, previous.gui_mailbox_received_frames),
+        delta(d.gui_mailbox_overwritten_frames, previous.gui_mailbox_overwritten_frames),
+        delta(d.gui_update_requests, previous.gui_update_requests),
+        delta(d.gui_update_queued, previous.gui_update_queued),
+        delta(d.gui_update_while_pending, previous.gui_update_while_pending),
+        delta(d.update_later_events, previous.update_later_events),
+        delta(d.update_request_events, previous.update_request_events),
+        delta(d.top_level_update_request_events, previous.top_level_update_request_events),
+        delta(d.paint_events, previous.paint_events),
+        delta(d.paintGL_calls, previous.paintGL_calls),
+        delta(d.paintGL_new_frame_calls, previous.paintGL_new_frame_calls),
+        delta(d.paintGL_duplicate_frame_calls, previous.paintGL_duplicate_frame_calls),
+        delta(d.paintGL_no_frame_calls, previous.paintGL_no_frame_calls),
+        delta(d.paintGL_unready_calls, previous.paintGL_unready_calls),
+        delta(d.frameSwapped_count, previous.frameSwapped_count),
+        d.gui_mailbox_received_frames, d.gui_mailbox_overwritten_frames, d.gui_update_requests,
+        d.gui_update_queued, d.paintGL_calls, d.frameSwapped_count,
+        d.mailbox_to_paint.AvgMs(), d.mailbox_to_paint.MaxMs(),
+        d.update_to_paint.AvgMs(), d.update_to_paint.MaxMs(), d.paintGL_interval.AvgMs(), d.paintGL_interval.MaxMs(),
+        d.paintGL_duration.AvgMs(), d.paintGL_duration.MaxMs(), d.frame_swapped_interval.AvgMs(),
+        d.frame_swapped_interval.MaxMs(), d.heartbeat_samples ? d.heartbeat_delay_total_ms / d.heartbeat_samples : 0.0,
+        d.heartbeat_delay_max_ms, d.last_painted_sequence, d.mailbox_sequence, d.update_pending,
+        d.last_resize_ns, d.last_paint_start_ns, d.last_frame_swapped_ns,
+        delta(d.aboutToCompose_count, previous.aboutToCompose_count),
+        d.compose_duration.AvgMs(), d.compose_duration.MaxMs(),
+        d.mailbox_to_gui.AvgMs(), d.mailbox_to_gui.MaxMs(), gui_diagnostics_timer_.interval());
+    const auto now_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
+    const double receive_age_ms = d.latest_mailbox_receive_ns != 0 && now_ns >= d.latest_mailbox_receive_ns
+        ? static_cast<double>(now_ns - d.latest_mailbox_receive_ns) / 1e6 : 1e9;
+    const double paint_age_ms = d.last_paint_start_ns != 0 && now_ns >= d.last_paint_start_ns
+        ? static_cast<double>(now_ns - d.last_paint_start_ns) / 1e6 : 1e9;
+    if (!force && native_window != nullptr && native_window->isExposed() && isVisible() &&
+        receive_age_ms < 500.0 && paint_age_ms > 500.0 &&
+        (gui_low_paint_last_warn_at_.time_since_epoch().count() == 0 ||
+         now - gui_low_paint_last_warn_at_ >= std::chrono::seconds(5))) {
+        gui_low_paint_last_warn_at_ = now;
+        RENDER_LOG_NO_THROW(LOG_WARN,
+            "[GuiRender][LowPaint] receive_age_ms={:.3f} paint_age_ms={:.3f} visible={} exposed={} active={} "
+            "heartbeat_delay_max_ms={:.3f} update_pending={} mailbox_sequence={} last_painted_sequence={}",
+            receive_age_ms, paint_age_ms, isVisible(), native_window->isExposed(),
+            top_level != nullptr && top_level->isActiveWindow(), d.heartbeat_delay_max_ms,
+            d.update_pending, d.mailbox_sequence, d.last_painted_sequence);
+    }
+    gui_diagnostics_interval_at_ = now;
+}
+
+void OpenGLView::RecordPaintGLFinished(std::chrono::steady_clock::time_point started_at) {
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(frame_mutex_);
+    gui_diagnostics_.paintGL_duration.Add(std::chrono::duration<double, std::milli>(now - started_at).count());
+}
+
+bool OpenGLView::event(QEvent* event) {
+    if (event != nullptr) {
+        std::lock_guard<std::mutex> lock(frame_mutex_);
+        if (event->type() == QEvent::UpdateLater) ++gui_diagnostics_.update_later_events;
+        if (event->type() == QEvent::UpdateRequest) ++gui_diagnostics_.update_request_events;
+        if (event->type() == QEvent::Paint) ++gui_diagnostics_.paint_events;
+    }
+    return QOpenGLWidget::event(event);
+}
+
+bool OpenGLView::eventFilter(QObject* watched, QEvent* event) {
+    if (watched == window() && event != nullptr && event->type() == QEvent::UpdateRequest) {
+        std::lock_guard<std::mutex> lock(frame_mutex_);
+        ++gui_diagnostics_.top_level_update_request_events;
+    }
+    return QOpenGLWidget::eventFilter(watched, event);
 }
 
 /**
@@ -590,6 +859,157 @@ void OpenGLView::SetHardwareRenderCapability(const std::shared_ptr<std::atomic<b
     hardware_render_capability_ = capability;
 }
 
+const char* OpenGLView::RenderFailureName(RenderFailure reason) {
+    constexpr std::array<const char*, static_cast<std::size_t>(RenderFailure::kCount)> names = {
+        "none", "egl_render_path_unavailable", "hardware_frame_invalid", "plane_parameters_invalid", "fd_invalid",
+        "fourcc_unsupported", "modifier_unsupported", "modifier_query_failed", "allocation_failed",
+        "egl_create_image_failed", "texture_allocation_failed", "texture_bind_failed", "texture_format_mismatch",
+        "shader_or_draw_failed", "fence_failed", "cpu_download_failed", "software_upload_failed", "resource_release_failed"};
+    return names[static_cast<std::size_t>(reason)];
+}
+
+bool OpenGLView::RecordRenderFailure(RenderFailure reason) noexcept {
+    last_render_failure_ = reason;
+    const auto index = static_cast<std::size_t>(reason);
+    const auto now = std::chrono::steady_clock::now();
+    ++render_failures_[index];
+    if (render_failures_[index] == 1 || now - render_failure_last_log_[index] >= std::chrono::seconds(5)) {
+        render_failure_last_log_[index] = now;
+        RENDER_LOG_NO_THROW(LOG_WARN, "[VideoRender][Failure] stream_id={} epoch={} reason={} count={} egl_display={} egl_context={}",
+                 render_stream_id_, render_epoch_, RenderFailureName(reason), render_failures_[index], eglGetCurrentDisplay(),
+                 eglGetCurrentContext());
+        return true;
+    }
+    return false;
+}
+
+void OpenGLView::AddRenderCount(std::uint64_t RenderCounters::* counter, std::uint64_t amount) {
+    render_total_.*counter += amount;
+    render_interval_.*counter += amount;
+}
+
+void OpenGLView::AddRenderTiming(RenderTiming RenderCounters::* metric, double elapsed_ms) {
+    (render_total_.*metric).Add(elapsed_ms);
+    (render_interval_.*metric).Add(elapsed_ms);
+}
+
+void OpenGLView::BeginRenderStatistics(const mediacore::VideoFrame& frame) {
+    if (render_statistics_active_ && frame.diagnostic_stream_id_ == render_stream_id_ && frame.epoch_ == render_epoch_) {
+        return;
+    }
+    if (render_statistics_active_) {
+        LogRenderStatistics(frame.diagnostic_stream_id_ != render_stream_id_ ? "stream_change" : "epoch_change", true);
+    }
+    render_statistics_active_ = true;
+    render_stream_id_ = frame.diagnostic_stream_id_;
+    render_epoch_ = frame.epoch_;
+    ++render_window_;
+    render_width_ = frame.width_;
+    render_height_ = frame.height_;
+    render_total_ = {};
+    render_interval_ = {};
+    render_failures_ = {};
+    render_failure_last_log_ = {};
+    last_layout_signature_ = 0;
+    import_success_logged_mask_ = 0;
+    last_submitted_sequence_ = 0;
+    render_started_at_ = render_interval_at_ = std::chrono::steady_clock::now();
+    last_draw_at_ = render_started_at_;
+    RENDER_LOG_NO_THROW(LOG_INFO, "[VideoRender][Epoch] stream_id={} epoch={} window={} first_pts_us={} resolution={}x{}",
+             render_stream_id_, render_epoch_, render_window_, frame.pts_us_.value_or(-1), render_width_, render_height_);
+}
+
+void OpenGLView::RecordDrawSubmitted(bool hardware, std::uint64_t sequence) noexcept {
+    AddRenderCount(&RenderCounters::gl_draw_submitted_frames);
+    if (sequence != last_submitted_sequence_) {
+        AddRenderCount(&RenderCounters::unique_draw_submitted_frames);
+        last_submitted_sequence_ = sequence;
+    }
+    last_draw_at_ = std::chrono::steady_clock::now();
+    if (hardware) {
+        AddRenderCount(&RenderCounters::vaapi_dmabuf_render_frames);
+        if (render_total_.vaapi_dmabuf_render_frames == 1) {
+            RENDER_LOG_NO_THROW(LOG_INFO, "[VideoRender][FirstDmaBufDraw] stream_id={} epoch={} gl_draw_submitted=true "
+                     "application_cpu_pixel_copy=false shader_pixels=not_verified display_scanout=not_observable",
+                     render_stream_id_, render_epoch_);
+        }
+    }
+}
+
+void OpenGLView::LogRenderStatistics(const char* reason, bool summary) {
+    if (!render_statistics_active_) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const auto start = summary ? render_started_at_ : render_interval_at_;
+    const double seconds = std::chrono::duration<double>(now - start).count();
+    if (!summary && seconds < 5.0) {
+        return;
+    }
+    std::uint64_t mailbox_sequence = 0;
+    std::uint64_t mailbox_received = 0;
+    std::uint64_t mailbox_superseded = 0;
+    std::uint64_t mailbox_claimed = 0;
+    {
+        std::lock_guard<std::mutex> lock(frame_mutex_);
+        mailbox_sequence = mailbox_sequence_;
+        mailbox_received = mailbox_frames_received_;
+        mailbox_superseded = mailbox_superseded_before_paint_frames_;
+        mailbox_claimed = mailbox_claimed_sequence_;
+    }
+    const QWidget* top_level = window();
+    const QWindow* native_window = top_level != nullptr ? top_level->windowHandle() : nullptr;
+    const auto& s = summary ? render_total_ : render_interval_;
+    const auto steady_ns = [](const auto point) {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(point.time_since_epoch()).count();
+    };
+    RENDER_LOG_NO_THROW(LOG_INFO, "[VideoRender][{}] reason={} stream_id={} epoch={} window={} resolution={}x{} "
+             "start_steady_ns={} end_steady_ns={} elapsed_sec={:.6f} last_draw_steady_ns={} "
+             "egl_image_create_attempts={} egl_image_create_success={} egl_image_create_failed={} "
+             "gl_egl_image_bind_success={} gl_egl_image_bind_failed={} vaapi_dmabuf_render_frames={} "
+             "vaapi_cpu_download_frames={} cpu_download_failed={} cpu_download_bytes={} "
+             "software_texture_upload_frames={} software_upload_failed={} fallback_frames={} "
+             "gl_draw_submitted_frames={} unique_draw_submitted_frames={} gl_draw_failed={} "
+             "unique_draw_fps={:.3f} displayed_frames=not_observable timing_scope=cpu_api_wall_not_gpu_execution "
+             "isVisible={} isExposed={} isActiveWindow={} mailbox_sequence={} painting_sequence={} "
+             "mailbox_scope=view_lifetime mailbox_frames_received={} mailbox_superseded_before_paint_frames={} "
+             "mailbox_claimed_sequence={}",
+             summary ? "Summary" : "Interval", reason, render_stream_id_, render_epoch_, render_window_, render_width_, render_height_,
+             steady_ns(start), steady_ns(now), seconds, steady_ns(last_draw_at_),
+             s.egl_image_create_attempts, s.egl_image_create_success, s.egl_image_create_failed,
+             s.gl_egl_image_bind_success, s.gl_egl_image_bind_failed, s.vaapi_dmabuf_render_frames,
+             s.vaapi_cpu_download_frames, s.cpu_download_failed, s.cpu_download_bytes,
+             s.software_texture_upload_frames, s.software_upload_failed, s.fallback_frames,
+             s.gl_draw_submitted_frames, s.unique_draw_submitted_frames, s.gl_draw_failed,
+             seconds > 0 ? s.unique_draw_submitted_frames / seconds : 0.0,
+             isVisible(), native_window != nullptr && native_window->isExposed(),
+             top_level != nullptr && top_level->isActiveWindow(), mailbox_sequence, painting_sequence_,
+             mailbox_received, mailbox_superseded, mailbox_claimed);
+    const auto log_timing = [&](const char* name, const RenderTiming& timing) {
+        RENDER_LOG_NO_THROW(LOG_INFO, "[VideoRender][Timing] scope={} reason={} stream_id={} epoch={} window={} start_steady_ns={} end_steady_ns={} "
+                 "operation={} calls={} total_ms={:.6f} avg_ms={:.6f} max_ms={:.6f}",
+                 summary ? "summary" : "interval", reason, render_stream_id_, render_epoch_, render_window_, steady_ns(start), steady_ns(now),
+                 name, timing.calls, timing.total_ms, timing.calls ? timing.total_ms / timing.calls : 0.0, timing.max_ms);
+    };
+    log_timing("software_texture_upload", s.upload);
+    log_timing("dmabuf_import_and_draw", s.dmabuf_render);
+    log_timing("cpu_download", s.download);
+    log_timing("draw_submission", s.draw);
+    log_timing("existing_fence_wait", s.fence_wait);
+    if (summary) {
+        for (std::size_t index = 1; index < render_failures_.size(); ++index) {
+            if (render_failures_[index] != 0) {
+                RENDER_LOG_NO_THROW(LOG_INFO, "[VideoRender][FailureSummary] stream_id={} epoch={} window={} reason={} occurrences={}",
+                         render_stream_id_, render_epoch_, render_window_, RenderFailureName(static_cast<RenderFailure>(index)),
+                         render_failures_[index]);
+            }
+        }
+    } else {
+        render_interval_ = {};
+        render_interval_at_ = now;
+    }
+}
+
 /**
  * @brief 初始化 QOpenGLWidget 使用的 OpenGL / EGL 渲染环境。
  * @note Qt 调用本函数时，控件对应的 OpenGL Context 已经是 current。
@@ -600,6 +1020,49 @@ void OpenGLView::initializeGL() {
 
     // 1. 初始化 Qt 提供的 OpenGL 3.3 Core 函数入口。
     initializeOpenGLFunctions();
+
+    QOpenGLContext* current_context = QOpenGLContext::currentContext();
+    if (current_context != nullptr && current_context == context()) {
+        const auto format = current_context->format();
+        const auto gl_string = [this](GLenum name) {
+            const auto* value = glGetString(name);
+            return value != nullptr ? reinterpret_cast<const char*>(value) : "<unavailable>";
+        };
+        LOG_INFO("OpenGL current context: valid={}, vendor={}, renderer={}, version={}",
+                 current_context->isValid(), gl_string(GL_VENDOR), gl_string(GL_RENDERER), gl_string(GL_VERSION));
+        LOG_INFO("OpenGL context format: {}.{}, profile={}, renderable_type={}, options=0x{:x}, "
+                 "depth={}, stencil={}, samples={}, swap_behavior={}, swap_interval={}, isOpenGLES={}",
+                 format.majorVersion(), format.minorVersion(), static_cast<int>(format.profile()),
+                 static_cast<int>(format.renderableType()), static_cast<unsigned int>(format.options().toInt()),
+                 format.depthBufferSize(), format.stencilBufferSize(), format.samples(),
+                 static_cast<int>(format.swapBehavior()), format.swapInterval(), current_context->isOpenGLES());
+#if QT_CONFIG(egl)
+        auto* native_egl = current_context->nativeInterface<QNativeInterface::QEGLContext>();
+        LOG_INFO("Qt native EGL: QT_CONFIG(egl)=true, interface={}, display={}, context={}",
+                 static_cast<void*>(native_egl),
+                 native_egl != nullptr ? native_egl->display() : EGL_NO_DISPLAY,
+                 native_egl != nullptr ? native_egl->nativeContext() : EGL_NO_CONTEXT);
+#else
+        LOG_INFO("Qt native EGL: QT_CONFIG(egl)=false, QEGLContext declaration unavailable");
+#endif
+#if QT_CONFIG(xcb_glx_plugin)
+        auto* native_glx = current_context->nativeInterface<QNativeInterface::QGLXContext>();
+        LOG_INFO("Qt native GLX: interface={}, context={}",
+                 static_cast<void*>(native_glx),
+                 native_glx != nullptr ? static_cast<void*>(native_glx->nativeContext()) : nullptr);
+#else
+        LOG_INFO("Qt native GLX: QGLXContext declaration unavailable");
+#endif
+        // Resolve the diagnostic GLX entry point without adding Xlib headers or changing the GL backend.
+        using GetGlxCurrentContext = void* (*)();
+        const auto get_glx_context = reinterpret_cast<GetGlxCurrentContext>(
+            QLibrary::resolve(QStringLiteral("GLX"), 0, "glXGetCurrentContext"));
+        LOG_INFO("Native current handles: EGL display={}, EGL context={}, GLX query_available={}, GLX context={}",
+                 eglGetCurrentDisplay(), eglGetCurrentContext(), get_glx_context != nullptr,
+                 get_glx_context != nullptr ? get_glx_context() : nullptr);
+    } else {
+        LOG_WARN("OpenGL context diagnostics skipped: this widget's context is not current");
+    }
 
     // 2. 设置清屏颜色（RGBA）。
     glClearColor(0.1f, 0.1f, 0.15f, 1.0f);
@@ -733,6 +1196,12 @@ bool OpenGLView::CreateRetirementContext(QOpenGLContext* share_context) {
 void OpenGLView::resizeGL(int width, int height) {
     // 将 OpenGL 视口设置为控件当前的物理像素尺寸。
     glViewport(0, 0, width, height);
+    {
+        std::lock_guard<std::mutex> lock(frame_mutex_);
+        gui_diagnostics_.last_resize_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
     LOG_INFO("OpenGL viewport resized to {}x{}", width, height);
 }
 
@@ -742,6 +1211,25 @@ void OpenGLView::resizeGL(int width, int height) {
  * @note 硬件和软件路径使用不同的 Shader，必须分别检查各自的就绪状态
  */
 void OpenGLView::paintGL() {
+    const auto paint_started = std::chrono::steady_clock::now();
+    PaintScope paint_scope{this, paint_started};
+    {
+        std::lock_guard<std::mutex> lock(frame_mutex_);
+        ++gui_diagnostics_.paintGL_calls;
+        const auto start_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(paint_started.time_since_epoch()).count());
+        if (gui_diagnostics_.last_paint_start_ns != 0) {
+            gui_diagnostics_.paintGL_interval.Add(
+                static_cast<double>(start_ns - gui_diagnostics_.last_paint_start_ns) / 1e6);
+        }
+        if (gui_diagnostics_.update_pending && gui_diagnostics_.update_pending_since_ns != 0) {
+            gui_diagnostics_.update_to_paint.Add(
+                static_cast<double>(start_ns - gui_diagnostics_.update_pending_since_ns) / 1e6);
+        }
+        gui_diagnostics_.update_pending = false;
+        gui_diagnostics_.update_pending_since_ns = 0;
+        gui_diagnostics_.last_paint_start_ns = start_ns;
+    }
     // 0. 清除当前 QOpenGLWidget 的绘制目标
     glClear(GL_COLOR_BUFFER_BIT);
 
@@ -756,22 +1244,48 @@ void OpenGLView::paintGL() {
         egl_import_.is_available_ && hardware_shader_ready_ && hardware_shader_program_ != nullptr &&
         !hardware_retirement_suspended_ && GetDeferredGlResourceReaper().CanRenderHardware();
     if (!software_path_ready && !hardware_path_ready) {
+        std::lock_guard<std::mutex> lock(frame_mutex_);
+        ++gui_diagnostics_.paintGL_unready_calls;
         LOG_TRACE("Paint skipped because neither hardware nor software shader path is ready");
         return;
     }
 
     // 2. 从帧信箱中复制一份 shared_ptr，锁外继续处理时保证 VideoFrame 仍然存活
     std::shared_ptr<mediacore::VideoFrame> frame;
+    std::uint64_t claimed_sequence = 0;
+    std::uint64_t claimed_receive_ns = 0;
     {
         std::lock_guard<std::mutex> lock(frame_mutex_);
         frame = current_frame_;
+        painting_sequence_ = mailbox_sequence_;
+        claimed_sequence = mailbox_sequence_;
+        claimed_receive_ns = gui_diagnostics_.latest_mailbox_receive_ns;
+        mailbox_claimed_sequence_ = mailbox_sequence_;
     }
 
     // 校验帧数据有效性（过滤 Flush / 空帧控制信令）
     if (frame == nullptr || !frame->IsValid()) {
+        std::lock_guard<std::mutex> lock(frame_mutex_);
+        ++gui_diagnostics_.paintGL_no_frame_calls;
         LOG_TRACE("Paint skipped because no valid frame is available");
         return;
     }
+    {
+        const auto paint_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(paint_started.time_since_epoch()).count());
+        std::lock_guard<std::mutex> lock(frame_mutex_);
+        if (claimed_sequence != gui_diagnostics_.last_painted_sequence) {
+            ++gui_diagnostics_.paintGL_new_frame_calls;
+            gui_diagnostics_.last_painted_sequence = claimed_sequence;
+        } else {
+            ++gui_diagnostics_.paintGL_duplicate_frame_calls;
+        }
+        if (claimed_receive_ns != 0 && claimed_receive_ns <= paint_ns) {
+            gui_diagnostics_.mailbox_to_paint.Add(static_cast<double>(paint_ns - claimed_receive_ns) / 1e6);
+        }
+    }
+    BeginRenderStatistics(*frame);
+    LogRenderStatistics("periodic", false);
 
     // 3. 根据帧的色彩空间选择 YUV → RGB 转换矩阵。
     //    元数据未指定时，暂按分辨率推断：≥720p 使用 BT.709，否则使用 BT.601
@@ -802,16 +1316,37 @@ void OpenGLView::paintGL() {
     std::optional<mediacore::VideoFrame> downloaded_frame;
     const mediacore::VideoFrame* frame_to_render = frame.get();
     if (frame->hardware_ != nullptr) {
-        if (hardware_path_ready && RenderHardwareFrameWithEglImages(frame, *matrix)) {
+        last_render_failure_ = RenderFailure::kNone;
+        bool rendered = false;
+        if (hardware_path_ready) {
+            const auto started = std::chrono::steady_clock::now();
+            rendered = RenderHardwareFrameWithEglImages(frame, *matrix);
+            AddRenderTiming(&RenderCounters::dmabuf_render,
+                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+        } else {
+            RecordRenderFailure(RenderFailure::kPathUnavailable);
+        }
+        if (rendered) {
             return;
         }
 
         // 没有可用的软件 Shader 时，无法执行下载后的软件渲染回退。
         if (!software_path_ready) {
-            LOG_WARN("Hardware rendering failed and software fallback is unavailable");
+            if (RecordRenderFailure(RenderFailure::kPathUnavailable)) {
+                LOG_WARN("Hardware rendering failed and software fallback is unavailable");
+            }
             return;
         }
 
+        AddRenderCount(&RenderCounters::fallback_frames);
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_hardware_frame_failure_log_ >= std::chrono::seconds(5)) {
+            last_hardware_frame_failure_log_ = now;
+            RENDER_LOG_NO_THROW(LOG_WARN, "[VideoRender][Fallback] stream_id={} epoch={} from=VAAPI_DMA_BUF to=CPU_UPLOAD reason={} "
+                     "fallback_frames={} egl_display={} egl_context={}",
+                     render_stream_id_, render_epoch_, RenderFailureName(last_render_failure_), render_total_.fallback_frames,
+                     eglGetCurrentDisplay(), eglGetCurrentContext());
+        }
         downloaded_frame.emplace();
         if (!DownloadHardwareFrameToSoftwareFrame(*frame, *downloaded_frame)) {
             const auto now = std::chrono::steady_clock::now();
@@ -840,7 +1375,22 @@ void OpenGLView::paintGL() {
               static_cast<int>(frame_to_render->color_space_),
               static_cast<int>(frame_to_render->color_range_),
               is_full_range ? "full-range" : "limited-range");
+    // Clear only the diagnostic error state, never change the upload/draw decisions.
+    while (glGetError() != GL_NO_ERROR) {}
+    const auto upload_started = std::chrono::steady_clock::now();
     UploadSoftwareFrameTextures(*frame_to_render);
+    AddRenderTiming(&RenderCounters::upload,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - upload_started).count());
+    const GLenum upload_error = glGetError();
+    if (upload_error == GL_NO_ERROR) {
+        AddRenderCount(&RenderCounters::software_texture_upload_frames);
+    } else {
+        AddRenderCount(&RenderCounters::software_upload_failed);
+        if (RecordRenderFailure(RenderFailure::kSoftwareUpload)) {
+            RENDER_LOG_NO_THROW(LOG_ERROR, "[VideoRender][GL] api=glTexImage2D/glTexSubImage2D epoch={} error=0x{:x} textures={},{},{}",
+                      render_epoch_, upload_error, texture_ids_[0], texture_ids_[1], texture_ids_[2]);
+        }
+    }
 
     // 6. 绑定软件 Shader，并传入本帧使用的 YUV → RGB 转换矩阵与色彩范围参数
     //    软件帧一律是 8-bit YUV420P（硬件帧下载回退时也已转换成 YUV420P），所以位深固定为 8
@@ -862,7 +1412,19 @@ void OpenGLView::paintGL() {
 
     // 8. 绑定全屏四边形几何数据，执行绘制命令
     vao_.bind();
+    const auto draw_started = std::chrono::steady_clock::now();
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, nullptr);
+    AddRenderTiming(&RenderCounters::draw,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - draw_started).count());
+    const GLenum draw_error = glGetError();
+    if (draw_error == GL_NO_ERROR) {
+        RecordDrawSubmitted(false, painting_sequence_);
+    } else {
+        AddRenderCount(&RenderCounters::gl_draw_failed);
+        if (RecordRenderFailure(RenderFailure::kShaderDraw)) {
+            RENDER_LOG_NO_THROW(LOG_ERROR, "[VideoRender][GL] api=glDrawElements path=software epoch={} error=0x{:x}", render_epoch_, draw_error);
+        }
+    }
 
     // 9. 解绑 VAO 和 Shader，避免影响后续 Qt 或其他 OpenGL 绘制操作
     vao_.release();
@@ -1069,6 +1631,7 @@ void OpenGLView::UploadSoftwareFrameTextures(const mediacore::VideoFrame& frame)
 bool OpenGLView::InitializeEglDmaBufImport() {
     // 1. 清空旧的 Display、函数入口、格式列表和查询缓存，避免沿用上次 Context 的能力状态。
     egl_import_ = {};
+    import_rejection_count_ = 0;
 
     // 2. 获取当前线程正在使用的 Qt OpenGL Context。
     QOpenGLContext* current_context = QOpenGLContext::currentContext();
@@ -1089,19 +1652,34 @@ bool OpenGLView::InitializeEglDmaBufImport() {
         return false;
     }
     egl_import_.display_ = native_egl_context->display();
+    LOG_INFO("EGL import context matched: display={}, context={}",
+             egl_import_.display_, native_egl_context->nativeContext());
 #else
     LOG_WARN("This Qt build has no EGL native context interface");
     return false;
 #endif
 
     // 4. 确认 EGLDisplay 已初始化，能够查询 EGL 版本。
-    if (eglQueryString(egl_import_.display_, EGL_VERSION) == nullptr) {
-        LOG_WARN("Qt returned an EGLDisplay that is not initialized");
+    const char* egl_version = eglQueryString(egl_import_.display_, EGL_VERSION);
+    if (egl_version == nullptr) {
+        LOG_WARN("Qt returned an EGLDisplay that is not initialized: display={}, error=0x{:x}",
+                 egl_import_.display_, eglGetError());
         egl_import_ = {};
         return false;
     }
+    const char* egl_vendor = eglQueryString(egl_import_.display_, EGL_VENDOR);
+    LOG_INFO("EGL display initialized: display={}, vendor={}, version={}",
+             egl_import_.display_, egl_vendor != nullptr ? egl_vendor : "<unavailable>", egl_version);
     // 5. 检查 DMA-BUF 导入和 Modifier 查询两个必需扩展是否都由当前 EGLDisplay 声明支持。
     const char* display_extensions = eglQueryString(egl_import_.display_, EGL_EXTENSIONS);
+    LOG_INFO("EGL display extensions: EGL_EXT_image_dma_buf_import={}, "
+             "EGL_EXT_image_dma_buf_import_modifiers={}, EGL_KHR_image_base={}, "
+             "EGL_KHR_gl_texture_2D_image={}; GL_OES_EGL_image={}",
+             HasEglExtension(display_extensions, "EGL_EXT_image_dma_buf_import"),
+             HasEglExtension(display_extensions, "EGL_EXT_image_dma_buf_import_modifiers"),
+             HasEglExtension(display_extensions, "EGL_KHR_image_base"),
+             HasEglExtension(display_extensions, "EGL_KHR_gl_texture_2D_image"),
+             current_context->hasExtension("GL_OES_EGL_image"));
     if (!HasEglExtension(display_extensions, "EGL_EXT_image_dma_buf_import") ||
         !HasEglExtension(display_extensions, "EGL_EXT_image_dma_buf_import_modifiers")) {
         LOG_INFO("EGL DMA-BUF import and modifier extensions are both required");
@@ -1130,8 +1708,10 @@ bool OpenGLView::InitializeEglDmaBufImport() {
 
     // 8. 先只查询可导入 DRM FourCC 的数量，为后续分配数组做准备。
     EGLint format_count = 0;
-    if (egl_import_.query_formats_(egl_import_.display_, 0, nullptr, &format_count) != EGL_TRUE || format_count <= 0) {
-        LOG_WARN("eglQueryDmaBufFormatsEXT returned no importable formats");
+    const EGLBoolean format_count_result = egl_import_.query_formats_(egl_import_.display_, 0, nullptr, &format_count);
+    LOG_INFO("eglQueryDmaBufFormatsEXT count: result={}, count={}", format_count_result, format_count);
+    if (format_count_result != EGL_TRUE || format_count <= 0) {
+        LOG_WARN("eglQueryDmaBufFormatsEXT returned no importable formats: error=0x{:x}", eglGetError());
         egl_import_ = {};
         return false;
     }
@@ -1143,15 +1723,18 @@ bool OpenGLView::InitializeEglDmaBufImport() {
         return false;
     }
     // 10. 读取驱动实际支持的 FourCC 列表，并校验驱动返回的数量没有超出分配容量。
-    if (egl_import_.query_formats_(
-            egl_import_.display_, format_count, egl_import_.importable_formats_.data(), &format_count) != EGL_TRUE ||
+    const EGLBoolean format_list_result = egl_import_.query_formats_(
+        egl_import_.display_, format_count, egl_import_.importable_formats_.data(), &format_count);
+    LOG_INFO("eglQueryDmaBufFormatsEXT list: result={}, count={}", format_list_result, format_count);
+    if (format_list_result != EGL_TRUE ||
         format_count < 0 || static_cast<std::size_t>(format_count) > egl_import_.importable_formats_.size()) {
-        LOG_WARN("eglQueryDmaBufFormatsEXT failed while reading supported formats");
+        LOG_WARN("eglQueryDmaBufFormatsEXT failed while reading supported formats: error=0x{:x}", eglGetError());
         egl_import_ = {};
         return false;
     }
     // 11. 按实际返回数量收缩列表，并标记 EGL DMA-BUF 导入基础能力初始化完成。
     egl_import_.importable_formats_.resize(static_cast<std::size_t>(format_count));
+    LogEglDmaBufFormats(egl_import_.display_, egl_import_.query_modifiers_, egl_import_.importable_formats_);
     egl_import_.is_available_ = true;
     LOG_INFO("Qt EGL context and EGL DMA-BUF modifier import functions are available");
     return true;
@@ -1167,8 +1750,23 @@ bool OpenGLView::InitializeEglDmaBufImport() {
 bool OpenGLView::QueryDmaBufPlaneImportSupport(std::uint32_t drm_format, std::uint64_t drm_modifier) {
     // 1. 先查询缓存，避免重复向 EGL 驱动请求相同格式和 Modifier 的支持情况。
     const auto cache_key = std::make_pair(drm_format, drm_modifier);
+    const auto remember_rejection = [this, &cache_key](RenderFailure reason) {
+        last_render_failure_ = reason;
+        if (import_rejection_count_ < import_rejections_.size()) {
+            import_rejections_[import_rejection_count_++] = {cache_key, reason};
+        }
+    };
     const auto cached_result = egl_import_.format_modifier_support_.find(cache_key);
     if (cached_result != egl_import_.format_modifier_support_.end()) {
+        if (!cached_result->second) {
+            last_render_failure_ = RenderFailure::kModifierUnsupported;
+            for (std::size_t index = 0; index < import_rejection_count_; ++index) {
+                if (import_rejections_[index].key == cache_key) {
+                    last_render_failure_ = import_rejections_[index].reason;
+                    break;
+                }
+            }
+        }
         return cached_result->second;
     }
 
@@ -1178,6 +1776,9 @@ bool OpenGLView::QueryDmaBufPlaneImportSupport(std::uint32_t drm_format, std::ui
         std::find(egl_import_.importable_formats_.begin(), egl_import_.importable_formats_.end(), egl_drm_format) !=
         egl_import_.importable_formats_.end();
     if (!format_is_importable) {
+        remember_rejection(RenderFailure::kFormatUnsupported);
+        RENDER_LOG_NO_THROW(LOG_WARN, "[VideoRender][FormatSupport] fourcc=0x{:08x} modifier=0x{:016x} "
+                 "supported=false reason=fourcc_unsupported display={}", drm_format, drm_modifier, egl_import_.display_);
         egl_import_.format_modifier_support_.emplace(cache_key, false);
         return false;
     }
@@ -1187,6 +1788,11 @@ bool OpenGLView::QueryDmaBufPlaneImportSupport(std::uint32_t drm_format, std::ui
     if (egl_import_.query_modifiers_(egl_import_.display_, egl_drm_format, 0, nullptr, nullptr, &modifier_count) !=
             EGL_TRUE ||
         modifier_count < 0) {
+        const EGLint error = eglGetError();
+        remember_rejection(RenderFailure::kModifierQuery);
+        RENDER_LOG_NO_THROW(LOG_ERROR, "[VideoRender][EGL] api=eglQueryDmaBufModifiersEXT stage=count error=0x{:x} "
+                  "display={} context={} fourcc=0x{:08x} modifier=0x{:016x}",
+                  error, egl_import_.display_, eglGetCurrentContext(), drm_format, drm_modifier);
         egl_import_.format_modifier_support_.emplace(cache_key, false);
         return false;
     }
@@ -1199,6 +1805,7 @@ bool OpenGLView::QueryDmaBufPlaneImportSupport(std::uint32_t drm_format, std::ui
         supported_modifiers.resize(static_cast<std::size_t>(modifier_count));
         external_only.resize(static_cast<std::size_t>(modifier_count));
     } catch (const std::bad_alloc&) {
+        remember_rejection(RenderFailure::kAllocation);
         egl_import_.format_modifier_support_.emplace(cache_key, false);
         return false;
     }
@@ -1210,6 +1817,11 @@ bool OpenGLView::QueryDmaBufPlaneImportSupport(std::uint32_t drm_format, std::ui
                                      external_only.data(),
                                      &modifier_count) != EGL_TRUE ||
         modifier_count < 0 || static_cast<std::size_t>(modifier_count) > supported_modifiers.size()) {
+        const EGLint error = eglGetError();
+        remember_rejection(RenderFailure::kModifierQuery);
+        RENDER_LOG_NO_THROW(LOG_ERROR, "[VideoRender][EGL] api=eglQueryDmaBufModifiersEXT stage=list error=0x{:x} "
+                  "display={} context={} fourcc=0x{:08x} modifier=0x{:016x}",
+                  error, egl_import_.display_, eglGetCurrentContext(), drm_format, drm_modifier);
         egl_import_.format_modifier_support_.emplace(cache_key, false);
         return false;
     }
@@ -1225,6 +1837,12 @@ bool OpenGLView::QueryDmaBufPlaneImportSupport(std::uint32_t drm_format, std::ui
         }
     }
     // 7. 缓存查询结果，供后续帧直接使用。
+    RENDER_LOG_NO_THROW(LOG_INFO, "[VideoRender][FormatSupport] fourcc=0x{:08x} modifier=0x{:016x} "
+             "texture_2d_supported={} queried_modifiers={} display={}",
+             drm_format, drm_modifier, is_supported, modifier_count, egl_import_.display_);
+    if (!is_supported) {
+        remember_rejection(RenderFailure::kModifierUnsupported);
+    }
     egl_import_.format_modifier_support_.emplace(cache_key, is_supported);
     return is_supported;
 }
@@ -1283,17 +1901,45 @@ bool OpenGLView::RenderHardwareFrameWithEglImages(const std::shared_ptr<mediacor
     // 1. 检查输入帧、硬件帧载体以及 EGL DMA-BUF 导入能力是否有效。
     if (video_frame == nullptr || video_frame->hardware_ == nullptr || !egl_import_.is_available_ ||
         egl_import_.display_ == EGL_NO_DISPLAY) {
+        RecordRenderFailure(RenderFailure::kPathUnavailable);
         return false;
     }
 
     // 2. 取得 HardwareFrame，并确认格式仅为当前 Shader 支持的 NV12 或 P010。
     const mediacore::HardwareFrame& hardware_frame = *video_frame->hardware_;
+    // Stable layout identity deliberately excludes FD and Surface IDs, which change per frame.
+    std::uint64_t signature = 1469598103934665603ULL;
+    const auto mix = [&](std::uint64_t value) { signature = (signature ^ value) * 1099511628211ULL; };
+    mix(hardware_frame.layer_format_); mix(hardware_frame.width_); mix(hardware_frame.height_);
+    mix(video_frame->width_); mix(video_frame->height_);
+    for (const auto& object : hardware_frame.dma_buf_objects_) { mix(object.size_bytes_); mix(object.format_modifier_); }
+    for (const auto& plane : hardware_frame.planes_) {
+        mix(plane.drm_format_); mix(plane.dma_buf_index_); mix(plane.offset_bytes_); mix(plane.pitch_bytes_);
+    }
+    const bool log_layout = signature != last_layout_signature_;
+    if (log_layout) {
+        last_layout_signature_ = signature;
+        RENDER_LOG_NO_THROW(LOG_INFO, "[VideoRender][Layout] stream_id={} epoch={} fourcc=0x{:08x} storage={}x{} visible={}x{} objects={} planes={}",
+                 render_stream_id_, render_epoch_, hardware_frame.layer_format_, hardware_frame.width_, hardware_frame.height_,
+                 video_frame->width_, video_frame->height_, hardware_frame.dma_buf_objects_.size(), hardware_frame.planes_.size());
+        for (std::size_t index = 0; index < hardware_frame.dma_buf_objects_.size(); ++index) {
+            const auto& object = hardware_frame.dma_buf_objects_[index];
+            RENDER_LOG_NO_THROW(LOG_INFO, "[VideoRender][Object] epoch={} object={} fd={} fd_valid={} size={} modifier=0x{:016x}",
+                     render_epoch_, index, object.fd_, object.fd_ >= 0, object.size_bytes_, object.format_modifier_);
+        }
+        for (std::size_t index = 0; index < hardware_frame.planes_.size(); ++index) {
+            const auto& plane = hardware_frame.planes_[index];
+            RENDER_LOG_NO_THROW(LOG_INFO, "[VideoRender][Plane] epoch={} plane={} fourcc=0x{:08x} object_index={} offset={} pitch={}",
+                     render_epoch_, index, plane.drm_format_, plane.dma_buf_index_, plane.offset_bytes_, plane.pitch_bytes_);
+        }
+    }
     const bool is_p010 = hardware_frame.layer_format_ == mediacore::kDrmFormatP010;
     if ((!is_p010 && hardware_frame.layer_format_ != mediacore::kDrmFormatNv12) || video_frame->width_ <= 0 ||
         video_frame->height_ <= 0 || hardware_frame.width_ <= 0 || hardware_frame.height_ <= 0 ||
         video_frame->width_ > hardware_frame.width_ || video_frame->height_ > hardware_frame.height_ ||
         hardware_frame.av_frame_ref_ == nullptr || hardware_frame.planes_.size() != 2 ||
         !hardware_frame.ValidateDmaBufLayout()) {
+        RecordRenderFailure(RenderFailure::kInvalidFrame);
         return false;
     }
 
@@ -1332,6 +1978,13 @@ bool OpenGLView::RenderHardwareFrameWithEglImages(const std::shared_ptr<mediacor
             plane_storage_heights[plane_index] > static_cast<std::uint32_t>(std::numeric_limits<EGLint>::max()) ||
             dma_buf_plane.offset_bytes_ > static_cast<std::uint32_t>(std::numeric_limits<EGLint>::max()) ||
             dma_buf_plane.pitch_bytes_ > static_cast<std::uint32_t>(std::numeric_limits<EGLint>::max())) {
+            if (RecordRenderFailure(RenderFailure::kInvalidPlane)) {
+                RENDER_LOG_NO_THROW(LOG_ERROR, "[VideoRender][PlaneInvalid] epoch={} plane={} fourcc=0x{:08x} object_index={} "
+                          "offset={} pitch={} storage={}x{}",
+                          render_epoch_, plane_index, dma_buf_plane.drm_format_, dma_buf_plane.dma_buf_index_,
+                          dma_buf_plane.offset_bytes_, dma_buf_plane.pitch_bytes_,
+                          plane_storage_widths[plane_index], plane_storage_heights[plane_index]);
+            }
             return false;
         }
 
@@ -1342,12 +1995,18 @@ bool OpenGLView::RenderHardwareFrameWithEglImages(const std::shared_ptr<mediacor
             plane_import_is_supported =
                 QueryDmaBufPlaneImportSupport(dma_buf_plane.drm_format_, dma_buf_object.format_modifier_);
         } catch (const std::bad_alloc&) {
+            RecordRenderFailure(RenderFailure::kAllocation);
             return false;
         }
         if (dma_buf_object.fd_ < 0 || !plane_import_is_supported) {
-            LOG_INFO("EGL does not advertise DRM format 0x{:x} with modifier 0x{:x}",
-                     dma_buf_plane.drm_format_,
-                     dma_buf_object.format_modifier_);
+            const RenderFailure reason = dma_buf_object.fd_ < 0 ? RenderFailure::kInvalidFd :
+                (last_render_failure_ == RenderFailure::kNone ? RenderFailure::kModifierUnsupported : last_render_failure_);
+            if (RecordRenderFailure(reason)) {
+                RENDER_LOG_NO_THROW(LOG_ERROR, "[VideoRender][PlaneUnsupported] epoch={} plane={} reason={} fd={} fourcc=0x{:08x} "
+                          "modifier=0x{:016x} offset={} pitch={} display={}",
+                          render_epoch_, plane_index, RenderFailureName(reason), dma_buf_object.fd_, dma_buf_plane.drm_format_,
+                          dma_buf_object.format_modifier_, dma_buf_plane.offset_bytes_, dma_buf_plane.pitch_bytes_, egl_import_.display_);
+            }
             return false;
         }
         texture_width[plane_index] = static_cast<GLsizei>(plane_storage_widths[plane_index]);
@@ -1360,6 +2019,7 @@ bool OpenGLView::RenderHardwareFrameWithEglImages(const std::shared_ptr<mediacor
     try {
         pending_resources = std::make_unique<PendingFrameResources>();
     } catch (const std::bad_alloc&) {
+        RecordRenderFailure(RenderFailure::kAllocation);
         return false;
     }
     // EGLImage 导入不会接管 fd 的关闭责任。
@@ -1379,7 +2039,7 @@ bool OpenGLView::RenderHardwareFrameWithEglImages(const std::shared_ptr<mediacor
             try {
                 pending_frame_resources_.push_back(std::move(pending_resources));
             } catch (const std::bad_alloc&) {
-                LOG_ERROR("Could not retain a frame after an unconfirmed GL finish; keeping it until process exit");
+                RENDER_LOG_NO_THROW(LOG_ERROR, "Could not retain a frame after an unconfirmed GL finish; keeping it until process exit");
                 GetDeferredGlResourceReaper().DisableHardwarePermanently();
                 static_cast<void>(pending_resources.release());
             }
@@ -1416,21 +2076,46 @@ bool OpenGLView::RenderHardwareFrameWithEglImages(const std::shared_ptr<mediacor
                                            EncodeUint32AsEglInt(modifier_high),
                                            EGL_NONE};
 
+        if (log_layout) {
+            RENDER_LOG_NO_THROW(LOG_INFO, "[VideoRender][EglAttributes] epoch={} plane={} target=EGL_LINUX_DMA_BUF_EXT context=EGL_NO_CONTEXT "
+                     "display={} current_context={} fd={} fourcc=0x{:08x} modifier=0x{:016x} offset={} pitch={} "
+                     "width={} height={} attribute_pairs=8 terminated=true",
+                     render_epoch_, plane_index, egl_import_.display_, eglGetCurrentContext(), dma_buf_object.fd_,
+                     dma_buf_plane.drm_format_, dma_buf_object.format_modifier_, dma_buf_plane.offset_bytes_,
+                     dma_buf_plane.pitch_bytes_, plane_storage_widths[plane_index], plane_storage_heights[plane_index]);
+        }
+
         // 8.2 将当前 Plane 对应的 DMA-BUF 导入 EGL，创建 EGLImage。
         //     EGLImage 使用该 fd 对应的存储，但 fd 的关闭责任仍由 HardwareFrame 持有。
+        AddRenderCount(&RenderCounters::egl_image_create_attempts);
         pending_resources->egl_images_[plane_index] = egl_import_.create_image_(
             egl_import_.display_, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, image_attributes);
         if (pending_resources->egl_images_[plane_index] == EGL_NO_IMAGE_KHR) {
             const EGLint egl_error = eglGetError();
-            LOG_WARN("eglCreateImageKHR failed for plane {}: EGL error 0x{:x}", plane_index, egl_error);
+            AddRenderCount(&RenderCounters::egl_image_create_failed);
+            if (RecordRenderFailure(RenderFailure::kEglCreate)) {
+                RENDER_LOG_NO_THROW(LOG_ERROR, "[VideoRender][EGL] api=eglCreateImageKHR result=EGL_NO_IMAGE_KHR epoch={} plane={} "
+                          "error=0x{:x} display={} context={} fd={} fourcc=0x{:08x} modifier=0x{:016x} "
+                          "offset={} pitch={} width={} height={}",
+                          render_epoch_, plane_index, egl_error, egl_import_.display_, eglGetCurrentContext(),
+                          dma_buf_object.fd_, dma_buf_plane.drm_format_, dma_buf_object.format_modifier_,
+                          dma_buf_plane.offset_bytes_, dma_buf_plane.pitch_bytes_,
+                          plane_storage_widths[plane_index], plane_storage_heights[plane_index]);
+            }
             rollback(false);
             return false;
         }
+        AddRenderCount(&RenderCounters::egl_image_create_success);
+        ++lifetime_images_created_;
 
         // 8.3 创建一个 OpenGL Texture 对象，用于后续绑定当前 Plane 的 EGLImage
         glGenTextures(1, &pending_resources->textures_[plane_index]);
-        if (pending_resources->textures_[plane_index] == 0 || glGetError() != GL_NO_ERROR) {
-            LOG_WARN("OpenGL texture allocation failed for DMA-BUF plane {}", plane_index);
+        const GLenum allocation_error = glGetError();
+        if (pending_resources->textures_[plane_index] == 0 || allocation_error != GL_NO_ERROR) {
+            if (RecordRenderFailure(RenderFailure::kTextureAllocation)) {
+                RENDER_LOG_NO_THROW(LOG_ERROR, "[VideoRender][GL] api=glGenTextures epoch={} plane={} texture={} image_valid=true error=0x{:x}",
+                          render_epoch_, plane_index, pending_resources->textures_[plane_index], allocation_error);
+            }
             rollback(false);
             return false;
         }
@@ -1446,10 +2131,18 @@ bool OpenGLView::RenderHardwareFrameWithEglImages(const std::shared_ptr<mediacor
                                           reinterpret_cast<GLeglImageOES>(pending_resources->egl_images_[plane_index]));
         const GLenum import_error = glGetError();
         if (import_error != GL_NO_ERROR) {
-            LOG_WARN("glEGLImageTargetTexture2DOES failed for plane {}: GL error 0x{:x}", plane_index, import_error);
+            AddRenderCount(&RenderCounters::gl_egl_image_bind_failed);
+            if (RecordRenderFailure(RenderFailure::kTextureBind)) {
+                RENDER_LOG_NO_THROW(LOG_ERROR, "[VideoRender][GL] api=glEGLImageTargetTexture2DOES epoch={} plane={} error=0x{:x} "
+                          "texture={} image={} display={} context={} fourcc=0x{:08x} modifier=0x{:016x}",
+                          render_epoch_, plane_index, import_error, pending_resources->textures_[plane_index],
+                          pending_resources->egl_images_[plane_index], egl_import_.display_, eglGetCurrentContext(),
+                          dma_buf_plane.drm_format_, dma_buf_object.format_modifier_);
+            }
             rollback(false);
             return false;
         }
+        AddRenderCount(&RenderCounters::gl_egl_image_bind_success);
 
         // EGLImage 导入成功只说明驱动接受了 DMA-BUF 描述；还要检查
         // 纹理实际内部格式是否与 Shader 的归一化采样假设一致。
@@ -1462,12 +2155,23 @@ bool OpenGLView::RenderHardwareFrameWithEglImages(const std::shared_ptr<mediacor
         const GLenum format_query_error = glGetError();
         if (format_query_error != GL_NO_ERROR ||
             imported_internal_format != static_cast<GLint>(expected_internal_format)) {
-            LOG_WARN("Imported DMA-BUF plane {} has unexpected texture format 0x{:x}, expected 0x{:x}",
-                     plane_index,
-                     static_cast<unsigned int>(imported_internal_format),
-                     static_cast<unsigned int>(expected_internal_format));
+            if (RecordRenderFailure(RenderFailure::kTextureFormat)) {
+                RENDER_LOG_NO_THROW(LOG_ERROR, "[VideoRender][GL] api=glGetTexLevelParameteriv epoch={} plane={} error=0x{:x} "
+                          "texture={} image={} internal_format=0x{:x} expected=0x{:x}",
+                          render_epoch_, plane_index, format_query_error, pending_resources->textures_[plane_index],
+                          pending_resources->egl_images_[plane_index], static_cast<unsigned int>(imported_internal_format),
+                          static_cast<unsigned int>(expected_internal_format));
+            }
             rollback(false);
             return false;
+        }
+        const unsigned plane_bit = 1U << plane_index;
+        if (log_layout || (import_success_logged_mask_ & plane_bit) == 0) {
+            import_success_logged_mask_ |= plane_bit;
+            RENDER_LOG_NO_THROW(LOG_INFO, "[VideoRender][ImportSuccess] stream_id={} epoch={} plane={} api=eglCreateImageKHR image={} "
+                     "bind_api=glEGLImageTargetTexture2DOES texture={} internal_format=0x{:x} gl_error=0x{:x}",
+                     render_stream_id_, render_epoch_, plane_index, pending_resources->egl_images_[plane_index],
+                     pending_resources->textures_[plane_index], static_cast<unsigned int>(imported_internal_format), import_error);
         }
     }
 
@@ -1502,22 +2206,31 @@ bool OpenGLView::RenderHardwareFrameWithEglImages(const std::shared_ptr<mediacor
     glBindTexture(GL_TEXTURE_2D, pending_resources->textures_[1]);
     // 11. 绑定全屏四边形几何数据，执行硬件帧绘制，然后恢复 VAO 和 Shader 绑定状态。
     vao_.bind();
+    const auto draw_started = std::chrono::steady_clock::now();
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, nullptr);
+    AddRenderTiming(&RenderCounters::draw,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - draw_started).count());
     vao_.release();
     hardware_shader_program_->release();
 
     const GLenum draw_error = glGetError();
     if (draw_error != GL_NO_ERROR) {
-        LOG_WARN("Hardware frame draw failed: GL error 0x{:x}", draw_error);
+        AddRenderCount(&RenderCounters::gl_draw_failed);
+        if (RecordRenderFailure(RenderFailure::kShaderDraw)) {
+            RENDER_LOG_NO_THROW(LOG_ERROR, "[VideoRender][GL] api=glDrawElements path=DMA_BUF epoch={} error=0x{:x}", render_epoch_, draw_error);
+        }
         rollback(true);
         return false;
     }
+    RecordDrawSubmitted(true, painting_sequence_);
 
     // 12. 绘制命令已提交，但 GPU 可能仍在读取 EGLImage；在命令之后插入 Fence 作为完成标记。
     pending_resources->fence_ = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     glFlush();
     if (pending_resources->fence_ == nullptr) {
-        LOG_WARN("glFenceSync failed; waiting for the GPU before releasing the frame");
+        if (RecordRenderFailure(RenderFailure::kFence)) {
+            RENDER_LOG_NO_THROW(LOG_ERROR, "[VideoRender][GL] api=glFenceSync epoch={} result=null; existing_gpu_wait_fallback=true", render_epoch_);
+        }
         rollback(true);
         return false;
     }
@@ -1526,6 +2239,7 @@ bool OpenGLView::RenderHardwareFrameWithEglImages(const std::shared_ptr<mediacor
     try {
         pending_frame_resources_.push_back(std::move(pending_resources));
     } catch (const std::bad_alloc&) {
+        RecordRenderFailure(RenderFailure::kAllocation);
         if (pending_resources != nullptr) {
             rollback(true);
         } else {
@@ -1533,6 +2247,7 @@ bool OpenGLView::RenderHardwareFrameWithEglImages(const std::shared_ptr<mediacor
         }
         return false;
     }
+    lifetime_pending_peak_ = std::max(lifetime_pending_peak_, pending_frame_resources_.size());
     return true;
 }
 
@@ -1559,10 +2274,26 @@ bool OpenGLView::DownloadHardwareFrameToSoftwareFrame(const mediacore::VideoFram
     // 3. 请求 FFmpeg 将硬件帧数据传输到普通软件帧。
     const auto transfer_started_at = std::chrono::steady_clock::now();
     const int transfer_result = av_hwframe_transfer_data(downloaded, hardware_video_frame.hardware_->av_frame_ref_, 0);
-    RecordHardwareFrameDownload(std::chrono::duration<double, std::milli>(
-                                    std::chrono::steady_clock::now() - transfer_started_at)
-                                    .count(),
-                                transfer_result >= 0);
+    const double transfer_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - transfer_started_at).count();
+    AddRenderTiming(&RenderCounters::download, transfer_ms);
+    if (transfer_result >= 0) {
+        AddRenderCount(&RenderCounters::vaapi_cpu_download_frames);
+        const int bytes = av_image_get_buffer_size(static_cast<AVPixelFormat>(downloaded->format),
+                                                   downloaded->width, downloaded->height, 1);
+        if (bytes > 0) { AddRenderCount(&RenderCounters::cpu_download_bytes, static_cast<std::uint64_t>(bytes)); }
+    } else {
+        AddRenderCount(&RenderCounters::cpu_download_failed);
+        if (RecordRenderFailure(RenderFailure::kDownload)) {
+            std::array<char, AV_ERROR_MAX_STRING_SIZE> error{};
+            av_strerror(transfer_result, error.data(), error.size());
+            RENDER_LOG_NO_THROW(LOG_ERROR, "[VideoRender][FFmpeg] api=av_hwframe_transfer_data error_code={} error_message='{}' "
+                      "epoch={} mode=vaapi codec=decoder_owned frame_format={} resolution={}x{}",
+                      transfer_result, error.data(), hardware_video_frame.epoch_,
+                      hardware_video_frame.hardware_->av_frame_ref_->format,
+                      hardware_video_frame.width_, hardware_video_frame.height_);
+        }
+    }
     if (transfer_result < 0 || downloaded->format < 0 || downloaded->width <= 0 || downloaded->height <= 0) {
         av_frame_free(&downloaded);
         return false;
@@ -1614,48 +2345,10 @@ bool OpenGLView::DownloadHardwareFrameToSoftwareFrame(const mediacore::VideoFram
     software_video_frame.height_ = hardware_video_frame.height_;
     software_video_frame.pts_us_ = hardware_video_frame.pts_us_;
     software_video_frame.epoch_ = hardware_video_frame.epoch_;
+    software_video_frame.diagnostic_stream_id_ = hardware_video_frame.diagnostic_stream_id_;
     software_video_frame.color_space_ = hardware_video_frame.color_space_;
     software_video_frame.color_range_ = hardware_video_frame.color_range_;
     return software_video_frame.IsValid();
-}
-
-void OpenGLView::RecordHardwareFrameDownload(double elapsed_ms, bool succeeded) {
-    ++renderer_download_count_;
-    ++renderer_download_interval_count_;
-    renderer_download_total_ms_ += elapsed_ms;
-    renderer_download_interval_ms_ += elapsed_ms;
-    renderer_download_max_ms_ = std::max(renderer_download_max_ms_, elapsed_ms);
-    renderer_download_interval_max_ms_ = std::max(renderer_download_interval_max_ms_, elapsed_ms);
-    if (!succeeded) {
-        ++renderer_download_failures_;
-        ++renderer_download_interval_failures_;
-    }
-
-    const auto now = std::chrono::steady_clock::now();
-    const double interval_seconds =
-        std::chrono::duration<double>(now - renderer_interval_started_at_).count();
-    if (interval_seconds < 5.0) {
-        return;
-    }
-
-    const double average_download_ms = renderer_download_interval_count_ == 0
-        ? 0.0
-        : renderer_download_interval_ms_ / static_cast<double>(renderer_download_interval_count_);
-    LOG_INFO("RendererDownloadStats reason=interval scope=interval transfer_count={} failures={} "
-             "avg_transfer_ms={:.3f} max_transfer_ms={:.3f} interval_s={:.3f} "
-             "cumulative_transfers={} cumulative_failures={}",
-             renderer_download_interval_count_,
-             renderer_download_interval_failures_,
-             average_download_ms,
-             renderer_download_interval_max_ms_,
-             interval_seconds,
-             renderer_download_count_,
-             renderer_download_failures_);
-    renderer_download_interval_count_ = 0;
-    renderer_download_interval_failures_ = 0;
-    renderer_download_interval_ms_ = 0.0;
-    renderer_download_interval_max_ms_ = 0.0;
-    renderer_interval_started_at_ = now;
 }
 
 /**
@@ -1681,8 +2374,13 @@ void OpenGLView::ReclaimCompletedFrameResources() {
         PendingFrameResources* pending_resources = it->get();
 
         if (pending_resources->fence_ != nullptr) {
+            const auto wait_started = std::chrono::steady_clock::now();
             const GLenum status = glClientWaitSync(pending_resources->fence_, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
+            AddRenderTiming(&RenderCounters::fence_wait,
+                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_started).count());
+            ++lifetime_fence_polls_;
             if (status == GL_TIMEOUT_EXPIRED) {
+                ++lifetime_fence_timeouts_;
                 ++it;  // GPU 还没画完，下次再查
                 continue;
             }
@@ -1691,17 +2389,23 @@ void OpenGLView::ReclaimCompletedFrameResources() {
                 if (hardware_render_capability_ != nullptr) {
                     hardware_render_capability_->store(false, std::memory_order_release);
                 }
-                LOG_ERROR("OpenGL Fence status is indeterminate; retaining the frame and suspending DMA-BUF rendering");
+                if (RecordRenderFailure(RenderFailure::kFence)) {
+                    RENDER_LOG_NO_THROW(LOG_ERROR, "[VideoRender][Fence] api=glClientWaitSync status=0x{:x} epoch={} "
+                              "error=0x{:x} action=retain_and_suspend", status, render_epoch_, glGetError());
+                }
                 ++it;
                 continue;
             }
+            ++lifetime_fence_signaled_;
             pending_resources->gpu_use_is_complete_ = true;
         } else if (!pending_resources->gpu_use_is_complete_) {
             hardware_retirement_suspended_ = true;
             if (hardware_render_capability_ != nullptr) {
                 hardware_render_capability_->store(false, std::memory_order_release);
             }
-            LOG_ERROR("OpenGL frame has no completion Fence; retaining it and suspending DMA-BUF rendering");
+            if (RecordRenderFailure(RenderFailure::kFence)) {
+                RENDER_LOG_NO_THROW(LOG_ERROR, "OpenGL frame has no completion Fence; retaining it and suspending DMA-BUF rendering");
+            }
             ++it;
             continue;
         }
@@ -1724,9 +2428,15 @@ void OpenGLView::ReclaimCompletedFrameResources() {
 
         if (oldest_resources->fence_ != nullptr) {
             // 最多等 100 ms（GLuint64 纳秒）
+            const auto wait_started = std::chrono::steady_clock::now();
             const GLenum status = glClientWaitSync(
                 oldest_resources->fence_, GL_SYNC_FLUSH_COMMANDS_BIT, static_cast<GLuint64>(100) * 1000ULL * 1000ULL);
+            AddRenderTiming(&RenderCounters::fence_wait,
+                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_started).count());
+            ++lifetime_fence_polls_;
+            if (status == GL_TIMEOUT_EXPIRED) { ++lifetime_fence_timeouts_; }
             if (status == GL_ALREADY_SIGNALED || status == GL_CONDITION_SATISFIED) {
+                ++lifetime_fence_signaled_;
                 oldest_resources->gpu_use_is_complete_ = true;
                 if (ReleasePendingFrameResources(*oldest_resources, false)) {
                     pending_frame_resources_.erase(pending_frame_resources_.begin());
@@ -1739,7 +2449,9 @@ void OpenGLView::ReclaimCompletedFrameResources() {
         if (hardware_render_capability_ != nullptr) {
             hardware_render_capability_->store(false, std::memory_order_release);
         }
-        LOG_WARN("Pending hardware frame limit exceeded; keeping unconfirmed resources and suspending DMA-BUF rendering");
+        if (RecordRenderFailure(RenderFailure::kFence)) {
+            RENDER_LOG_NO_THROW(LOG_WARN, "Pending hardware frame limit exceeded; keeping unconfirmed resources and suspending DMA-BUF rendering");
+        }
         break;
     }
 }
@@ -1754,7 +2466,10 @@ void OpenGLView::ReclaimCompletedFrameResources() {
 bool OpenGLView::ReleasePendingFrameResources(PendingFrameResources& pending_resources, bool wait_for_gpu) {
     // 1. 如果调用方不能确认 GPU 已完成，先等待当前 Context 已提交的命令执行完毕。
     if (wait_for_gpu) {
+        const auto wait_started = std::chrono::steady_clock::now();
         glFinish();
+        AddRenderTiming(&RenderCounters::fence_wait,
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_started).count());
         bool context_lost = false;
         while (const GLenum error = glGetError()) {
             if (error == GL_CONTEXT_LOST) {
@@ -1783,12 +2498,28 @@ bool OpenGLView::ReleasePendingFrameResources(PendingFrameResources& pending_res
         if (egl_image != EGL_NO_IMAGE_KHR) {
             if (egl_import_.destroy_image_ == nullptr || egl_import_.display_ == EGL_NO_DISPLAY ||
                 egl_import_.destroy_image_(egl_import_.display_, egl_image) != EGL_TRUE) {
+                const EGLint error = eglGetError();
+                if (RecordRenderFailure(RenderFailure::kResourceRelease)) {
+                    RENDER_LOG_NO_THROW(LOG_ERROR, "[VideoRender][EGL] api=eglDestroyImageKHR error=0x{:x} display={} context={} image={} "
+                              "epoch={} action=retain_frame", error, egl_import_.display_, eglGetCurrentContext(),
+                              egl_image, render_epoch_);
+                }
                 return false;
             }
+            ++lifetime_images_destroyed_;
             egl_image = EGL_NO_IMAGE_KHR;
         }
     }
     // 5. 最后释放 VideoFrame 引用。若这是最后一份引用，HardwareFrame 才会关闭 fd 并释放 AVFrame 引用。
+    if (pending_resources.video_frame_ != nullptr) {
+        ++lifetime_frame_resources_released_;
+        if (lifetime_frame_resources_released_ == 1) {
+            RENDER_LOG_NO_THROW(LOG_INFO, "[VideoRender][FirstResourceRelease] epoch={} gpu_use_complete={} "
+                     "textures_deleted=true images_destroyed=true frame_reference_released=true "
+                     "fd_owner=HardwareFrame fd_close_observed=false",
+                     pending_resources.video_frame_->epoch_, pending_resources.gpu_use_is_complete_);
+        }
+    }
     pending_resources.video_frame_.reset();
     return true;
 }
@@ -1844,8 +2575,14 @@ void OpenGLView::ReleaseOpenGlResources() {
             if (!gpu_use_is_complete && resources.fence_ != nullptr) {
                 constexpr int kMaxFenceWaitAttempts = 10;
                 for (int wait_attempt = 0; wait_attempt < kMaxFenceWaitAttempts; ++wait_attempt) {
+                    const auto wait_started = std::chrono::steady_clock::now();
                     const GLenum status = glClientWaitSync(resources.fence_, GL_SYNC_FLUSH_COMMANDS_BIT, 100000000ULL);
+                    AddRenderTiming(&RenderCounters::fence_wait,
+                                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_started).count());
+                    ++lifetime_fence_polls_;
+                    if (status == GL_TIMEOUT_EXPIRED) { ++lifetime_fence_timeouts_; }
                     if (status == GL_ALREADY_SIGNALED || status == GL_CONDITION_SATISFIED) {
+                        ++lifetime_fence_signaled_;
                         gpu_use_is_complete = true;
                         break;
                     }
@@ -1878,7 +2615,7 @@ void OpenGLView::ReleaseOpenGlResources() {
         ebo_.destroy();
         resource_context->doneCurrent();
     } else {
-        LOG_WARN("No OpenGL context is available; deferred frame resources will remain owned until a context can reap them");
+        RENDER_LOG_NO_THROW(LOG_WARN, "No OpenGL context is available; deferred frame resources will remain owned until a context can reap them");
     }
 
     // 9. 将未确认的帧及其 DMA-BUF/AVFrame 所有权转交给进程级回收器。
@@ -1899,6 +2636,7 @@ void OpenGLView::DeferPendingFrameResources() {
     if (pending_frame_resources_.empty()) {
         return;
     }
+    lifetime_resources_deferred_ += pending_frame_resources_.size();
 
     auto& reaper = GetDeferredGlResourceReaper();
     std::unique_ptr<DeferredResourceBatch> batch;
@@ -1912,7 +2650,7 @@ void OpenGLView::DeferPendingFrameResources() {
     } catch (const std::bad_alloc&) {
         // Allocation failure leaves no safe owner capable of polling these Fences.
         // Retain every object until process exit and permanently disable new exports.
-        LOG_ERROR("Could not allocate deferred GL resource batch; retaining DMA-BUF resources until process exit");
+        RENDER_LOG_NO_THROW(LOG_ERROR, "Could not allocate deferred GL resource batch; retaining DMA-BUF resources until process exit");
         reaper.DisableHardwarePermanently();
         for (auto& resources : pending_frame_resources_) {
             static_cast<void>(resources.release());
@@ -1924,7 +2662,9 @@ void OpenGLView::DeferPendingFrameResources() {
     }
 
     if (!reaper.Defer(batch)) {
-        LOG_ERROR("Could not enqueue deferred GL resource batch; retaining it until process exit");
+        RENDER_LOG_NO_THROW(LOG_ERROR, "Could not enqueue deferred GL resource batch; retaining it until process exit");
         static_cast<void>(batch.release());
     }
 }
+
+#undef RENDER_LOG_NO_THROW

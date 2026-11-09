@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <cctype>
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <limits>
@@ -20,6 +21,18 @@ extern "C" {
 }
 
 namespace mediacore {
+
+namespace {
+std::atomic<std::uint64_t> owned_fd_close_success{0};
+std::atomic<std::uint64_t> owned_fd_close_failed{0};
+std::atomic<std::uint64_t> owned_av_frame_refs_released{0};
+}
+
+HardwareFrameReleaseStats GetHardwareFrameReleaseStats() noexcept {
+    return {owned_fd_close_success.load(std::memory_order_relaxed),
+            owned_fd_close_failed.load(std::memory_order_relaxed),
+            owned_av_frame_refs_released.load(std::memory_order_relaxed)};
+}
 
 /**
  * @brief 析构函数，释放当前对象持有的全部资源
@@ -101,7 +114,9 @@ void HardwareFrame::ReleaseResources() noexcept {
                     dma_buf_objects_[later_index].fd_ = -1;
                 }
             }
-            ::close(dma_buf_object.fd_);
+            const int close_result = ::close(dma_buf_object.fd_);
+            (close_result == 0 ? owned_fd_close_success : owned_fd_close_failed)
+                .fetch_add(1, std::memory_order_relaxed);
             dma_buf_object.fd_ = -1;
         }
     }
@@ -113,6 +128,7 @@ void HardwareFrame::ReleaseResources() noexcept {
     // 最后释放 FFmpeg 帧引用；此时 Surface 对应的独立 fd 已关闭。
     if (av_frame_ref_ != nullptr) {
         av_frame_free(&av_frame_ref_);
+        owned_av_frame_refs_released.fetch_add(1, std::memory_order_relaxed);
     }
 
     // 将图像信息恢复为空状态。

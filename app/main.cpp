@@ -17,6 +17,7 @@
 #include <memory>
 
 #include "mediacore/logger.h"
+#include "mediacore/av_types/hardware_frame.h"
 #include "mediacore/player_factory.h"
 #include "player_widget.h"
 
@@ -57,7 +58,10 @@ int main(int argc, char* argv[]) {
 
         // QApplication 负责捕获与分发底层窗口系统的原生输入、重绘和定时器事件
         QApplication app(argc, argv);
-        LOG_INFO("QApplication created");
+        LOG_INFO("QApplication created: Qt compile {}, runtime {}, QPA platform {}",
+                 QT_VERSION_STR,
+                 qVersion(),
+                 QGuiApplication::platformName().toStdString());
 
         QCommandLineParser parser;
         parser.addHelpOption();
@@ -120,7 +124,11 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // 7. 优雅关闭日志引擎，刷新未落盘缓冲并注销资源
+    // 7. 关闭日志引擎，刷新未落盘缓冲并注销资源
+    const auto releases = mediacore::GetHardwareFrameReleaseStats();
+    LOG_INFO("[HardwareFrame][ReleaseSummary] scope=process owned_fd_close_success={} "
+             "owned_fd_close_failed={} av_frame_refs_released={}",
+             releases.fd_close_success, releases.fd_close_failed, releases.av_frame_refs_released);
     LOG_INFO("Application exited with code {}", exit_code);
     mediacore::Logger::Shutdown();
 

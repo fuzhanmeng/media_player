@@ -188,10 +188,17 @@ TickResult AvSyncNode::Tick() {
             if (was_using_audio_clock_ && !state.is_audio_master_) {
                 ++audio_clock_fallback_count_;
 
-                LOG_WARN(
-                    "AVSync audio clock ended/stalled;"
-                    "using monotonic fallback, epoch {}",
-                    epoch);
+                if (state.audio_clock_reason_ == PlaybackTimeline::AudioClockReason::kAudioEos) {
+                    LOG_INFO("[AVSync][ClockFallback] from=AUDIO_MASTER to=MONOTONIC reason={} epoch={} "
+                             "position_us={} audio_progress_age_ms={} stall_timeout_ms={}",
+                             PlaybackTimeline::AudioClockReasonName(state.audio_clock_reason_), epoch,
+                             state.media_position_us_, state.audio_progress_age_ms_, state.audio_stall_timeout_ms_);
+                } else {
+                    LOG_WARN("[AVSync][ClockFallback] from=AUDIO_MASTER to=MONOTONIC reason={} epoch={} "
+                             "position_us={} audio_progress_age_ms={} stall_timeout_ms={}",
+                             PlaybackTimeline::AudioClockReasonName(state.audio_clock_reason_), epoch,
+                             state.media_position_us_, state.audio_progress_age_ms_, state.audio_stall_timeout_ms_);
+                }
             }
 
             // 记录本轮观察到的主时钟状态，供下一轮判断是否发生切换

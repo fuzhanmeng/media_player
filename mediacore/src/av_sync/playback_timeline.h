@@ -39,6 +39,26 @@ enum class PlaybackTrack : std::uint8_t {
  */
 class PlaybackTimeline {
 public:
+    // Diagnostic classification only; clock selection still uses AudioMasterLocked().
+    enum class AudioClockReason : std::uint8_t {
+        kAudioMaster,
+        kNoAudioTrack,
+        kNoAudioPosition,
+        kAudioEos,
+        kProgressTimeout
+    };
+
+    static const char* AudioClockReasonName(AudioClockReason reason) noexcept {
+        switch (reason) {
+            case AudioClockReason::kAudioMaster: return "AUDIO_MASTER";
+            case AudioClockReason::kNoAudioTrack: return "NO_AUDIO_TRACK";
+            case AudioClockReason::kNoAudioPosition: return "NO_AUDIO_POSITION";
+            case AudioClockReason::kAudioEos: return "AUDIO_EOS";
+            case AudioClockReason::kProgressTimeout: return "PROGRESS_TIMEOUT";
+        }
+        return "UNKNOWN";
+    }
+
     /**
      * @struct Snapshot
      * @brief 某一瞬间播放状态与时间位置的完整只读快照
@@ -51,6 +71,9 @@ public:
         bool stopped_{false};  ///< 是否已停止
         bool has_audio_position_{false};  ///< 当前版本是否收到过有效的音频进度
         bool is_audio_master_{false};  ///< 当前是否正以音频进度作为全局主时钟
+        AudioClockReason audio_clock_reason_{AudioClockReason::kNoAudioPosition};
+        std::int64_t audio_progress_age_ms_{-1};  ///< -1 means no position received
+        std::int64_t audio_stall_timeout_ms_{0};
         std::int64_t seek_target_us_{0};  ///< 最近一次跳转的目标位置（微秒）
         std::int64_t media_position_us_{0};  ///< 当前估算的播放位置（微秒）
     };
@@ -104,6 +127,14 @@ public:
         result.media_position_us_ = PositionLocked();
         result.has_audio_position_ = has_audio_position_;
         result.is_audio_master_ = AudioMasterLocked();
+        result.audio_clock_reason_ = result.is_audio_master_ ? AudioClockReason::kAudioMaster :
+            !has_audio_track_ ? AudioClockReason::kNoAudioTrack :
+            audio_finished_ ? AudioClockReason::kAudioEos :
+            !has_audio_position_ ? AudioClockReason::kNoAudioPosition : AudioClockReason::kProgressTimeout;
+        result.audio_progress_age_ms_ = has_audio_position_
+            ? std::chrono::duration_cast<std::chrono::milliseconds>(SteadyClock::now() - last_audio_progress_time_).count()
+            : -1;
+        result.audio_stall_timeout_ms_ = audio_stall_timeout_.count();
 
         return result;
     }

@@ -14,9 +14,12 @@
 
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QMouseEvent>
 #include <QPushButton>
 #include <QSignalBlocker>
 #include <QSlider>
+#include <QStyle>
+#include <QStyleOptionSlider>
 
 #include <algorithm>
 
@@ -44,6 +47,7 @@ ControllerWidget::ControllerWidget(QWidget* parent)
     // 使用 [0, 1000] 整数刻度表达播放相对进度（千分比），规避浮点传递可能导致的精度截断误差
     progress_slider_->setRange(0, 1000);
     progress_slider_->setEnabled(false);
+    progress_slider_->installEventFilter(this);
 
     // 2. 装配水平布局
     auto* layout = new QHBoxLayout(this);
@@ -63,16 +67,66 @@ ControllerWidget::ControllerWidget(QWidget* parent)
     // QSlider::sliderReleased 信号本身不携带当前刻度数值，而在拖拽定位交互中，
     // 上层只需在用户松开鼠标（释放）的瞬间获得最终目标位置；
     // 因此在 Lambda 内部提取 progress_slider_->value() 并作为整型参数随 Seek 信号发出
+    connect(progress_slider_, &QSlider::sliderPressed, this, [this]() {
+        slider_move_events_ = 0;
+        last_slider_move_log_ = {};
+        LOG_INFO("[Seek][UI] signal=sliderPressed value={} slider_position={} enabled={}",
+                 progress_slider_->value(), progress_slider_->sliderPosition(), progress_slider_->isEnabled());
+    });
     connect(progress_slider_, &QSlider::sliderReleased, this, [this]() {
         const int position = progress_slider_->value();
-        LOG_INFO("Progress slider released, position {}", position);
+        LOG_INFO("[Seek][UI] signal=sliderReleased value={} slider_position={} moved_events={}",
+                 position, progress_slider_->sliderPosition(), slider_move_events_);
         emit Seek(position);
     });
 
     // 拖动过程中仅更新文本预览；真正的 Seek 仍只在释放滑块时发出。
-    connect(progress_slider_, &QSlider::sliderMoved, this, [this](int) { UpdateTimeDisplay(); });
+    connect(progress_slider_, &QSlider::sliderMoved, this, [this](int position) {
+        ++slider_move_events_;
+        const auto now = std::chrono::steady_clock::now();
+        if (slider_move_events_ == 1 || now - last_slider_move_log_ >= std::chrono::milliseconds(250)) {
+            last_slider_move_log_ = now;
+            LOG_INFO("[Seek][UI] signal=sliderMoved position={} moved_events={} slider_down={}",
+                     position, slider_move_events_, progress_slider_->isSliderDown());
+        }
+        UpdateTimeDisplay();
+    });
+    connect(progress_slider_, &QSlider::actionTriggered, this, [this](int action) {
+        LOG_DEBUG("[Seek][UI] signal=actionTriggered action={} value={} slider_position={} slider_down={}",
+                  action, progress_slider_->value(), progress_slider_->sliderPosition(), progress_slider_->isSliderDown());
+    });
 
     LOG_INFO("ControllerWidget constructed");
+}
+
+bool ControllerWidget::eventFilter(QObject* watched, QEvent* event) {
+    if (watched == progress_slider_ &&
+        (event->type() == QEvent::MouseButtonPress || event->type() == QEvent::MouseButtonRelease)) {
+        const auto* mouse = static_cast<QMouseEvent*>(event);
+        QStyleOptionSlider option;
+        option.initFrom(progress_slider_);
+        option.orientation = progress_slider_->orientation();
+        option.minimum = progress_slider_->minimum();
+        option.maximum = progress_slider_->maximum();
+        option.sliderPosition = progress_slider_->sliderPosition();
+        option.sliderValue = progress_slider_->value();
+        option.singleStep = progress_slider_->singleStep();
+        option.pageStep = progress_slider_->pageStep();
+        option.upsideDown = progress_slider_->invertedAppearance() !=
+            (progress_slider_->layoutDirection() == Qt::RightToLeft);
+        const auto handle = progress_slider_->style()->subControlRect(
+            QStyle::CC_Slider, &option, QStyle::SC_SliderHandle, progress_slider_);
+        LOG_INFO("[Seek][UIInput] event={} local_x={} local_y={} global_x={} global_y={} "
+                 "button={} buttons={} spontaneous={} enabled={} value={} slider_down={} width={} height={} "
+                 "handle_x={} handle_y={} handle_width={} handle_height={} handle_hit={}",
+                 event->type() == QEvent::MouseButtonPress ? "MouseButtonPress" : "MouseButtonRelease",
+                 mouse->position().x(), mouse->position().y(), mouse->globalPosition().x(), mouse->globalPosition().y(),
+                 static_cast<int>(mouse->button()), static_cast<int>(mouse->buttons().toInt()), event->spontaneous(),
+                 progress_slider_->isEnabled(), progress_slider_->value(), progress_slider_->isSliderDown(),
+                 progress_slider_->width(), progress_slider_->height(), handle.x(), handle.y(),
+                 handle.width(), handle.height(), handle.contains(mouse->position().toPoint()));
+    }
+    return QWidget::eventFilter(watched, event);
 }
 
 /**
@@ -106,6 +160,9 @@ void ControllerWidget::SetPlayPauseEnabled(bool enabled) {
  * 直播流（Live Stream）或未知时长的流媒体应保持置灰禁用。
  */
 void ControllerWidget::SetSeekEnabled(bool enabled) {
+    if (progress_slider_->isEnabled() != enabled) {
+        LOG_INFO("[Seek][UI] enabled={} duration_us={}", enabled, duration_us_);
+    }
     progress_slider_->setEnabled(enabled);
 }
 

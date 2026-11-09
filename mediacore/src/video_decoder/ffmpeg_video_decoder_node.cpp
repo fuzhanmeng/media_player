@@ -189,6 +189,7 @@ TickResult FfmpegVideoDecoderNode::HandlePacket(Packet& packet) {
             case FfmpegDecoderSendStatus::kError:
                 if (IsSkippableDecodeError(send_result.media_error_) &&
                     ++consecutive_skippable_errors_ <= kMaxConsecutiveSkippableErrors) {
+                    video_decoder_->RecordSkippedCorruptInput();
                     LOG_WARN("Video decoder skipped a corrupt packet at epoch {} ({} consecutive): {}",
                              packet.GetEpoch(),
                              consecutive_skippable_errors_,
@@ -214,6 +215,8 @@ TickResult FfmpegVideoDecoderNode::HandleStreamReset(const StreamReset& reset) {
 
     // 丢弃解码器内部的陈旧参考帧与重排缓存
     video_decoder_->Flush();
+    video_decoder_->SetStatisticsEpoch(reset.epoch_);
+    LOG_INFO("[Seek][DecoderReset] epoch={} target_us={} flush_completed=true", reset.epoch_, reset.target_us_);
 
     // 向下游 VideoSinkNode 转发 StreamReset
     if (!SendOutput(VideoFrameStreamItem{reset})) {

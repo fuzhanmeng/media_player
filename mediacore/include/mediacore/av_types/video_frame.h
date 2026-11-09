@@ -119,6 +119,10 @@ struct VideoFrame {
      */
     std::uint64_t epoch_{0};
 
+    // Diagnostic identity of the producing decoder instance. Epochs can restart
+    // after reopening a file; this ID is never used for playback or ownership.
+    std::uint64_t diagnostic_stream_id_{0};
+
     // 3. =============== 视频色彩信息 ===============
 
     /// 视频源的色彩空间
@@ -384,6 +388,7 @@ private:
         other.pts_us_.reset();
 
         epoch_ = std::exchange(other.epoch_, 0);
+        diagnostic_stream_id_ = std::exchange(other.diagnostic_stream_id_, 0);
 
         color_space_ = other.color_space_;
         color_range_ = other.color_range_;

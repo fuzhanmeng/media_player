@@ -14,6 +14,7 @@
 #include <QWidget>
 
 #include <cstdint>
+#include <chrono>
 
 class QPushButton;
 class QSlider;
@@ -94,6 +95,9 @@ signals:
      */
     void Seek(int position);
 
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override;
+
 private:
     void UpdateTimeDisplay();
 
@@ -102,4 +106,6 @@ private:
     QSlider* progress_slider_{nullptr};        ///< 时间轴定位进度条（Qt 对象树托管）
     std::int64_t position_us_{0};  ///< 最近一次从播放器读取的媒体位置
     std::int64_t duration_us_{0};  ///< 最近一次从播放器读取的媒体总时长
+    std::uint64_t slider_move_events_{0};
+    std::chrono::steady_clock::time_point last_slider_move_log_{};
 };

@@ -59,12 +59,24 @@ VideoSinkNode::~VideoSinkNode() {
  */
 void VideoSinkNode::DeliverFrame(VideoFrame frame) {
     if (IsCurrentEpoch(frame.epoch_) && timeline_->Get().epoch_ == frame.epoch_) {
+        if (sink_frames_total_ == 0) {
+            LOG_INFO("[Seek][FirstSinkFrame] epoch={} pts_us={} target_us={}",
+                     frame.epoch_, frame.pts_us_.value_or(-1), seek_target_us_);
+        }
         ++sink_frames_total_;
         ++sink_frames_interval_;
         sink_summary_logged_ = false;
         video_dispatcher_->DeliverFrame(std::make_shared<VideoFrame>(std::move(frame)));
         LogFrameStatistics("interval", false);
+    } else {
+        RecordDroppedFrame();
     }
+}
+
+void VideoSinkNode::RecordDroppedFrame() {
+    ++dropped_frames_total_;
+    ++dropped_frames_interval_;
+    sink_summary_logged_ = false;
 }
 
 void VideoSinkNode::LogFrameStatistics(const char* reason, bool summary) {
@@ -77,19 +89,34 @@ void VideoSinkNode::LogFrameStatistics(const char* reason, bool summary) {
 
     const std::uint64_t frames = summary ? sink_frames_total_ : sink_frames_interval_;
     const double fps = elapsed_seconds > 0.0 ? static_cast<double>(frames) / elapsed_seconds : 0.0;
-    LOG_INFO("VideoSinkStats reason={} scope={} rate_basis=wall_clock sink_frames={} sink_wall_fps={:.3f} cumulative_sink_frames={} "
-             "displayed_frames=not_observable interval_s={:.3f}",
+    const auto start = summary ? sink_statistics_started_at_ : sink_interval_started_at_;
+    const auto received = summary ? received_frames_total_ : received_frames_interval_;
+    LOG_INFO("[VideoSinkPerf][{}] reason={} epoch={} window_start_ns={} window_end_ns={} "
+             "rate_basis=wall_clock sink_frames={} sink_wall_fps={:.3f} cumulative_sink_frames={} "
+             "video_sink_received_frames={} video_sink_fps={:.3f} video_sink_dropped_frames={} "
+             "pending_input_frames={} held_seek_fallback_frames={} "
+             "drop_scope=sink_only displayed_frames=not_observable interval_s={:.3f}",
+             summary ? "Summary" : "Interval",
              reason,
-             summary ? "total" : "interval",
+             current_epoch_,
+             std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count(),
+             std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count(),
              frames,
              fps,
              sink_frames_total_,
+             received,
+             elapsed_seconds > 0.0 ? static_cast<double>(received) / elapsed_seconds : 0.0,
+             summary ? dropped_frames_total_ : dropped_frames_interval_,
+             pending_item_ && std::holds_alternative<VideoFrame>(*pending_item_) ? 1 : 0,
+             fallback_frame_ && !fallback_frame_delivered_ ? 1 : 0,
              elapsed_seconds);
 
     if (summary) {
         sink_summary_logged_ = true;
     } else {
         sink_frames_interval_ = 0;
+        received_frames_interval_ = 0;
+        dropped_frames_interval_ = 0;
         sink_interval_started_at_ = now;
     }
 }
@@ -139,6 +166,11 @@ TickResult VideoSinkNode::Tick() {
     // 2. 获取输数据，没有处理完之前始终保留数据
     if (!pending_item_) {
         pending_item_ = ReceiveInputFor(std::chrono::milliseconds(5));
+        if (pending_item_ && std::holds_alternative<VideoFrame>(*pending_item_)) {
+            ++received_frames_total_;
+            ++received_frames_interval_;
+            sink_summary_logged_ = false;
+        }
     }
 
     // 3. 如果没接收到数据
@@ -150,6 +182,9 @@ TickResult VideoSinkNode::Tick() {
     const auto input_epoch = std::visit([](const auto& itme) { return itme.epoch_; }, *pending_item_);
 
     if (!IsCurrentEpoch(input_epoch) || input_epoch != timeline_->Get().epoch_) {
+        if (std::holds_alternative<VideoFrame>(*pending_item_)) {
+            RecordDroppedFrame();
+        }
         pending_item_.reset();
         return TickResult::kContinue;
     }
@@ -166,6 +201,13 @@ TickResult VideoSinkNode::Tick() {
 
     // Seek 重置：切换播放版本并重新开始帧搜索
     if (const auto* reset = std::get_if<StreamReset>(&stream_item)) {
+        if (fallback_frame_ && !fallback_frame_delivered_) RecordDroppedFrame();
+        if (!sink_summary_logged_ && received_frames_total_ > 0) LogFrameStatistics("epoch_end", true);
+        sink_frames_total_ = sink_frames_interval_ = 0;
+        received_frames_total_ = received_frames_interval_ = 0;
+        dropped_frames_total_ = dropped_frames_interval_ = 0;
+        sink_statistics_started_at_ = sink_interval_started_at_ = std::chrono::steady_clock::now();
+        sink_summary_logged_ = false;
         current_epoch_ = reset->epoch_;
         seek_target_us_ = reset->target_us_;
 
@@ -174,6 +216,7 @@ TickResult VideoSinkNode::Tick() {
         is_eos_processed_ = false;
 
         fallback_frame_.reset();
+        fallback_frame_delivered_ = false;
         return TickResult::kContinue;
     }
 
@@ -188,19 +231,24 @@ TickResult VideoSinkNode::Tick() {
             const auto frame_pts = video_frame->pts_us_.value_or(seek_target_us_);
 
             if (frame_pts < seek_target_us_) {
+                if (fallback_frame_) RecordDroppedFrame();
                 fallback_frame_ = std::move(*video_frame);
+                fallback_frame_delivered_ = false;
             } else {
                 // 找到第一张满足目标时间的帧，完成预览
                 const auto actual_position_us = frame_pts;
 
                 DeliverFrame(std::move(*video_frame));
                 is_searching_ = false;
+                if (fallback_frame_) RecordDroppedFrame();
                 fallback_frame_.reset();
                 ReportReady(actual_position_us, false);
             }
         } else if (!is_eos_processed_) {
             // 正常播放：直接交付，上游已完成同步调度
             DeliverFrame(std::move(*video_frame));
+        } else {
+            RecordDroppedFrame();
         }
 
         return TickResult::kContinue;
@@ -227,6 +275,7 @@ TickResult VideoSinkNode::Tick() {
 
             if (fallback_frame_) {
                 DeliverFrame(std::move(*fallback_frame_));
+                fallback_frame_delivered_ = true;
             }
 
             ReportReady(actual_position_us, true);

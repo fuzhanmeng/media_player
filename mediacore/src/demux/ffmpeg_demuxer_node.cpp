@@ -572,6 +572,8 @@ TickResult FfmpegDemuxerNode::ExecuteSeek(PendingSeek request) {
 
     // 2. 调 av_seek_frame 定位
     const FfmpegSeekResult seek_result = demuxer_->Seek(request.target_us_);
+    LOG_INFO("[Seek][DemuxResult] epoch={} target_us={} status={} error={}",
+             request.epoch_, request.target_us_, static_cast<int>(seek_result.status_), seek_result.error_.Message());
 
     // 3. 如果这期间又有更新的 Seek，本次结果作废，直接返回
     if (seek_result.status_ == FfmpegSeekStatus::kSeekInterrupted) {

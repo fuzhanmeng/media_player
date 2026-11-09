@@ -251,7 +251,7 @@ void PlayerWidget::OnSeek(int position) {
     // 将千分比刻度位置 [0, 1000] 换算为微秒时间戳
     const std::int64_t target_us = std::min<std::int64_t>(duration_us, position * duration_us / 1000);
 
-    LOG_INFO("Seek request sent to player, slider position {} -> target {} us", position, target_us);
+    LOG_INFO("[Seek][UIRequest] slider_position={} duration_us={} target_us={}", position, duration_us, target_us);
     player_->Seek(target_us);
 }
 

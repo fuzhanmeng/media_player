@@ -21,6 +21,7 @@ extern "C" {
 #include <libavutil/channel_layout.h>
 #include <libavutil/error.h>
 #include <libavutil/mathematics.h>
+#include <libavutil/samplefmt.h>
 #include <libswresample/swresample.h>
 }
 
@@ -229,6 +230,14 @@ struct FfmpegAudioDecoder::Impl final {
         // 保存源音频的采样率和格式
         input_rate_ = input.sample_rate;
         input_format_ = static_cast<AVSampleFormat>(input.format);
+        const char* input_format_name = av_get_sample_fmt_name(input_format_);
+        const char* output_format_name = av_get_sample_fmt_name(AV_SAMPLE_FMT_S16);
+        LOG_INFO("[AudioDecoder][Resampler] input_rate={} input_channels={} input_format={} "
+                 "output_rate={} output_channels={} output_format={} initialized=true",
+                 input_rate_, input.ch_layout.nb_channels,
+                 input_format_name != nullptr ? input_format_name : "unknown",
+                 PcmFrame::kSampleRate, PcmFrame::kChannels,
+                 output_format_name != nullptr ? output_format_name : "unknown");
     }
 
     /**

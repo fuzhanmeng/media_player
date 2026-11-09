@@ -982,6 +982,14 @@ FfmpegSeekResult FfmpegDemuxer::Seek(std::int64_t target_us) {
 
     // 10. 调用 FFmpeg 执行真正的底层定位
     const int seek_result = av_seek_frame(av_format_ctx_, seek_stream_index, target_ts, AVSEEK_FLAG_BACKWARD);
+    char seek_error_text[AV_ERROR_MAX_STRING_SIZE]{};
+    if (seek_result < 0) {
+        av_strerror(seek_result, seek_error_text, sizeof(seek_error_text));
+    }
+    LOG_INFO("[Seek][FFmpeg] api=av_seek_frame result={} error={} stream={} target_us={} target_ts={} "
+             "time_base={}/{} flags=AVSEEK_FLAG_BACKWARD",
+             seek_result, seek_result < 0 ? seek_error_text : "success", seek_stream_index,
+             target_us, target_ts, stream->time_base.num, stream->time_base.den);
 
     // 11. 检查定位过程中是否出现新的中断请求：av_seek_frame() 也可能执行阻塞 I/O
     const DemuxerInterruptReason after_seek = interrupt_.GetInterruptReason();

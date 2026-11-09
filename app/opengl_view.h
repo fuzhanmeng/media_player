@@ -25,6 +25,8 @@
 #include <QOpenGLShaderProgram>
 #include <QOpenGLVertexArrayObject>
 #include <QOpenGLWidget>
+#include <QTimer>
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -130,6 +132,9 @@ protected:
      */
     void resizeGL(int width, int height) override;
 
+    bool event(QEvent* event) override;
+    bool eventFilter(QObject* watched, QEvent* event) override;
+
     /**
      * @brief 核心渲染主循环：绘制当前视频画面
      * @details
@@ -142,6 +147,11 @@ protected:
     void paintGL() override;
 
 private:
+    void OnFrameArrivedOnGuiThread();
+    void OnGuiDiagnosticsHeartbeat();
+    void LogGuiDiagnostics(bool force);
+    void RecordPaintGLFinished(std::chrono::steady_clock::time_point started_at);
+
     // ==================== 软件帧渲染（CPU 上传）====================
 
     /**
@@ -332,7 +342,58 @@ private:
      */
     bool DownloadHardwareFrameToSoftwareFrame(const mediacore::VideoFrame& hardware_video_frame,
                                              mediacore::VideoFrame& software_video_frame);
-    void RecordHardwareFrameDownload(double elapsed_ms, bool succeeded);
+
+    // All statistics below are owned by the GUI thread. Only the mailbox sequence
+    // crosses threads, under frame_mutex_; observing a frame never retains it.
+    struct RenderTiming {
+        std::uint64_t calls{0};
+        double total_ms{0};
+        double max_ms{0};
+        void Add(double ms) { ++calls; total_ms += ms; max_ms = std::max(max_ms, ms); }
+        double AvgMs() const { return calls ? total_ms / calls : 0.0; }
+        double MaxMs() const { return max_ms; }
+    };
+    struct RenderCounters {
+        std::uint64_t egl_image_create_attempts{0}, egl_image_create_success{0}, egl_image_create_failed{0};
+        std::uint64_t gl_egl_image_bind_success{0}, gl_egl_image_bind_failed{0};
+        std::uint64_t vaapi_dmabuf_render_frames{0}, vaapi_cpu_download_frames{0}, cpu_download_failed{0};
+        std::uint64_t cpu_download_bytes{0}, software_texture_upload_frames{0}, software_upload_failed{0};
+        std::uint64_t gl_draw_submitted_frames{0}, unique_draw_submitted_frames{0}, gl_draw_failed{0};
+        std::uint64_t fallback_frames{0};
+        RenderTiming upload, dmabuf_render, download, draw, fence_wait;
+    };
+    struct GuiDiagnostics {
+        std::uint64_t video_dispatch_frames{0}, gui_mailbox_received_frames{0};
+        std::uint64_t gui_mailbox_overwritten_frames{0};
+        std::uint64_t gui_update_requests{0}, gui_update_queued{0}, gui_update_while_pending{0};
+        std::uint64_t update_later_events{0}, update_request_events{0}, paint_events{0};
+        std::uint64_t top_level_update_request_events{0}, aboutToCompose_count{0};
+        std::uint64_t paintGL_calls{0}, paintGL_new_frame_calls{0}, paintGL_duplicate_frame_calls{0};
+        std::uint64_t paintGL_no_frame_calls{0}, paintGL_unready_calls{0}, frameSwapped_count{0};
+        RenderTiming update_to_paint, mailbox_to_paint, paintGL_interval, paintGL_duration, frame_swapped_interval;
+        RenderTiming mailbox_to_gui, compose_duration;
+        std::uint64_t latest_mailbox_receive_ns{0}, update_pending_since_ns{0};
+        std::uint64_t last_paint_start_ns{0}, last_frame_swapped_ns{0};
+        std::uint64_t compose_started_ns{0};
+        std::uint64_t last_resize_ns{0}, last_painted_sequence{0};
+        std::uint64_t heartbeat_samples{0};
+        double heartbeat_delay_total_ms{0}, heartbeat_delay_max_ms{0};
+        bool update_pending{false};
+        std::uint64_t mailbox_sequence{0};
+    };
+    enum class RenderFailure : std::size_t {
+        kNone, kPathUnavailable, kInvalidFrame, kInvalidPlane, kInvalidFd,
+        kFormatUnsupported, kModifierUnsupported, kModifierQuery, kAllocation,
+        kEglCreate, kTextureAllocation, kTextureBind, kTextureFormat, kShaderDraw,
+        kFence, kDownload, kSoftwareUpload, kResourceRelease, kCount
+    };
+    void BeginRenderStatistics(const mediacore::VideoFrame& frame);
+    void LogRenderStatistics(const char* reason, bool summary);
+    void RecordDrawSubmitted(bool hardware, std::uint64_t sequence) noexcept;
+    bool RecordRenderFailure(RenderFailure reason) noexcept;
+    static const char* RenderFailureName(RenderFailure reason);
+    void AddRenderTiming(RenderTiming RenderCounters::* metric, double elapsed_ms);
+    void AddRenderCount(std::uint64_t RenderCounters::* counter, std::uint64_t amount = 1);
 
     /**
      * @brief 检查并回收已经完成 GPU 读取的硬件帧资源
@@ -380,6 +441,45 @@ private:
 
     std::mutex frame_mutex_;  ///< 互斥锁：保护 current_frame_ 信箱的跨线程读写访问
     std::shared_ptr<mediacore::VideoFrame> current_frame_{nullptr};  ///< 视频帧信箱：始终仅保留最新到达的一帧画面
+    std::uint64_t mailbox_sequence_{0};  // guarded by frame_mutex_
+    // Lifetime counters, also guarded by frame_mutex_. "Claimed" means paintGL
+    // copied the shared_ptr, not that a draw or physical display completed.
+    std::uint64_t mailbox_claimed_sequence_{0};
+    std::uint64_t mailbox_frames_received_{0};
+    std::uint64_t mailbox_superseded_before_paint_frames_{0};
+    GuiDiagnostics gui_diagnostics_{};  // guarded by frame_mutex_
+    GuiDiagnostics gui_diagnostics_last_logged_{};  // GUI thread only
+    std::uint64_t painting_sequence_{0}, last_submitted_sequence_{0};  // GUI thread only
+    RenderCounters render_total_{}, render_interval_{};
+    std::array<std::uint64_t, static_cast<std::size_t>(RenderFailure::kCount)> render_failures_{};
+    std::array<std::chrono::steady_clock::time_point, static_cast<std::size_t>(RenderFailure::kCount)>
+        render_failure_last_log_{};
+    RenderFailure last_render_failure_{RenderFailure::kNone};
+    // Small fixed diagnostic cache preserves the reason of a cached rejection
+    // without allocation or changing the renderer's actual support cache.
+    struct ImportRejection {
+        std::pair<std::uint32_t, std::uint64_t> key{};
+        RenderFailure reason{RenderFailure::kNone};
+    };
+    std::array<ImportRejection, 16> import_rejections_{};
+    std::size_t import_rejection_count_{0};
+    bool render_statistics_active_{false};
+    std::uint64_t render_stream_id_{0}, render_epoch_{0}, render_window_{0}, last_layout_signature_{0};
+    unsigned import_success_logged_mask_{0};
+    int render_width_{0}, render_height_{0};
+    std::chrono::steady_clock::time_point render_started_at_{}, render_interval_at_{}, last_draw_at_{};
+    QTimer gui_diagnostics_timer_;
+    std::chrono::steady_clock::time_point gui_diagnostics_interval_at_{}, gui_heartbeat_at_{};
+    std::chrono::steady_clock::time_point gui_low_paint_last_warn_at_{};
+    struct PaintScope {
+        OpenGLView* view;
+        std::chrono::steady_clock::time_point started_at;
+        ~PaintScope() { view->RecordPaintGLFinished(started_at); }
+    };
+    std::uint64_t lifetime_images_created_{0}, lifetime_images_destroyed_{0};
+    std::uint64_t lifetime_frame_resources_released_{0}, lifetime_resources_deferred_{0};
+    std::uint64_t lifetime_fence_polls_{0}, lifetime_fence_timeouts_{0}, lifetime_fence_signaled_{0};
+    std::size_t lifetime_pending_peak_{0};
     std::unique_ptr<QOpenGLShaderProgram> shader_program_;  ///< 着色器程序对象（承载 YUV 转 RGB 片段着色器）
     std::array<GLuint, 3> texture_ids_{0, 0, 0};  ///< Y/U/V 三个平面的 OpenGL 2D 纹理句柄（0: Y, 1: U, 2: V）
     QOpenGLVertexArrayObject vao_;  ///< 顶点数组对象（VAO），保存顶点属性解析格式
@@ -408,17 +508,6 @@ private:
 
     std::vector<std::unique_ptr<PendingFrameResources>> pending_frame_resources_;
     // 保存已经提交 GPU 绘制、但可能尚未完成读取的硬件帧资源
-
-    std::uint64_t renderer_download_count_{0};
-    std::uint64_t renderer_download_failures_{0};
-    std::uint64_t renderer_download_interval_count_{0};
-    std::uint64_t renderer_download_interval_failures_{0};
-    double renderer_download_total_ms_{0.0};
-    double renderer_download_interval_ms_{0.0};
-    double renderer_download_max_ms_{0.0};
-    double renderer_download_interval_max_ms_{0.0};
-    std::chrono::steady_clock::time_point renderer_statistics_started_at_{};
-    std::chrono::steady_clock::time_point renderer_interval_started_at_{};
 
     // ================ 硬件渲染失败控制 ================
 

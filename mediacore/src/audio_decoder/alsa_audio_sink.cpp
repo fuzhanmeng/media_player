@@ -103,7 +103,7 @@ public:
                  buffer_ms_);
 
         snd_pcm_t* opened_pcm = nullptr;
-        Check(snd_pcm_open(&opened_pcm, device_.c_str(), SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK), "open");
+        Check(snd_pcm_open(&opened_pcm, device_.c_str(), SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK), "snd_pcm_open");
 
         // 只有 Open 成功后才把句柄交给本对象持有
         pcm_ = opened_pcm;
@@ -163,13 +163,17 @@ public:
         const snd_pcm_sframes_t written = snd_pcm_writei(pcm_, data, requested_frames);
 
         if (written < 0) {
+            if (written == -EAGAIN) {
+                ++write_eagain_count_;
+            }
             if (written != -EAGAIN) {
-                Recover(static_cast<int>(written));
+                Recover(static_cast<int>(written), "snd_pcm_writei");
             }
             return 0;
         }
 
         const auto accepted_frames = static_cast<std::size_t>(written);
+        written_new_frames_ += accepted_frames;
         const auto accepted_samples = accepted_frames * PcmFrame::kChannels;
 
         // vector 保存的是 int16_t 采样值，而 ALSA 的 writei 以帧为单位,所以复制范围需要把帧数乘以声道数
@@ -232,21 +236,22 @@ public:
 
         const snd_pcm_state_t state = snd_pcm_state(pcm_);
         if (state == SND_PCM_STATE_DISCONNECTED) {
-            Check(-ENODEV, "device disconnected before drain");
+            Check(-ENODEV, "snd_pcm_state(before_drain)");
         }
 
         // 如果尾部太短、尚未达到自动启动阈值，明确 start 后 drain，避免尾音一直排队
         if (state == SND_PCM_STATE_PREPARED) {
-            Check(snd_pcm_start(pcm_), "start tail");
+            Check(snd_pcm_start(pcm_), "snd_pcm_start(tail)");
         }
 
         const int result = snd_pcm_drain(pcm_);
         if (result == -EAGAIN) {
+            ++drain_eagain_count_;
             return false;
         }
 
         if (result < 0) {
-            Recover(result);
+            Recover(result, "snd_pcm_drain");
             return false;
         }
 
@@ -267,8 +272,8 @@ public:
 
         LOG_DEBUG("ALSA device '{}' discarding {} pending frames for Flush", device_, ShadowFrames());
 
-        Check(snd_pcm_drop(pcm_), "drop");
-        Check(snd_pcm_prepare(pcm_), "prepare after drop");
+        Check(snd_pcm_drop(pcm_), "snd_pcm_drop");
+        Check(snd_pcm_prepare(pcm_), "snd_pcm_prepare(after_drop)");
 
         shadow_samples_.clear();
         submitted_pending_frames_ = 0;
@@ -310,7 +315,7 @@ public:
             // 查询当前 PCM 状态，决定是否尝试硬件暂停
             const snd_pcm_state_t state = snd_pcm_state(pcm_);
             if (state == SND_PCM_STATE_DISCONNECTED) {
-                Check(-ENODEV, "device disconnrcted before pause");
+                Check(-ENODEV, "snd_pcm_state(before_pause)");
             }
 
             // 只有同时满足 PCM 配置声明支持硬件暂停且当前设备状态为 RUNNING，正在运行 才尝试硬件暂停
@@ -334,17 +339,16 @@ public:
 
                 // 硬件暂停失败：常见情况包括设备不支持 pause，或者当前 PCM 状态不允许暂停
                 // 接下来尝试软件暂停，以便仍然可以实现暂停功能
-                LOG_WARN(
-                    "ALSA device '{}' hardware pause failed, code {} ({}); "
-                    "trying software pause",
-                    device_,
-                    result,
-                    snd_strerror(result));
+                LOG_WARN("[ALSA][Fallback] api=snd_pcm_pause(1) return={} error={} device={} state={} "
+                         "delay_last_observed={} delay_available={} avail_last_observed={} avail_available={} "
+                         "playback_paused={} fallback=software_pause",
+                         result, snd_strerror(result), device_, snd_pcm_state_name(state),
+                         last_delay_frames_, has_delay_frames_, last_avail_result_, has_avail_result_, paused_);
 
                 // -ENOSYS：当前 PCM 实现不支持该操作
                 // -EINVAL：参数或当前状态不允许执行该操作
                 if (result != -ENOSYS && result != -EINVAL) {
-                    Recover(result);
+                    Recover(result, "snd_pcm_pause(1)");
                 }
             } else if (state == SND_PCM_STATE_RUNNING) {
                 // 设备正在运行，但是没有声明支持硬件暂停，因此只能用软件暂停
@@ -361,10 +365,10 @@ public:
             // 使用软件暂停：执行到这里说明硬件暂停失败，需要清理 ALSA 队列
 
             // 1. drop
-            Check(snd_pcm_drop(pcm_), "drop for software pause");
+            Check(snd_pcm_drop(pcm_), "snd_pcm_drop(software_pause)");
 
             // 2. prepare：重新准备 PCM，使用设备回到可以接受后续数据的状态
-            Check(snd_pcm_prepare(pcm_), "prepare for software pause");
+            Check(snd_pcm_prepare(pcm_), "snd_pcm_prepare(software_pause)");
 
             // drop 已经清空了设备队列，因此原来的已提交计数不能继续保留
             // shadow_samples_ 保存 100 帧；原先提交给 ALSA 的前 60 帧；drop 后，60帧 被清空
@@ -399,14 +403,13 @@ public:
                 // 硬件恢复失败，记录错误原因，并尝试通过 Recover() 处理
                 // Recover() 可能成功恢复、推迟重试，或者抛出无法处理的错误
 
-                LOG_WARN(
-                    "ALSA device '{}' hardware resume failed, code {} ({}); "
-                    "attempting recovery",
-                    device_,
-                    result,
-                    snd_strerror(result));
+                LOG_WARN("[ALSA][Fallback] api=snd_pcm_pause(0) return={} error={} device={} state={} "
+                         "delay_last_observed={} delay_available={} avail_last_observed={} avail_available={} "
+                         "playback_paused={} fallback=recovery",
+                         result, snd_strerror(result), device_, snd_pcm_state_name(snd_pcm_state(pcm_)),
+                         last_delay_frames_, has_delay_frames_, last_avail_result_, has_avail_result_, paused_);
 
-                Recover(result);
+                Recover(result, "snd_pcm_pause(0)");
             }
 
         } else if (!paused_) {
@@ -461,9 +464,12 @@ public:
         // 设备处于 XRUN/SUSPENDED 等异常状态时 avail_update 会返回负的 errno：
         // 先走一次恢复，再重试；恢复失败则报告 0，由上层按"暂时写不进去"处理
         snd_pcm_sframes_t available = snd_pcm_avail_update(pcm_);
+        last_avail_result_ = available;
+        has_avail_result_ = true;
         if (available < 0) {
-            Recover(static_cast<int>(available));
+            Recover(static_cast<int>(available), "snd_pcm_avail_update");
             available = snd_pcm_avail_update(pcm_);
+            last_avail_result_ = available;
         }
 
         if (available < 0) {
@@ -496,6 +502,7 @@ public:
         }
         text += " paused=" + std::to_string(paused_ ? 1 : 0);
         text += " hw_pause=" + std::to_string(hardware_pause_active_ ? 1 : 0);
+        text += " avail_last_observed=" + (has_avail_result_ ? std::to_string(last_avail_result_) : "unavailable");
         return text;
     }
 
@@ -510,17 +517,17 @@ private:
         // 1. 硬件参数（格式、采样率、period 和 buffer）
         snd_pcm_hw_params_t* hw = nullptr;
         snd_pcm_hw_params_alloca(&hw);
-        Check(snd_pcm_hw_params_any(pcm_, hw), "hw_params_any");
+        Check(snd_pcm_hw_params_any(pcm_, hw), "snd_pcm_hw_params_any");
 
-        Check(snd_pcm_hw_params_set_access(pcm_, hw, SND_PCM_ACCESS_RW_INTERLEAVED), "set_access");
+        Check(snd_pcm_hw_params_set_access(pcm_, hw, SND_PCM_ACCESS_RW_INTERLEAVED), "snd_pcm_hw_params_set_access");
 
-        Check(snd_pcm_hw_params_set_format(pcm_, hw, SND_PCM_FORMAT_S16), "set_format");
+        Check(snd_pcm_hw_params_set_format(pcm_, hw, SND_PCM_FORMAT_S16), "snd_pcm_hw_params_set_format");
 
-        Check(snd_pcm_hw_params_set_channels(pcm_, hw, PcmFrame::kChannels), "set_channels");
+        Check(snd_pcm_hw_params_set_channels(pcm_, hw, PcmFrame::kChannels), "snd_pcm_hw_params_set_channels");
 
         // negotiated_rate 协商采样率
         unsigned int negotiated_rate = PcmFrame::kSampleRate;
-        Check(snd_pcm_hw_params_set_rate_near(pcm_, hw, &negotiated_rate, nullptr), "set_rate_near");
+        Check(snd_pcm_hw_params_set_rate_near(pcm_, hw, &negotiated_rate, nullptr), "snd_pcm_hw_params_set_rate_near");
 
         // 上游 PcmFrame 和时间线都以 固定 48 kHz 为契约，因此不能接收 44.1 kHz
         if (negotiated_rate != PcmFrame::kSampleRate) {
@@ -538,22 +545,22 @@ private:
         snd_pcm_uframes_t requested_period_frames =
             std::min<snd_pcm_uframes_t>(static_cast<snd_pcm_uframes_t>(kMaxReplayFrames), requested_buffer_frames / 2);
         Check(snd_pcm_hw_params_set_period_size_near(pcm_, hw, &requested_period_frames, nullptr),
-              "set_period_size_near");
+              "snd_pcm_hw_params_set_period_size_near");
 
         // buffer 是总容量，near 表示请求尽量接近的目标值，ALSA 可能回写另一个实际值
         snd_pcm_uframes_t negotiated_buffer_frames = requested_buffer_frames;
-        Check(snd_pcm_hw_params_set_buffer_size_near(pcm_, hw, &negotiated_buffer_frames), "set_buffer_size_near");
+        Check(snd_pcm_hw_params_set_buffer_size_near(pcm_, hw, &negotiated_buffer_frames), "snd_pcm_hw_params_set_buffer_size_near");
 
         // 适配选择出的硬件参数，ALSA 会更新 hw 参数对象以反映最终选中的配置
-        Check(snd_pcm_hw_params(pcm_, hw), "hw_params");
+        Check(snd_pcm_hw_params(pcm_, hw), "snd_pcm_hw_params");
 
         // 必须读取最终 period 与 buffer，而不是把 set_*_near 的请求/中间值当作最终的结果
         snd_pcm_uframes_t actual_buffer_frames = 0;
-        Check(snd_pcm_hw_params_get_buffer_size(hw, &actual_buffer_frames), "get_buffer_size");
+        Check(snd_pcm_hw_params_get_buffer_size(hw, &actual_buffer_frames), "snd_pcm_hw_params_get_buffer_size");
 
         snd_pcm_uframes_t actual_period_frames = 0;
         int period_direction = 0;
-        Check(snd_pcm_hw_params_get_period_size(hw, &actual_period_frames, &period_direction), "get_period_size");
+        Check(snd_pcm_hw_params_get_period_size(hw, &actual_period_frames, &period_direction), "snd_pcm_hw_params_get_period_size");
 
         hardware_pause_supported_ = (snd_pcm_hw_params_can_pause(hw) != 0);
 
@@ -564,21 +571,21 @@ private:
         // 2. 软件参数（起播阈值、可用空间阈值）
         snd_pcm_sw_params_t* sw = nullptr;
         snd_pcm_sw_params_alloca(&sw);
-        Check(snd_pcm_sw_params_current(pcm_, sw), "sw_param_current");
+        Check(snd_pcm_sw_params_current(pcm_, sw), "snd_pcm_sw_params_current");
 
         // 达到 start_threshold 后 ALSA 自动起播，取三者最小值，避免必须填满整个 buffer
         //  1) 实际 buffer 容量；2) 两个实际 period；3) 用户最初请求的 buffer 帧数。
         const snd_pcm_uframes_t start_threshold =
             std::min({actual_buffer_frames, actual_period_frames * 2, requested_buffer_frames});
-        Check(snd_pcm_sw_params_set_start_threshold(pcm_, sw, start_threshold), "start_threshold");
+        Check(snd_pcm_sw_params_set_start_threshold(pcm_, sw, start_threshold), "snd_pcm_sw_params_set_start_threshold");
 
         // avail_min 表示可用/空闲帧达到多少时，等待机制可以通知应用，它不是起播时阈值，当前类不使用
         // ALSA poll/wait，而是由上游周期性调用公共方法并执行非阻塞写入
-        Check(snd_pcm_sw_params_set_avail_min(pcm_, sw, actual_period_frames), "avail_min");
-        Check(snd_pcm_sw_params(pcm_, sw), "sw_params");
+        Check(snd_pcm_sw_params_set_avail_min(pcm_, sw, actual_period_frames), "snd_pcm_sw_params_set_avail_min");
+        Check(snd_pcm_sw_params(pcm_, sw), "snd_pcm_sw_params");
 
         // 让配置后的 PCM 进入 PREPARED 状态，此时可以写入 PCM 音频，但是不一定开始播放
-        Check(snd_pcm_prepare(pcm_), "prepared");
+        Check(snd_pcm_prepare(pcm_), "snd_pcm_prepare");
 
         const double actual_buffer_ms = static_cast<double>(actual_buffer_frames) * 1000.0 / negotiated_rate;
         const double actual_period_ms = static_cast<double>(actual_period_frames) * 1000.0 / negotiated_rate;
@@ -597,6 +604,10 @@ private:
             actual_period_frames,
             actual_period_ms,
             hardware_pause_supported_);
+        LOG_INFO("[ALSA][Init] device={} pcm_type={} state={} rate={} channels={} "
+                 "buffer_frames={} period_frames={} nonblocking=true",
+                 device_, snd_pcm_type_name(snd_pcm_type(pcm_)), snd_pcm_state_name(snd_pcm_state(pcm_)),
+                 negotiated_rate, PcmFrame::kChannels, actual_buffer_frames, actual_period_frames);
 
         // 某些构建配置会将日志宏编译为空；显式标记这两个派生值已被有意计算。
         (void)actual_buffer_ms;
@@ -626,16 +637,16 @@ private:
 
         // 设备断开是独立的生命周期故障，不应当作普通 XRUN 无限重试
         if (state == SND_PCM_STATE_DISCONNECTED) {
-            Check(-ENODEV, "PCM disconnected");
+            Check(-ENODEV, "snd_pcm_state");
         }
 
         if (state == SND_PCM_STATE_SUSPENDED) {
-            Recover(-ESTRPIPE);
+            Recover(-ESTRPIPE, "snd_pcm_state");
             return;
         }
 
         if (state == SND_PCM_STATE_XRUN) {
-            Recover(-EPIPE);
+            Recover(-EPIPE, "snd_pcm_state");
             return;
         }
 
@@ -654,9 +665,14 @@ private:
 
         snd_pcm_sframes_t device_delay_frames = 0;
         const int result = snd_pcm_delay(pcm_, &device_delay_frames);
+        last_delay_result_ = result;
+        if (result >= 0) {
+            last_delay_frames_ = device_delay_frames;
+            has_delay_frames_ = true;
+        }
         if (result < 0) {
             // 查询状态与查询 delay 不是原子操作，故即使前面看到正常状态，这里仍需处理错误。
-            Recover(result);
+            Recover(result, "snd_pcm_delay");
             return;
         }
 
@@ -667,17 +683,20 @@ private:
 
         if (remaining_device_frames > submitted_pending_frames_ &&
             remaining_device_frames - submitted_pending_frames_ > kDelayMismatchToleranceFrames) {
+            ++delay_mismatch_count_;
             const auto now = std::chrono::steady_clock::now();
             if (now - last_delay_mismatch_log_ >= kDelayMismatchLogInterval) {
                 last_delay_mismatch_log_ = now;
-                LOG_WARN("ALSA device '{}' reports {} delay frames, above {} submitted frames "
-                         "(shadow {}, excess {}, state {}); tracking unchanged",
+                LOG_WARN("[ALSA][DelayMismatch] api=snd_pcm_delay device={} return={} delay={} submitted={} "
+                         "shadow={} excess={} state={} avail_last_observed={} avail_available={} "
+                         "playback_paused={} total_observations={} tracking=unchanged",
                          device_,
+                         result,
                          remaining_device_frames,
                          submitted_pending_frames_,
                          ShadowFrames(),
                          remaining_device_frames - submitted_pending_frames_,
-                         snd_pcm_state_name(state));
+                         snd_pcm_state_name(state), last_avail_result_, has_avail_result_, paused_, delay_mismatch_count_);
             }
         }
 
@@ -752,8 +771,11 @@ private:
             const snd_pcm_sframes_t written = snd_pcm_writei(pcm_, replay_data, chunk);
 
             if (written < 0) {
+                if (written == -EAGAIN) {
+                    ++write_eagain_count_;
+                }
                 if (written != -EAGAIN) {
-                    Recover(static_cast<int>(written));
+                    Recover(static_cast<int>(written), "snd_pcm_writei");
                 }
                 // 负 errno 不是写入帧数；设备暂时写不下，留到下一次调用重试
                 return;
@@ -765,6 +787,7 @@ private:
 
             submitted_pending_frames_ += static_cast<std::size_t>(written);
             replayed_this_call += static_cast<std::size_t>(written);
+            written_replay_frames_ += static_cast<std::size_t>(written);
         }
     }
 
@@ -777,10 +800,32 @@ private:
      * 若暂时返回 -EAGAIN，将恢复推迟后的调用，其他恢复失败则 prepare 并把副本整体转为待重送
      * 其他错误交由 Check() 转为异常
      */
-    void Recover(int error) {
+    void LogRecoverableError(const char* api, int error) {
+        ++recovery_error_observations_;
+        if (error == -EPIPE) ++xrun_observations_;
+        if (error == -ESTRPIPE) ++suspend_observations_;
+        const auto now = std::chrono::steady_clock::now();
+        if (recovery_error_observations_ == 1 || error != last_recovery_error_ ||
+            now - last_recovery_log_ >= std::chrono::seconds(2)) {
+            last_recovery_error_ = error;
+            last_recovery_log_ = now;
+            LOG_WARN("[ALSA][Recovery] api={} return={} error={} device={} state={} "
+                     "delay_last_observed={} delay_available={} delay_query_return={} "
+                     "avail_last_observed={} avail_available={} playback_paused={} submitted={} shadow={} "
+                     "error_observations={} xrun_observations={} suspend_observations={}",
+                     api, error, snd_strerror(error), device_,
+                     pcm_ != nullptr ? snd_pcm_state_name(snd_pcm_state(pcm_)) : "CLOSED",
+                     last_delay_frames_, has_delay_frames_, last_delay_result_, last_avail_result_, has_avail_result_,
+                     paused_, submitted_pending_frames_, ShadowFrames(), recovery_error_observations_,
+                     xrun_observations_, suspend_observations_);
+        }
+    }
+
+    void Recover(int error, const char* api) {
+        LogRecoverableError(api, error);
         // 1. 设备欠载
         if (error == -EPIPE) {
-            LOG_WARN(
+            LOG_DEBUG(
                 "ALSA device '{}' underrun: discarding {} submitted pending frames;"
                 "retaining {} frames waiting for replay",
                 device_,
@@ -792,7 +837,7 @@ private:
             // 上层算出的 played = next_frame_ - ShadowFrames() 正好等于真实播放位置。
             // 若在此处额外让上层回退 next_frame_，会凭空补出一段静音并把后续音频整体后移。
             RemoveSubmittedPrefix(submitted_pending_frames_);
-            Check(snd_pcm_prepare(pcm_), "prepare after underrun");
+            Check(snd_pcm_prepare(pcm_), "snd_pcm_prepare(after_underrun)");
             suspend_warning_logged_ = false;
             return;
         }
@@ -815,18 +860,18 @@ private:
             }
 
             if (resumed == -EAGAIN) {
+                ++resume_eagain_count_;
                 // 设备仍未恢复；不在这里阻塞循环，以便上层继续处理停止等控制请求。
                 return;
             }
 
-            LOG_WARN(
-                "ALSA device '{}' resume failed, code {} ({});"
-                "prepare and scheduling retained audio for replay",
-                device_,
-                resumed,
-                snd_strerror(resumed));
+            LOG_WARN("[ALSA][Fallback] api=snd_pcm_resume return={} error={} device={} state={} "
+                     "delay_last_observed={} delay_available={} avail_last_observed={} avail_available={} "
+                     "playback_paused={} fallback=prepare_and_replay",
+                     resumed, snd_strerror(resumed), device_, snd_pcm_state_name(snd_pcm_state(pcm_)),
+                     last_delay_frames_, has_delay_frames_, last_avail_result_, has_avail_result_, paused_);
 
-            Check(snd_pcm_prepare(pcm_), "prepare after suspend");
+            Check(snd_pcm_prepare(pcm_), "snd_pcm_prepare(after_suspend)");
 
             // prepare 已重置设备队列，保留 shadow，后续由 PumpReplay 从头重新提交
             submitted_pending_frames_ = 0;
@@ -834,7 +879,7 @@ private:
             return;
         }
 
-        Check(error, "PCM I/O");
+        Check(error, api);
     }
 
     /**
@@ -852,7 +897,13 @@ private:
 
         // 日志失败不能阻止异常抛出
         try {
-            LOG_DEBUG("{}", message);
+            LOG_ERROR("[ALSA][Error] api={} return={} error={} device={} state={} "
+                      "delay_last_observed={} delay_available={} delay_query_return={} "
+                      "avail_last_observed={} avail_available={} playback_paused={} submitted={} shadow={}",
+                      operation, result, snd_strerror(result), device_,
+                      pcm_ != nullptr ? snd_pcm_state_name(snd_pcm_state(pcm_)) : "CLOSED",
+                      last_delay_frames_, has_delay_frames_, last_delay_result_, last_avail_result_, has_avail_result_,
+                      paused_, submitted_pending_frames_, ShadowFrames());
         } catch (...) {
             // 忽略日志异常
         }
@@ -878,6 +929,18 @@ private:
             return;
         }
 
+        try {
+            LOG_INFO("[ALSA][Summary] scope=pcm_session device={} recovery_error_observations={} "
+                     "xrun_observations={} suspend_observations={} delay_mismatch_observations={} "
+                     "write_eagain={} drain_eagain={} resume_eagain={} "
+                     "written_new_frames={} written_replay_frames={} pending_frames={}",
+                     device_, recovery_error_observations_, xrun_observations_, suspend_observations_,
+                     delay_mismatch_count_, write_eagain_count_, drain_eagain_count_, resume_eagain_count_,
+                     written_new_frames_, written_replay_frames_, ShadowFrames());
+        } catch (...) {
+            // Diagnostic failure must not change the no-throw device cleanup contract.
+        }
+
         (void)snd_pcm_drop(pcm_);
         (void)snd_pcm_close(pcm_);
         pcm_ = nullptr;
@@ -893,6 +956,13 @@ private:
         hardware_pause_active_ = false;
         paused_ = false;
         suspend_warning_logged_ = false;
+        has_delay_frames_ = has_avail_result_ = false;
+        last_delay_frames_ = last_avail_result_ = 0;
+        last_delay_result_ = last_recovery_error_ = 0;
+        recovery_error_observations_ = xrun_observations_ = suspend_observations_ = delay_mismatch_count_ = 0;
+        write_eagain_count_ = drain_eagain_count_ = resume_eagain_count_ = 0;
+        written_new_frames_ = written_replay_frames_ = 0;
+        last_recovery_log_ = {};
     }
 
 private:
@@ -908,6 +978,24 @@ private:
     bool hardware_pause_active_{false};  ///< 本对象是否成功请求了硬件暂停
     bool paused_{false};  ///< 本对象的逻辑暂停状态
     bool suspend_warning_logged_{false};  ///< 当前挂起恢复过程是否已经打印过警告，防止刷屏
+    // Owned exclusively by the audio sink thread. Values are cached observations,
+    // not an atomic ALSA status snapshot; diagnostics issue no extra delay/avail queries.
+    snd_pcm_sframes_t last_delay_frames_{0};
+    snd_pcm_sframes_t last_avail_result_{0};
+    int last_delay_result_{0};
+    bool has_delay_frames_{false};
+    bool has_avail_result_{false};
+    std::uint64_t recovery_error_observations_{0};
+    std::uint64_t xrun_observations_{0};
+    std::uint64_t suspend_observations_{0};
+    std::uint64_t delay_mismatch_count_{0};
+    std::uint64_t write_eagain_count_{0};
+    std::uint64_t drain_eagain_count_{0};
+    std::uint64_t resume_eagain_count_{0};
+    std::uint64_t written_new_frames_{0};
+    std::uint64_t written_replay_frames_{0};
+    int last_recovery_error_{0};
+    std::chrono::steady_clock::time_point last_recovery_log_{};
 };
 }  // namespace
 

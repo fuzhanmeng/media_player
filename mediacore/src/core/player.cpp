@@ -568,6 +568,7 @@ void Player::Stop() {
 
 /** @brief 异步提交 Seek 请求；参数单位为微秒，合法性由控制线程检查 */
 void Player::Seek(std::int64_t target_us) {
+    LOG_INFO("[Seek][Request] stage=player_api target_us={}", target_us);
     control_->Seek(target_us);
 }
 
@@ -1222,6 +1223,9 @@ void Player::Control::HandleStop() {
  * 不改变上一轮已经确定的完成后播放意图
  */
 void Player::Control::HandleSeek(std::int64_t target_position_us) {
+    LOG_INFO("[Seek][Decision] stage=control_received target_us={} state={} pipeline={} epoch={}",
+             target_position_us, PlaybackStateToString(state_.load()), pipeline_ != nullptr,
+             pipeline_ ? pipeline_->GetCurrentEpoch() : 0);
     // 1. pipeline 无效时直接返回
     if (!pipeline_) {
         LOG_WARN("Player seek to {} us ignored,: no pipeline", target_position_us);
@@ -1290,6 +1294,9 @@ bool Player::Control::StartSeek(std::int64_t target_position_us, bool should_res
         target_position_us = std::min(target_position_us, media_duration_us);
     }
 
+    LOG_INFO("[Seek][Start] stage=control_accepted accepted=true target_us={} old_epoch={} resume={}",
+             target_position_us, pipeline_->GetCurrentEpoch(), should_resume_after_seek);
+
     // 4. 先生成新 epoch 并同步给时间轴，再由 Pipeline 请求 Demuxer 定位
     //    不能在 Seek 前读取 GetCurrentEpoch()：该值还是上一轮，Seek 内部才会递增
     //    也不能等 Seek 返回再更新时间轴：Demuxer 可能已经发出了新 epoch 的 Reset
@@ -1302,6 +1309,7 @@ bool Player::Control::StartSeek(std::int64_t target_position_us, bool should_res
         timeline->BeginSeek(epoch, target_position_us);
     });
     if (!seek_epoch.has_value()) {
+        LOG_ERROR("[Seek][Start] accepted=false stage=pipeline target_us={}", target_position_us);
         // 请求未被接受时清理本轮状态，不能继续等待完成事件。
         HandleStop();
         SetState(PlaybackState::kError);
@@ -1310,6 +1318,7 @@ bool Player::Control::StartSeek(std::int64_t target_position_us, bool should_res
     // 暂时放行节点，使暂停状态下的节点也能处理流重置、预滚数据和就绪通知
     pipeline_->Resume();
 
+    LOG_INFO("[Seek][Start] stage=pipeline_accepted epoch={} target_us={}", *seek_epoch, target_position_us);
     SetState(PlaybackState::kSeeking);
     return true;
 }
