@@ -163,3 +163,8 @@ CheckOptions:
 
   - key: readability-identifier-naming.MacroDefinitionCase
     value: UPPER_CASE
+
+  # 允许通过 (void) 明确表示有意忽略函数返回值。
+  # 例如： (void)codec_ctx_owner.release();
+  - key: bugprone-unused-return-value.AllowCastToVoid
+    value: 'true'

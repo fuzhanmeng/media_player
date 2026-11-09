@@ -116,7 +116,7 @@ public:
     /**
      * @brief 返回包时长，单位微秒，未知时无值
      */
-    std::optional<std::int64_t> GetDurationUs() { return duration_us_; }
+    std::optional<std::int64_t> GetDurationUs() const { return duration_us_; }
 
     /**
      * @brief 获取世代号

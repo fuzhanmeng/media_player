@@ -72,6 +72,12 @@ class AiMediaPlayer(ConanFile):
 
         # Qt 体量巨大，必须裁剪：不裁会编译数小时并拖入大量无关依赖
         "qt/*:shared": True,          # 动态链接 Qt（静态链接有 LGPL 授权约束且体积爆炸）
+        # 使用 Qt 的 xcb EGL 集成，使 QOpenGLWidget 创建 EGL context；
+        # 运行时通过 QT_XCB_GL_INTEGRATION=xcb_egl 选择该后端，供
+        # VA-API DMA-BUF 通过 EGLImage 导入到 Qt 当前 EGL context。
+        "qt/*:opengl": "desktop",
+        "qt/*:with_egl": True,
+        "qt/*:with_x11": True,
         "qt/*:qtwebengine": False,    # 关闭 WebEngine（Chromium 内核，数 GB，不用）
         "qt/*:qtwebchannel": False,
         "qt/*:qtwebsockets": False,

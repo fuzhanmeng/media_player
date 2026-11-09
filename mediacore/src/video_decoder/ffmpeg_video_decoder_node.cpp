@@ -298,6 +298,8 @@ TickResult FfmpegVideoDecoderNode::HandleEndOfStream(const EndOfStream& eos) {
         return frame_result;
     }
 
+    video_decoder_->LogStatistics("eos", true);
+
     if (!IsCurrentEpoch(output_epoch_)) {
         return TickResult::kContinue;
     }

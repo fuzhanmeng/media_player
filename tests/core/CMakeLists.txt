@@ -63,3 +63,74 @@ add_test(
 )
 
 set_tests_properties(core.player_controls PROPERTIES TIMEOUT 15)
+
+# Audio clock completion must not be overwritten by a late device update.
+add_executable(playback_timeline_test
+    playback_timeline_test.cpp
+)
+
+target_compile_features(playback_timeline_test PRIVATE cxx_std_17)
+target_include_directories(playback_timeline_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../mediacore/src
+)
+
+set_target_properties(playback_timeline_test PROPERTIES
+    AUTOMOC OFF
+    AUTOUIC OFF
+    AUTORCC OFF
+)
+
+target_link_libraries(playback_timeline_test PRIVATE
+    mediacore
+)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(playback_timeline_test PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
+endif()
+
+add_test(
+    NAME core.playback_timeline
+    COMMAND playback_timeline_test
+)
+
+set_tests_properties(core.playback_timeline PROPERTIES TIMEOUT 5)
+
+# A full audio device remains an error during playback, but paused wall-clock
+# time must not count toward the AudioSinkNode stall watchdog.
+add_executable(audio_sink_watchdog_test
+    audio_sink_watchdog_test.cpp
+)
+
+target_compile_features(audio_sink_watchdog_test PRIVATE cxx_std_17)
+target_include_directories(audio_sink_watchdog_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../mediacore/src
+)
+
+set_target_properties(audio_sink_watchdog_test PROPERTIES
+    AUTOMOC OFF
+    AUTOUIC OFF
+    AUTORCC OFF
+)
+
+target_link_libraries(audio_sink_watchdog_test PRIVATE
+    mediacore
+)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(audio_sink_watchdog_test PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
+endif()
+
+add_test(
+    NAME core.audio_sink_watchdog
+    COMMAND audio_sink_watchdog_test
+)
+
+set_tests_properties(core.audio_sink_watchdog PROPERTIES TIMEOUT 10)

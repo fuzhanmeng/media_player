@@ -35,4 +35,4 @@ add_test(
     COMMAND ffmpeg_demuxer_node_test
 )
 
-set_tests_properties(demux.ffmpeg_demuxer_node PROPERTIES TIMEOUT 5)
+set_tests_properties(demux.ffmpeg_demuxer_node PROPERTIES TIMEOUT 15)

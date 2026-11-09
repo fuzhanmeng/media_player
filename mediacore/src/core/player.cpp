@@ -45,6 +45,7 @@ namespace mediacore {
  * @brief 创建一次后台媒体打开任务
  * @param media_uri 媒体文件路径或网络 URL；任务会保存自己的副本
  * @param open_sequence 本次 Open 的编号，用于过滤被后续 Open 替代的旧任务
+ * @param hw_accel 视频解码硬件加速策略；任务保存自己的副本，在后台线程里交给视频解码器 Open
  * @param on_open_finished 打开结束后的通知回调；只通知控制线程，不创建 Pipeline
  *
  * 线程执行顺序：
@@ -54,8 +55,11 @@ namespace mediacore {
  *
  * 解码器在这里打开，是为了避免 avcodec_open2 等耗时调用阻塞 Player 控制线程的邮箱。
  */
-OpenTask::OpenTask(std::string media_uri, std::uint64_t open_sequence, std::function<void()> on_open_finished)
-    : media_uri_(std::move(media_uri)), open_sequence_(open_sequence) {
+OpenTask::OpenTask(std::string media_uri,
+                   std::uint64_t open_sequence,
+                   HardwareAccel hw_accel,
+                   std::function<void()> on_open_finished)
+    : media_uri_(std::move(media_uri)), open_sequence_(open_sequence), hw_accel_(hw_accel) {
     // 打开操作可能长时间阻塞；放到独立线程后，控制线程仍能接收 Stop 或新的 Open
     open_thread_ = std::thread([this, on_open_finished = std::move(on_open_finished)] {
         try {
@@ -69,11 +73,11 @@ OpenTask::OpenTask(std::string media_uri, std::uint64_t open_sequence, std::func
 
                 // 如果有视频流
                 if (info.video_stream_.has_value()) {
-
                     // 打开视频解码器
-                    auto decoder_open = FfmpegVideoDecoder::Open(
-                        std::move(open_result_.video_codec_parameters_),
-                        info.video_stream_->time_base_);
+                    auto decoder_open = FfmpegVideoDecoder::Open(std::move(open_result_.video_codec_parameters_),
+                                                                 info.video_stream_->time_base_,
+                                                                 hw_accel_,
+                                                                 info.video_stream_->frame_rate_);
                     if (!decoder_open.Succeeded()) {
                         media_error_ = decoder_open.error_;
                     } else {
@@ -83,11 +87,9 @@ OpenTask::OpenTask(std::string media_uri, std::uint64_t open_sequence, std::func
 
                 // 如果有音频流
                 if (!media_error_.HasError() && info.audio_stream_.has_value()) {
-
                     // 打开音频解码器
-                    auto decoder_open = FfmpegAudioDecoder::Open(
-                        std::move(open_result_.audio_codec_parameters_),
-                        info.audio_stream_->time_base_);
+                    auto decoder_open = FfmpegAudioDecoder::Open(std::move(open_result_.audio_codec_parameters_),
+                                                                 info.audio_stream_->time_base_);
                     if (!decoder_open.Successed()) {
                         media_error_ = decoder_open.media_error_;
                     } else {
@@ -466,6 +468,14 @@ private:
     AudioSinkFactory audio_sink_factory_;
     std::chrono::steady_clock::time_point seek_deadline_{};  ///< 当前 Seek 的超时时刻；仅在 kSeeking 状态下检查
 
+    /**
+     * @brief 渲染端硬件能力标志，与 OpenGLView 和 FfmpegVideoDecoder 共享
+     * @details
+     * Control 构造时创建，AttachDisplayView 时注入显示端，BuildPipeline 时注入解码器
+     * 显示端 initializeGL 后写入真实值，解码器每帧读取决定是否导出 DMA-BUF
+     */
+    std::shared_ptr<std::atomic<bool>> hardware_render_capability_{std::make_shared<std::atomic<bool>>(false)};
+
     std::atomic<PlaybackState> state_{PlaybackState::kIdle};  ///< 对外发布的状态；其他线程可原子读取
     bool resume_after_seek_{false};  ///< 本轮 Seek 完成后是否恢复播放
     bool play_after_open_{false};  ///< Open 期间收到的最终播放意图，打开完成后应用
@@ -618,6 +628,12 @@ Player::Control::Control(PlayerConfig config, AudioSinkFactory audio_sink_factor
 /** @brief 通过分发器绑定显示对象；可能等待此前的显示回调退出 */
 void Player::Control::AttachDisplayView(IVideoSink* display_sink) {
     video_sink_dispatcher_->Attach(display_sink);
+
+    // 将共享的硬件渲染能力标志注入显示端，display_sink 在 initializeGL 后会把 EGL 结果写入该标志
+    // 解码器通过同一个 atomic<bool> 决定是否导出 DMA-BUF
+    if (display_sink) {
+        display_sink->SetHardwareRenderCapability(hardware_render_capability_);
+    }
 }
 
 /** @brief 通过分发器解绑显示对象，并等待其在途回调结束 */
@@ -717,14 +733,13 @@ void Player::Control::ControlLoop() noexcept {
                     lock, next_wakeup_time, [this]() { return !mailbox_.empty() || shutting_down_.load(); });
 
                 shutdown_requested = shutting_down_.load(std::memory_order_acquire);
-                const bool seek_deadline_reached = !shutdown_requested && seeking && pipeline_ &&
-                    std::chrono::steady_clock::now() >= seek_deadline_;
+                const bool seek_deadline_reached =
+                    !shutdown_requested && seeking && pipeline_ && std::chrono::steady_clock::now() >= seek_deadline_;
 
                 if (!seek_deadline_reached) {
                     // 已不在超时判定中：丢弃上一轮留下的配额，下次超时重新快照。
                     messages_to_drain_before_timeout.reset();
-                } else if (!messages_to_drain_before_timeout ||
-                           timeout_pipeline_generation != pipeline_generation_ ||
+                } else if (!messages_to_drain_before_timeout || timeout_pipeline_generation != pipeline_generation_ ||
                            timeout_seek_epoch != pipeline_->GetCurrentEpoch()) {
                     // 截取超时检查开始时的队列长度；后续新消息不能无限推迟超时处理。
                     messages_to_drain_before_timeout = mailbox_.size();
@@ -734,8 +749,8 @@ void Player::Control::ControlLoop() noexcept {
 
                 // 只有超时前已排队的消息全部处理完，才执行一次 Seek 超时处理；
                 // 新到达的消息不计入配额，避免它们无限推迟失败判定。
-                seek_timeout_reached = seek_deadline_reached && messages_to_drain_before_timeout &&
-                    *messages_to_drain_before_timeout == 0;
+                seek_timeout_reached =
+                    seek_deadline_reached && messages_to_drain_before_timeout && *messages_to_drain_before_timeout == 0;
 
                 // Seeking 超时后先处理超时前已经排队的消息；其他状态直接按 FIFO 取消息。
                 // 配额为 0 时不进入此分支，因此不会对 size_t 做下溢递减。
@@ -768,9 +783,8 @@ void Player::Control::ControlLoop() noexcept {
                 // HandleNodeError 内部会先 StopCurrentPipeline 再改状态，因此下一轮
                 // seek_deadline_reached 不再成立，同一次超时不会反复触发。
                 const auto seek_epoch = pipeline_->GetCurrentEpoch();
-                LOG_ERROR("Player seek timed out after {} ms at epoch {}",
-                          config_.sync_.seek_timeout_.count(),
-                          seek_epoch);
+                LOG_ERROR(
+                    "Player seek timed out after {} ms at epoch {}", config_.sync_.seek_timeout_.count(), seek_epoch);
                 HandleNodeError(pipeline_generation_,
                                 seek_epoch,
                                 MediaError::FromInternal("dual seek", "timed out waiting for all tracks"),
@@ -874,7 +888,7 @@ void Player::Control::HandleOpen(const std::string& uri) {
     const std::uint64_t open_sequence = ++next_open_sequence_;
 
     // 打开线程完成后只投递通知；Pipeline 的创建仍由控制线程完成
-    open_task_ = std::make_unique<OpenTask>(uri, open_sequence, [this, open_sequence]() {
+    open_task_ = std::make_unique<OpenTask>(uri, open_sequence, config_.decode_.hw_accel_, [this, open_sequence]() {
         Message message;
         message.type_ = MsgType::kEvtOpenFinished;
         message.open_sequence_ = open_sequence;
@@ -1001,8 +1015,9 @@ bool Player::Control::BuildPipeline(FfmpegDemuxerOpenResult open_result,
         auto synced_video_frame_link = new_pipeline->CreateLink<StreamItem<VideoFrame>>(1);
 
         // 创建视频解码节点
-        auto& video_decoder_node =
-            new_pipeline->EmplaceNode<FfmpegVideoDecoderNode>(std::move(video_decoder));
+        // 注入硬件渲染能力标志：解码器读取它决定是否导出 DMA-BUF,避免在渲染端 EGL 不可用时白做导出再由 GUI 线程下载
+        video_decoder->SetHardwareRenderCapability(hardware_render_capability_);
+        auto& video_decoder_node = new_pipeline->EmplaceNode<FfmpegVideoDecoderNode>(std::move(video_decoder));
 
         // 缺少有效帧率时按 25 fps（每帧约 40 ms）估算，仅用于缺失 PTS 和最后一帧结束时间的兜底
         const auto video_frame_rate = media_info.video_stream_->frame_rate_;
@@ -1040,8 +1055,7 @@ bool Player::Control::BuildPipeline(FfmpegDemuxerOpenResult open_result,
             new_pipeline->CreateLink<StreamItem<PcmFrame>>(config_.decode_.audio_frame_capacity_);
 
         // 创建音频解码节点
-        auto& audio_decoder_node =
-            new_pipeline->EmplaceNode<FfmpegAudioDecoderNode>(std::move(audio_decoder));
+        auto& audio_decoder_node = new_pipeline->EmplaceNode<FfmpegAudioDecoderNode>(std::move(audio_decoder));
 
         // 在控制线程中创建 IAudioSink 对象；AudioSinkNode 接管对象后，会在自己的工作线程里调用 Open()，
         // 因此这里是"对象构造失败"的唯一出口，声卡真正打开失败则在节点运行阶段暴露。

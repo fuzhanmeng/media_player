@@ -145,6 +145,11 @@ TickResult AudioSinkNode::ProcessPendingControl() {
 
         // 3. 把播放意图同步给硬件：跳转定位期间也必须保持静音，否则会播出旧位置的声音
         if (is_opened_) {
+            // watchdog measures active playback time only. Hardware pause freezes queued audio;
+            // software pause drops it and replays the preserved samples on resume. In both
+            // cases no device consumption is expected while paused, so start a fresh stall
+            // interval after every playback-control transition instead of counting that time.
+            stall_since_.reset();
             sink_->Pause(!state.playing_ | state.seeking_ | state.stopped_);
         }
 

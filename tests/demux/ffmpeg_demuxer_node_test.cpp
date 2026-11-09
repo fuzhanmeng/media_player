@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -18,6 +19,12 @@
 #include <string>
 #include <system_error>
 #include <utility>
+#include <variant>
+#include <vector>
+
+#include "av_sync/playback_timeline.h"
+#include "core/pipeline.h"
+#include "demux/ffmpeg_demuxer_node.h"
 
 extern "C" {
 #include <libavcodec/codec_id.h>
@@ -35,6 +42,7 @@ constexpr int kFrameCount = 3;
 constexpr int kFrameRate = 25;
 constexpr std::size_t kFrameSize = kWidth * kHeight * 3 / 2;
 constexpr std::int64_t kFrameDurationUs = 1000000 / kFrameRate;
+constexpr auto kPrerollTestTimeout = std::chrono::seconds(2);
 
 void Require(bool condition, const std::string& message) {
     if (!condition) {
@@ -233,6 +241,108 @@ void SharedStopInterruptsReadAndSeek(const TemporaryY4m& media) {
     Require(!seek.error_.HasError(), "stop interruption should not report an error");
 }
 
+/**
+ * @brief 双路 Seek replay 只跳过已交付前缀，之后的包仍按读取顺序交付一次并到达 EOS。
+ * @details 使用无音频 Y4M 和双输出 Pipeline，手动报告轨道 ready 来确定性驱动三阶段流程。
+ */
+void SeekReplaySkipsOnlyDeliveredPrefix(const TemporaryY4m& media) {
+    using namespace std::chrono_literals;
+    using mediacore::EndOfStream;
+    using mediacore::Packet;
+    using mediacore::PacketStreamItem;
+    using mediacore::PlaybackTrack;
+    using mediacore::StreamReset;
+
+    auto opened = OpenVideo(media);
+    auto timeline = std::make_shared<mediacore::PlaybackTimeline>(true, true);
+    mediacore::Pipeline pipeline;
+    auto video_output = pipeline.CreateLink<PacketStreamItem>(1);
+    auto audio_output = pipeline.CreateLink<PacketStreamItem>(1);
+    auto& source = pipeline.EmplaceNode<mediacore::FfmpegDemuxerNode>(std::move(opened.demuxer_), timeline);
+    Require(source.ConnectVideoOutput(video_output), "failed to connect replay-test video output");
+    Require(source.ConnectAudioOutput(audio_output), "failed to connect replay-test audio output");
+    pipeline.SetSeekSource(&source);
+    Require(pipeline.Start() == mediacore::PipelineStartResult::kStarted, "failed to start replay-test pipeline");
+
+    const auto requested_epoch = pipeline.Seek(0, [&](std::uint64_t epoch) { timeline->BeginSeek(epoch, 0); });
+    Require(requested_epoch.has_value(), "replay-test seek was not accepted");
+    const std::uint64_t epoch = *requested_epoch;
+    Require(pipeline.Resume(), "failed to resume replay-test pipeline");
+
+    auto video_reset = video_output->ReceiveFor(kPrerollTestTimeout);
+    auto audio_reset = audio_output->ReceiveFor(kPrerollTestTimeout);
+    Require(video_reset && std::holds_alternative<StreamReset>(*video_reset),
+            "video output did not receive the seek reset");
+    Require(audio_reset && std::holds_alternative<StreamReset>(*audio_reset),
+            "audio output did not receive the seek reset");
+    Require(std::get<StreamReset>(*video_reset).epoch_ == epoch && std::get<StreamReset>(*audio_reset).epoch_ == epoch,
+            "seek reset used the wrong epoch");
+
+    std::vector<int> received_frame_indices;
+    bool video_ready_reported = false;
+    bool audio_eos_received = false;
+    const auto deadline = std::chrono::steady_clock::now() + kPrerollTestTimeout;
+    while (!audio_eos_received && std::chrono::steady_clock::now() < deadline) {
+        if (auto item = video_output->ReceiveFor(2ms)) {
+            if (auto* packet = std::get_if<Packet>(&*item)) {
+                Require(packet->GetEpoch() == epoch, "video preroll packet used the wrong epoch");
+                const auto payload = packet->GetAVPacket()->data[0];
+                Require(payload >= 16 && (payload - 16) % 20 == 0, "video preroll packet had an invalid payload");
+                received_frame_indices.push_back((payload - 16) / 20);
+                if (!video_ready_reported) {
+                    timeline->MarkReady(PlaybackTrack::kVideo, epoch, packet->GetPtsUs().value_or(0), false);
+                    video_ready_reported = true;
+                }
+            } else {
+                Require(!std::holds_alternative<EndOfStream>(*item),
+                        "video output reached EOS before replay completed");
+                throw std::runtime_error("video output received an unexpected reset during preroll");
+            }
+        }
+
+        if (auto item = audio_output->ReceiveFor(2ms)) {
+            if (std::holds_alternative<EndOfStream>(*item)) {
+                Require(std::get<EndOfStream>(*item).epoch_ == epoch, "audio preroll EOS used the wrong epoch");
+                timeline->MarkReady(PlaybackTrack::kAudio, epoch, 0, false);
+                audio_eos_received = true;
+            } else {
+                throw std::runtime_error("audio output received an unexpected item for video-only media");
+            }
+        }
+    }
+
+    Require(video_ready_reported, "video preroll did not deliver a packet");
+    Require(audio_eos_received, "audio preroll did not finish after reaching EOF");
+    Require(!received_frame_indices.empty() && received_frame_indices.size() < kFrameCount,
+            "test did not establish a non-empty, incomplete video prefix");
+    for (std::size_t index = 0; index < received_frame_indices.size(); ++index) {
+        Require(received_frame_indices[index] == static_cast<int>(index),
+                "video preroll prefix was not delivered in packet order");
+    }
+
+    while (true) {
+        auto item = video_output->ReceiveFor(kPrerollTestTimeout);
+        Require(item.has_value(), "timed out waiting for replay video output");
+        if (auto* packet = std::get_if<Packet>(&*item)) {
+            Require(packet->GetEpoch() == epoch, "replay packet used the wrong epoch");
+            const auto payload = packet->GetAVPacket()->data[0];
+            Require(payload >= 16 && (payload - 16) % 20 == 0, "replay packet had an invalid payload");
+            received_frame_indices.push_back((payload - 16) / 20);
+            continue;
+        }
+
+        Require(std::holds_alternative<EndOfStream>(*item), "replay output received an unexpected reset");
+        Require(std::get<EndOfStream>(*item).epoch_ == epoch, "replay EOS used the wrong epoch");
+        break;
+    }
+
+    Require(received_frame_indices.size() == kFrameCount, "replay did not deliver every source frame exactly once");
+    for (int index = 0; index < kFrameCount; ++index) {
+        Require(received_frame_indices[static_cast<std::size_t>(index)] == index,
+                "replay duplicated, skipped, or reordered a source frame");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -242,6 +352,7 @@ int main() {
         ReadsUntilEofAndResumesAfterSeek(media);
         ReportsErrorsAndCancelledOpen(media);
         SharedStopInterruptsReadAndSeek(media);
+        SeekReplaySkipsOnlyDeliveredPrefix(media);
     } catch (const std::exception& error) {
         std::cerr << "ffmpeg_demuxer_node_test failed: " << error.what() << '\n';
         return 1;

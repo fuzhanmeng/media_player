@@ -635,6 +635,11 @@ private:
             reason = NodeFinishReason::kUnhandledException;
         }
 
+        // 工作线程退出前给派生类一次清理线程独占 I/O 的机会（例如 AudioSinkNode 丢弃设备里残留的音频）
+        // 必须在标记 kFinished 之前、仍在本线程内调用：之后 Pipeline 可能随时 Join 并销毁节点
+        // 它声明为 noexcept，正常、错误、异常和 Stop 四种退出方式都会走到这里
+        OnThreadExit();
+
         finish_reason_.store(reason, std::memory_order_release);
         state_.store(NodeState::kFinished, std::memory_order_release);
     }

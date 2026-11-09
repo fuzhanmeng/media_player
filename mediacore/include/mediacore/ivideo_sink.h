@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 
 namespace mediacore {
@@ -47,9 +48,31 @@ public:
      * 1. 执行上下文：此回调在 VideoSinkNode 后台工作线程中被同步调用；
      * 2. 非阻塞契约：实现端应尽快返回（例如将帧推入 UI 队列或触发异步重绘请求），避免阻塞管线消费；
      * 3. 严禁重入：禁止在此回调执行栈中直接同步调用 VideoSinkDispatcher::Attach() 或 Detach()，
-     *    否则会触发运行期重入拦截异常。
+     *    否则会触发运行期重入拦截异常
      */
     virtual void OnReceiveVideoFrame(std::shared_ptr<VideoFrame> video_frame) = 0;
+
+    /**
+     * @brief 注入硬解渲染能力标志，供解码器决定是否导出 DMA-BUF
+     * @param capability 布尔原子标志的共享所有权
+     *   · true  — 渲染端已确认 EGL DMA-BUF 导入可用，解码器应导出硬件帧
+     *   · false — 渲染端尚未初始化或 EGL 不可用，解码器应直接走下载路径
+     *   · nullptr — 调用方不关心能力协商，解码器保持自身默认行为不变
+     * @details
+     * 为什么需要这个机制：
+     *
+     * 解码器在 BuildPipeline 时就开始工作，而渲染端要到 initializeGL（首帧到来前）才知道 EGL 是否可用
+     * 没有这个标志时，解码器默认导出硬件帧，渲染端 EGL 不可用
+     * 的情况下每帧都要在 GUI 线程执行 av_hwframe_transfer_data + sws_scale，拖慢界面
+     * 正确流程：
+     * 1. Player::AttachDisplayView 调用本函数，把 shared_ptr 注入渲染端（OpenGLView）
+     * 2. 同一个 shared_ptr 也由 Player::BuildPipeline 注入解码器（FfmpegVideoDecoder）
+     * 3. OpenGLView::initializeGL 完成后，根据 InitializeEglDmaBufImport 的结果写入标志
+     * 4. 解码器在每帧导出前读取标志；false 时跳过导出，直接走下载转换
+     *
+     * 默认实现为空，不关心能力协商的实现端无需覆盖
+     */
+    virtual void SetHardwareRenderCapability(const std::shared_ptr<std::atomic<bool>>& /*capability*/) {}
 };
 
 }  // namespace mediacore

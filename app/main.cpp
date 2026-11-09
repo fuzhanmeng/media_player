@@ -10,7 +10,10 @@
  */
 
 #include <QApplication>
+#include <QCommandLineOption>
+#include <QCommandLineParser>
 #include <QStringList>
+#include <QtGlobal>
 #include <memory>
 
 #include "mediacore/logger.h"
@@ -42,14 +45,50 @@ int main(int argc, char* argv[]) {
 
     int exit_code = 0;
     {
-        // 2. 启动 Qt 应用环境与 GUI 平台适配层
+        // 2. 选择 Qt 的 xcb OpenGL 后端，再启动 Qt 应用环境
+        // DMA-BUF → EGLImage 零拷贝要求 QOpenGLWidget 运行在 EGL 上下文里（同一个 EGLDisplay 才能导入 DMA-BUF）；
+        // Qt 的 xcb 平台默认走 GLX，必须用 QT_XCB_GL_INTEGRATION=xcb_egl 切换到 EGL 后端。
+        // 这个环境变量必须在 QApplication 构造之前设置，之后改无效。
+        // 只在用户没有显式设置时才填默认值：用户设了就尊重用户（例如想强制回到 GLX 做对比）。
+        // 切到 EGL 后端不会改变软件帧渲染；EGL 不可用时 OpenGLView 会自动退回软件下载路径。
+        if (!qEnvironmentVariableIsSet("QT_XCB_GL_INTEGRATION")) {
+            qputenv("QT_XCB_GL_INTEGRATION", "xcb_egl");
+        }
+
         // QApplication 负责捕获与分发底层窗口系统的原生输入、重绘和定时器事件
         QApplication app(argc, argv);
         LOG_INFO("QApplication created");
 
+        QCommandLineParser parser;
+        parser.addHelpOption();
+        const QCommandLineOption decoder_mode_option(
+            "video-decoder", "Select the video decoder mode (auto, software, or vaapi).", "mode", "auto");
+        parser.addOption(decoder_mode_option);
+        parser.addPositionalArgument("media-file", "Media file to open.", "[media-file]");
+        parser.process(app);
+
+        mediacore::PlayerConfig player_config = mediacore::PlayerConfig::Default();
+        const QString decoder_mode = parser.value(decoder_mode_option).trimmed().toLower();
+        if (decoder_mode == "software") {
+            player_config.decode_.hw_accel_ = mediacore::HardwareAccel::kOff;
+        } else if (decoder_mode == "vaapi") {
+            player_config.decode_.hw_accel_ = mediacore::HardwareAccel::kVaapi;
+        } else if (decoder_mode != "auto") {
+            LOG_ERROR("Unsupported --video-decoder mode '{}'; expected auto, software, or vaapi", decoder_mode.toStdString());
+            exit_code = 2;
+        }
+
+        if (parser.positionalArguments().size() > 1) {
+            LOG_ERROR("Only one media file may be specified on the command line");
+            exit_code = 2;
+        }
+
         // 3. 借助抽象工厂创建 IPlayer 控制核心实例
         // 返回 std::unique_ptr 独占指针，掌控媒体引擎主生命周期
-        std::unique_ptr<mediacore::IPlayer> player = mediacore::CreatePlayer();
+        std::unique_ptr<mediacore::IPlayer> player;
+        if (exit_code == 0) {
+            player = mediacore::CreatePlayer(std::move(player_config));
+        }
         if (!player) {
             LOG_ERROR("Player creation failed");
             exit_code = 1;
@@ -67,16 +106,18 @@ int main(int argc, char* argv[]) {
 
         // 5. 命令行启动参数解析
         // 若启动命令携带媒体文件路径，自动直接起播
-        const QStringList arguments = app.arguments();
-        if (player && arguments.size() > 1) {
-            LOG_INFO("Opening file from command line argument: {}", arguments.at(1).toStdString());
-            window.OpenMediaFile(arguments.at(1));
+        if (player && !parser.positionalArguments().isEmpty()) {
+            const QString media_path = parser.positionalArguments().front();
+            LOG_INFO("Opening file from command line argument: {}", media_path.toStdString());
+            window.OpenMediaFile(media_path);
         }
 
         // 6. 移交主控制权，阻塞进入 Qt 事件主循环
         LOG_INFO("Qt event loop started");
-        exit_code = app.exec();
-        LOG_INFO("Qt event loop finished with code {}", exit_code);
+        if (exit_code == 0) {
+            exit_code = app.exec();
+            LOG_INFO("Qt event loop finished with code {}", exit_code);
+        }
     }
 
     // 7. 优雅关闭日志引擎，刷新未落盘缓冲并注销资源

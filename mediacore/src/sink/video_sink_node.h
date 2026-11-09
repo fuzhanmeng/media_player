@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -51,6 +52,8 @@ public:
                   std::shared_ptr<VideoSinkDispatcher> dispatcher,
                   std::shared_ptr<PlaybackTimeline> timeline);
 
+    ~VideoSinkNode() override;
+
 protected:
     /**
      * @brief 处理一个输入数据项
@@ -76,6 +79,7 @@ private:
      * @param reached_eof 寻找目标帧时是否已经到达输入结尾
      */
     void ReportReady(std::int64_t position, bool reached_eof);
+    void LogFrameStatistics(const char* reason, bool summary);
 
 private:
     std::shared_ptr<VideoSinkDispatcher> video_dispatcher_;
@@ -104,6 +108,12 @@ private:
 
     std::optional<StreamItem<VideoFrame>> pending_item_;
     ///< 已从输入队列取出但尚未处理的数据项，避免暂停时丢失数据
+
+    std::uint64_t sink_frames_total_{0};
+    std::uint64_t sink_frames_interval_{0};
+    std::chrono::steady_clock::time_point sink_statistics_started_at_{};
+    std::chrono::steady_clock::time_point sink_interval_started_at_{};
+    bool sink_summary_logged_{false};
 };
 
 }  // namespace mediacore

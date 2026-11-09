@@ -8,6 +8,7 @@ set(MEDIACORE_SOURCES
     src/audio_decoder/ffmpeg_audio_decoder_node.cpp
     src/av_sync/av_sync_node.cpp 
     src/av_types/audio_codec_parameters.cpp
+    src/av_types/hardware_frame.cpp
     src/av_types/packet.cpp
     src/av_types/video_codec_parameters.cpp
     src/config/player_config.cpp
@@ -50,6 +51,25 @@ target_compile_definitions(mediacore PUBLIC
     SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE    
 )
 
+# ============ VA-API ============
+# vaExportSurFacehandle / vaSyncSurfcae 都在 libva 中，不在 FFmpeg 中
+#
+# 为什么要用条件链接而不是 REQUIRED：
+# 播放器应该能在没有 VA-API 的机器上正常构建和运行-软解
+# 如果使用 find_library(... REQUIRED)，缺少库时整个项目直接失败
+#
+# 找到 libva 时定义 MEDIACORE_HAVE_VAAPI = 1，解码器里导出逻辑用这个宏
+# DRM（Direct Rendering Manager，直接渲染管理器）是 Linux 内核中的 GPU 图形管理子系统
+find_library(MEDIACORE_VA_LIBRARY NAMES va)
+find_library(MEDIACORE_VA_DRM_LIBRARY NAMES  va-drm)
+
+if(MEDIACORE_VA_LIBRARY)
+    message(STATUS "Found libva: ${MEDIACORE_VA_LIBRARY}")
+    target_compile_definitions(mediacore PRIVATE MEDIACORE_HAVE_VAAPI=1)
+else()
+    message(STATUS "libva not found: hardware zero-copy rendering disabled,software path only")
+endif()
+
 target_link_libraries(mediacore PUBLIC
     ffmpeg::avutil    # av_malloc / av_free 等内存与工具函数
     ffmpeg::avcodec   # AVPacket 相关函数
@@ -59,3 +79,12 @@ target_link_libraries(mediacore PUBLIC
     ffmpeg::avformat  # ffmpeg 解复用
     ${MEDIACORE_ASOUND_LIBRARY}
 )
+
+# libva 只在找到时连接，用 PRIVATE： app 层不直接调用 va* 函数，不需要看到这些符号
+if(MEDIACORE_VA_LIBRARY)
+    target_link_libraries(mediacore PRIVATE ${MEDIACORE_VA_LIBRARY})
+endif()
+
+if(MEDIACORE_VA_DRM_LIBRARY)
+    target_link_libraries(mediacore PRIVATE ${MEDIACORE_VA_DRM_LIBRARY})
+endif()

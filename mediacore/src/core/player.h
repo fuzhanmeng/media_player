@@ -44,9 +44,13 @@ public:
      * @brief 启动后台媒体打开任务
      * @param media_uri 媒体文件路径或网络流 URL
      * @param open_sequence 本次 Open 操作的编号，用于识别过期任务
+     * @param hw_accel 视频解码硬件加速策略，从 PlayerConfig::decode_.hw_accel_ 复制而来，传给 FfmpegVideoDecoder::Open
      * @param on_finished 打开任务结束后的通知回调，在后台线程中执行
      */
-    OpenTask(std::string media_uri, std::uint64_t open_sequence, std::function<void()> on_finished);
+    OpenTask(std::string media_uri,
+             std::uint64_t open_sequence,
+             HardwareAccel hw_accel,
+             std::function<void()> on_finished);
 
     /**
      * @brief 请求中断后台 I/O，并等待打开线程退出
@@ -134,6 +138,7 @@ public:
 private:
     std::string media_uri_;  ///< 待打开的媒体路径或 URL
     std::uint64_t open_sequence_{0};  ///< 本次 Open 操作的编号
+    HardwareAccel hw_accel_{HardwareAccel::kAuto};  ///< 视频解码硬件加速策略；声明顺序须与构造函数初始化列表一致
     DemuxerInterruptHandle interrupt_handle_;  ///< 用于请求中断 FFmpeg 阻塞 I/O
 
     FfmpegDemuxerOpenResult open_result_;  ///< 后台线程生成的解封装器和流信息

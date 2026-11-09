@@ -666,7 +666,7 @@ FfmpegDemuxerOpenResult FfmpegDemuxer::Open(const std::string& uri, DemuxerInter
     // 14. MediaInfo::IsValid() 只要求至少一轨有效
     MediaInfo media_info = BuildMediaInfo(context_owner.get(), video_stream, audio_stream);
 
-    if (!media_info.IsValid() || media_info.video_stream_ && !media_info.video_stream_->IsValid()) {
+    if (!media_info.IsValid() || (media_info.video_stream_ && !media_info.video_stream_->IsValid())) {
         LOG_ERROR("Failed to build valid audio/video media information in '{}' (video {}, audio {})",
                   uri,
                   video_stream_index,

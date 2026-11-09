@@ -41,16 +41,32 @@ struct DemuxConfig final {
 };
 
 /**
+ * @enum HardwareAccel
+ * @brief 视频解码的硬件加速策略
+ * @details
+ * - kOff：完全不尝试硬解码
+ * - kAuto：默认值，优先尝试硬件解码；首帧输出前硬件初始化或格式协商失败时退回软件解码
+ * - kVaapi：强制使用 VA-API，硬解码无法启用时直接报错
+ */
+enum class HardwareAccel : std::uint8_t {
+    kOff = 0,  ///< 强制软件解码，不创建硬件设备
+    kAuto = 1,  ///< 自动：优先硬件解码，首帧输出前失败时退回软件解码
+    kVaapi = 2,  ///< 强制 VA-API，无法启用时直接报错
+};
+
+/**
  * @struct DecodeConfig
  * @brief 解码后的原始帧队列容量
  * @details
  * 解码器将输出的原始图像帧（VideoFrame）与音频采样帧（AudioFrame）缓存至此层队列：
  * - 视频帧队列：通常保持较小深度（默认 3 帧），以控制未经压缩的 YUV/RGB 图像显存占用并减小渲染延迟；
  * - 音频帧队列：默认容纳更多小粒度音频帧（默认 32 帧），防止调度延迟造成声卡断流。
+ * - 硬件加速策略：决定视频解码是否尝试 VA-API，见 HardwareAccel。
  */
 struct DecodeConfig final {
     std::size_t video_frame_capacity_{3};  ///< 解码后原始视频帧 Link 队列容量上限（帧数量）
     std::size_t audio_frame_capacity_{32};  ///< 解码后原始音频帧 Link 队列容量上限（帧数量）
+    HardwareAccel hw_accel_{HardwareAccel::kAuto};  ///< 视频解码硬件加速策略
 };
 
 /**

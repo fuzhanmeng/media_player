@@ -6,6 +6,10 @@
 # OpenGL/OpenGLWidgets -> QOpenGLWidget 要用
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets OpenGL OpenGLWidgets)
 
+# opengl_view.cpp 直接调用 eglGetError / eglGetProcAddress / eglQueryString 等 EGL 函数（DMA-BUF → EGLImage 零拷贝），
+# 所以 app 必须自己链接 libEGL；这不取决于 Qt 是否带 EGL 后端
+find_package(OpenGL REQUIRED COMPONENTS EGL)
+
 # 定义可执行文件 target
 add_executable(media_player
     main.cpp
@@ -21,5 +25,6 @@ target_link_libraries(media_player PRIVATE
     Qt6::Widgets
     Qt6::OpenGL
     Qt6::OpenGLWidgets
+    OpenGL::EGL
     mediacore
 )

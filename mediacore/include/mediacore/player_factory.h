@@ -14,6 +14,7 @@
 #include <memory>
 
 #include "mediacore/iplayer.h"
+#include "mediacore/player_config.h"
 
 namespace mediacore {
 
@@ -24,5 +25,8 @@ namespace mediacore {
  * @note 调用方接管返回实例的所有权，其析构操作将触发底层 Pipeline 与关联后台线程的彻底清理。
  */
 std::unique_ptr<IPlayer> CreatePlayer();
+
+/** @brief 使用调用方指定的播放器配置创建实例。 */
+std::unique_ptr<IPlayer> CreatePlayer(PlayerConfig config);
 
 }  // namespace mediacore

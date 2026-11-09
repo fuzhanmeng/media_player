@@ -179,6 +179,9 @@ struct PacketPrefix {
         prefix_verified_ = delivered_packet_count_ == 0;
     }
 
+    /** @brief 只有尚未比较完整的已交付前缀包才需要计算指纹。 */
+    bool NeedsReplayComparison() const noexcept { return compared_packet_count_ < delivered_packet_count_; }
+
     /**
      * @brief 第三遍重读时，逐个比对读到的包是否属于已交付前缀
      * @param digest 重读到包的指纹
@@ -946,6 +949,8 @@ TickResult FfmpegDemuxerNode::TickSeekPreroll() {
         case FfmpegReadStatus::kSeekInterrupted:
             // 与 kSkipped 一样，返回主循环处理新的 Seek
             LOG_DEBUG("Demuxer preroll read interrupted by a newer seek at epoch {}", epoch);
+            return TickResult::kContinue;
+
         case FfmpegReadStatus::kSkipped:
             return TickResult::kContinue;
 
@@ -974,13 +979,14 @@ TickResult FfmpegDemuxerNode::TickSeekPreroll() {
         return TickResult::kContinue;
     }
 
-    const auto digest = seek.packet_hasher_.Fingerprint(packet);
+    PacketDigest digest{};
 
     if (seek.phase_ == SeekPreroll::Phase::kReplay) {
         auto& prefix = video ? seek.video_ : seek.audio_;
 
         // 已交付前缀必须逐包匹配；匹配成功后跳过，避免重复送入解码器
-        if (prefix.compared_packet_count_ < prefix.delivered_packet_count_) {
+        if (prefix.NeedsReplayComparison()) {
+            digest = seek.packet_hasher_.Fingerprint(packet);
             if (!prefix.MatchesDeliveredPrefix(digest)) {
                 LOG_ERROR(
                     "Demuxer replay could not reproduce the {} packet prefix at epoch {} "
@@ -1003,6 +1009,8 @@ TickResult FfmpegDemuxerNode::TickSeekPreroll() {
                       epoch);
             return Fail("Seek replay produced new packets after an already delivered EOS", epoch);
         }
+    } else {
+        digest = seek.packet_hasher_.Fingerprint(packet);
     }
 
     // 暂存当前包，下一轮通过 SendFor() 限时入队

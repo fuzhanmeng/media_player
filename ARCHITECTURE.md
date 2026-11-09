@@ -1,20 +1,79 @@
 # ARCHITECTURE
 
-> This document explains the implementation details and protocols of components that have already been completed and merged. For the high-level target architecture, see [README.md](./README.md). For current repository progress, see [DEVELOPMENT_PLAN.md](./DEVELOPMENT_PLAN.md).
+> This document describes the implementation currently present in the source tree. Runtime capability depends on the host's display, audio devices, GPU and drivers. For build instructions, see [README.md](./README.md).
 
-本文只描述**已经落地并且有正式测试支撑**的机制，全部内容以 `mediacore/src/` 下的源码和 `tests/dag/` 下的用例为事实来源。尚未实现的节点、Seek 流程、网络协议和硬解路径不在本文范围内。
+本文按当前源码描述播放器与 DAG 的实现。代码路径存在不等于已在每种主机环境验证；尤其 VA-API、DMA-BUF/EGL 导入、可见 OpenGL 显示和真实 ALSA 输出需要相应设备和驱动才能实测。
 
-覆盖范围：
+核心实现位置：
 
 ```text
-mediacore/src/utils/thread_safe_queue.h    有界阻塞队列
-mediacore/src/dag/link.h                   Link<T> / ILinkControl / LinkCreationToken
-mediacore/src/dag/inode.h                  INodeBase / INode 四个形态
-mediacore/src/dag/sync_context.h           SyncContext
-mediacore/src/dag/pipeline.h               Pipeline
-mediacore/src/av_types/packet.h/.cpp       Packet
-tests/dag/d9_dag_lifecycle_test.cpp        11 个生命周期用例
+mediacore/src/core/player.cpp                     控制线程、打开任务和媒体 Pipeline 组装
+mediacore/src/demux/ffmpeg_demuxer*.cpp           FFmpeg 输入、Demux Node 与 Seek replay
+mediacore/src/video_decoder/                     FFmpeg 软件/VA-API 视频解码
+mediacore/src/audio_decoder/                     FFmpeg 音频解码、swr、ALSA sink
+mediacore/src/av_sync/                           播放时间轴和视频调度
+mediacore/src/sink/                              视频/音频输出节点
+mediacore/src/core/{pipeline,inode,link,sync_context}.h
+app/opengl_view.cpp                              软件纹理和 DMA-BUF/EGLImage 渲染路径
+tests/                                           DAG、Demuxer、Player、时间轴等测试
 ```
+
+## Media Playback
+
+`main()` 创建 `IPlayer`，再把借用指针交给 `PlayerWidget`。Widget 将 `OpenMediaFile()`、Play、Pause、Seek、Stop 转为异步 `IPlayer` 命令；它将 `OpenGLView` 注册为 `IVideoSink`，析构时先 Detach 并等待已进入的回调结束。`IPlayer` 是控制接口，不拥有 UI 或媒体数据。
+
+`Player` 的 `Control` 邮箱线程串行处理应用命令和内部完成事件。每次 Open 会先停止旧 Pipeline 并打断、Join 旧 OpenTask，再创建带递增序号的新 OpenTask。OpenTask 的独立线程负责 FFmpeg 输入打开、流探测和现有轨道的解码器初始化；完成后只投递通知。控制线程检查序号、Join 任务并移动其资源，随后构建 Pipeline。过期 OpenTask 的通知不会启动新的 Pipeline。Player 常规析构会请求退出并 Join 控制线程；若析构发生在工作线程、sink 回调或控制线程自身，则把可 Join 的线程句柄交给 Reaper，避免相互等待。
+
+Pipeline 按媒体实际存在的轨道组图：Demuxer 的压缩视频包连接到 VideoDecoder、AvSync、VideoSink；压缩音频包连接到 AudioDecoder、重采样和 AudioSink。配置决定压缩包与解码帧 Link 的容量，同步后的显示帧 Link 保持一帧。Pipeline 独占 Node，登记全部 Link 和共享 SyncContext；每个 Node 有自己的工作线程。启动顺序反向遍历登记节点，使消费者先于生产者运行。
+
+```text
+OpenTask: FFmpeg input/probe + decoder initialization
+                         │
+                         ▼
+DemuxerNode ── StreamItem<Packet> ──┬── VideoDecoderNode ── AvSyncNode ── VideoSinkNode ── IVideoSink
+                                    │                                                        │
+                                    │                                                        └─ OpenGLView
+                                    └── AudioDecoderNode + swr ── PcmFrame ── AudioSinkNode ── ALSA
+```
+
+Demuxer 从选中的音视频流读取压缩包，并将各流时间戳按共同时间原点换算到微秒。视频解码输出带时间戳的帧；AvSyncNode 用 `PlaybackTimeline` 中的音频主时钟调度，时钟不可用时回退到单调时钟。VideoSinkNode 在正常播放时交付当前 epoch 的帧，在 Seek 预滚时选择目标附近画面并报告轨道就绪。音频解码器用 FFmpeg send/receive 接口并通过 `swr` 输出 PCM；AudioSinkNode 将 PCM 写入 `IAudioSink`，ALSA 实现负责设备参数、暂停、丢弃旧数据和 drain，并发布播放时钟。
+
+软件视频帧交给 OpenGLView 后通过 CPU 像素数据上传纹理。VA-API 解码是可选路径：`auto` 在 VA 设备/解码器初始化或格式协商阶段失败时用独立的软件上下文回退；强制 VA-API 则报告打开错误。成功创建 VA-API 上下文不等于最终使用硬解，实际模式以解码输出帧格式为准。运行中下载失败会报告错误，不会偷偷重开软件解码器。
+
+硬件帧导出只在渲染端报告能力后尝试。解码线程对当前 VA Surface 执行已有的 `vaSyncSurface()`，然后调用 `vaExportSurfaceHandle(DRM_PRIME_2)`。当前导入转换接受单 layer、双 plane 的 NV12/P010 布局；导出对象的原始 FD 由临时 owner 关闭，dup 后的 FD 和 AVFrame 引用由 `HardwareFrame` 持有。OpenGLView 为每个 plane 创建 EGLImage，将 EGLImage 关联到 Texture。渲染提交后插入 GL Fence，并保留帧对象；Fence 确认完成后，依次释放 Fence、Texture、EGLImage，最后释放 VideoFrame，从而关闭 DMA-BUF FD 并释放 VA Surface 引用。
+
+Context 销毁时，OpenGLView 在可用的当前或 retirement context 中等待并回收待退役帧。Fence 未完成时会把资源批次交给共享 retirement context 的定时回收器；未完成队列会暂停新的硬件帧导出。若 context 丢失、无法建立 retirement context 或回收器分配失败，代码会保留尚不能证明安全的资源到进程退出，避免 GPU 仍在读取时提前关 FD、销毁 EGLImage 或释放 AVFrame。EGL 导入成功也不证明驱动内部没有复制；实际可见显示和零拷贝效果需要目标设备验证。
+
+### Playback Control and Stream End
+
+- **Pause/Resume:** ALSA 硬件支持 pause 时保留设备缓冲；不支持时 sink 使用软件暂停恢复流程。时间轴和 Node 门控仍由控制线程协调。
+- **Seek:** Pipeline 递增 epoch、清理旧 Link 项并切换时间轴，再向 Demuxer 提交 Seek。Demuxer 按视频、音频和 replay 阶段定位并发送带新 epoch 的 `StreamReset`。解码器 Flush FFmpeg 状态，音频同时刷新重采样状态并丢弃旧设备 PCM；旧 epoch 数据被拒绝。各活动轨道预滚并报告就绪，Player 按 Seek 前播放意图恢复或保持暂停。
+- **Stop:** 控制线程请求停止，Pipeline 先标记所有 Node、Abort 所有 Link、请求打断阻塞 I/O、唤醒暂停 Node，最后 Join 工作线程。OpenTask 的中断请求后仍需 Join 才能释放。
+- **EOF:** Demuxer 向活动轨道发送有序 `EndOfStream`。视频和音频解码器排空延迟输出再转发 EOS；VideoSink 标记视频轨结束，AudioSink drain 设备后标记音频轨结束。所有活动轨道结束后 Player 进入 `Ended`。EOS 是流内控制项；Link 的 Close/Abort 用于队列生命周期，不等同于媒体 EOS。
+
+这些是源码的实现行为描述，不替代编码格式、设备输出、画面显示或硬件性能的运行测试。
+
+### Object Ownership and Thread Handoff
+
+```text
+main: unique_ptr<IPlayer> -> PlayerWidget (borrowed IPlayer*)
+Player: shared Control -> control thread
+Control: unique_ptr<OpenTask> / unique_ptr<Pipeline>
+Pipeline: unique_ptr<Node> + shared Link<T> + shared SyncContext
+OpenTask --Join + Take*--> Demuxer and decoders --move--> Pipeline nodes
+```
+
+OpenTask result fields are read only after Join. Decoder and demuxer ownership moves from the task to Pipeline nodes; a Pipeline is stopped and all Node threads are joined before those nodes are destroyed. Display attachment is non-owning and is detached before the widget and OpenGL view are destroyed.
+
+### Link, Backpressure and Epoch
+
+Each Link is a bounded blocking queue. A full queue blocks its producer and propagates backpressure upstream; normal Close allows queued items to drain, while Pipeline Abort wakes blocked senders/receivers and discards queued items during Stop. `StreamItem<T>` carries media values plus `StreamReset` and `EndOfStream` control items in order. The epoch in packets and frames identifies a playback generation: downstream nodes drop old-generation values, while `StreamReset` explicitly flushes codec/device state. Epoch checks do not replace ordered reset processing.
+
+The video path is paced in AvSyncNode using the shared playback timeline and the audio clock when available. Late-frame dropping is controlled by the sync configuration. If the ALSA clock is unavailable, timeline scheduling uses a monotonic clock; the code does not claim sample-accurate synchronization on every device.
+
+### Audio Decode and ALSA Output
+
+`FfmpegAudioDecoderNode` submits compressed packets to FFmpeg, receives decoded audio frames, and uses `swr` to produce the configured interleaved PCM format. `AudioSinkNode` writes PCM through `IAudioSink`; the default `AlsaAudioSink` opens/configures the selected ALSA PCM device, handles partial writes and recoverable ALSA errors, and exposes the consumed audio clock. Pause, StreamReset, Stop and EOS are handled on the sink worker: reset/stop discard stale device data, while normal EOS drains the device before reporting the audio track ended. Device availability and audible output remain runtime properties.
 
 ---
 
@@ -32,14 +91,14 @@ Pipeline
 
 | 类型 | 负责 | 不负责 |
 |---|---|---|
-| `Pipeline` | 创建并登记 Node/Link，启动、暂停、恢复、停止和 Join 整张图 | 具体媒体处理；当前不含 Open / Build / Seek |
+| `Pipeline` | 创建并登记 Node/Link，启动、暂停、恢复、停止和 Join 整张图；递增 epoch 并向 Seek source 提交定位 | 解封装、解码等媒体语义由 Node 和 Player 控制层负责 |
 | `SyncContext` | 保存全部 Node 共享的 Running/Paused 状态和 epoch，实现暂停等待 | Pipeline 生命周期状态、Node 停止标志、Link 所有权 |
 | `INodeBase` | 单个 Node 的一次性线程生命周期、固定 `ThreadMain`、停止标志、退出原因、异常边界 | 完整拓扑、Link 的统一中止 |
 | `INode<InT, OutT>` | 零或一个输入端口、零或一个输出端口的强类型连接和收发辅助 | 多输入、多输出拓扑 |
 | `Link<T>` | 包装强类型有界队列，提供 Send / Receive / Close / Abort | 决定正常 EOF 或立即停止的时机 |
 | `ThreadSafeQueue<T>` | 有界阻塞、背压、Close 排空、Abort 中止 | DAG 类型关系和媒体语义 |
 
-`PlayerFacade`、FSM、真实媒体组图尚未实现，`app/` 当前直接通过 `CreatePlayer()` 拿到 `StubPlayer`。
+`CreatePlayer()` 当前创建 `Player` 实例。Player 控制线程负责状态转换、打开任务管理、Pipeline 组装及 Seek 协调；Qt 通过 `IPlayer` 使用该实现。
 
 ---
 
@@ -148,13 +207,13 @@ void WaitWhilePaused(StopPredicate should_stop);
 
 `epoch_` 是 `atomic<uint64_t>`，初值 0。`INodeBase::IsCurrentEpoch(item_epoch)` 比较 `item_epoch < GetEpoch()`，小于说明是 Seek 之前产生的陈旧数据。
 
-**当前 epoch 只是一个计数器。** `BumpEpoch()` 已实现，但没有任何调用方 —— Seek 流程尚未实现。epoch 本身不清空队列、不刷新解码器、不定位媒体，这些是后续 Seek 里程碑的工作。
+`Pipeline::Seek()` 调用 `BumpEpoch()` 后提交目标位置给 Demuxer seek source。Player 在该同步回调中先将共享时间轴切换到新 epoch，Demuxer 成功定位后通过带内 `StreamReset` 通知下游刷新状态。epoch 用于拒绝旧周期数据；队列不靠 epoch 自动清空，清理由各解码/输出节点按 `StreamReset` 执行。
 
 ### 4.4 停止标志为什么不放这里
 
 Node 的停止标志是每个 `INodeBase` 自己的 `atomic<bool> stop_requested_`，不在 `SyncContext` 中。
 
-暂停是可逆的图级状态，停止是不可逆的单节点生命周期终点。合并成一个状态就无法表达"暂停中收到停止请求"这种组合 —— 而 `d9.stop_while_paused` 用例恰恰要验证这条路径。
+暂停是可逆的图级状态，停止是不可逆的单节点生命周期终点。合并成一个状态就无法表达"暂停中收到停止请求"这种组合 —— 而 `all.stop_while_paused` 用例恰恰要验证这条路径。
 
 ---
 
@@ -206,7 +265,7 @@ state_.store(kFinished)
 
 **`catch (...)` 兜在线程入口。** C++ 异常越过线程边界会直接 `std::terminate()`。这里捕获后存进 `exception_ptr`，Pipeline `Join()` 之后可以读出来。`GetUnhandledException()` 在 Node 未进入 `kJoined` 时抛 `std::logic_error` —— 未 Join 就读 `exception_ptr` 是数据竞争。
 
-`d9.tick_exception` 用例覆盖这条路径。
+`all.tick_exception` 用例覆盖这条路径。
 
 ### 5.3 Start / Stop / Join 分离
 
@@ -222,7 +281,7 @@ if (!state_.compare_exchange_strong(expected, NodeState::kRunning)) {
 }
 ```
 
-CAS 失败时 `expected` 被写成实际值，据此区分"已经启动过"和"启动前已收到停止请求"。线程工厂抛异常或返回不可 Join 的线程时，状态回滚到 `kCreated`，交给 Pipeline 统一回滚。`d9.partial_start_rollback` 用例通过注入一个会失败的线程工厂来验证这条路径。
+CAS 失败时 `expected` 被写成实际值，据此区分"已经启动过"和"启动前已收到停止请求"。线程工厂抛异常或返回不可 Join 的线程时，状态回滚到 `kCreated`，交给 Pipeline 统一回滚。`all.partial_start_rollback` 用例通过注入一个会失败的线程工厂来验证这条路径。
 
 **`SignalStop()`** 只置标志并用 CAS 循环把状态推到 `kStopRequested`，**不阻塞**。已在 `kStopRequested` / `kFinished` / `kJoined` 的 Node 不再改状态。
 
@@ -240,7 +299,7 @@ virtual ~INodeBase() {
 
 只断言，不兜底。如果基类析构里隐式 Join，就会掩盖"Pipeline 漏停了某个 Node"的 bug；而且析构顺序与 Link 生命周期一旦交错，问题极难定位。Debug 构建直接 assert 失败更好。关闭 assert 的构建中，joinable 的 `std::thread` 析构本来就会 `std::terminate()`。
 
-`d9.join_before_destruction` 用例验证 Node 析构前状态确实是 `kJoined`。
+`all.join_before_destruction` 用例验证 Node 析构前状态确实是 `kJoined`。
 
 ### 5.5 端口模板
 
@@ -257,7 +316,7 @@ virtual ~INodeBase() {
 
 `ConnectInput` / `ConnectOutput` 内部检查 `CanConfigure()`（即 `state_ == kCreated`）并拒绝空指针，运行中改拓扑会返回 false。
 
-`CloseOutputs()` 在 `INodeBase` 中是**纯虚**，四个端口模板各自提供 `final` 实现。纯虚的意义：将来直接继承 `INodeBase` 的多端口 Node（双输出 Demuxer、双输入 Muxer、多输出 Tee）必须显式回答"正常 EOF 时关哪几条输出"，漏写就是抽象类，编译期失败。`final` 的意义：用端口模板的 Node 一律走同一套关闭规则，不允许各自改写。
+`CloseOutputs()` 在 `INodeBase` 中是**纯虚**，四个端口模板各自提供 `final` 实现。多输出 Demuxer 直接继承 `INodeBase`，显式关闭它拥有的活动输出；单端口节点通过端口模板采用统一关闭规则。
 
 多输入或多输出的 Node 直接继承 `INodeBase`，自己持有需要的几条 Link。不为它们发明 `Link<void>` 或可变端口容器。
 
@@ -286,7 +345,7 @@ Pipeline
 
 真正需要跨线程读的量才用 atomic：`NodeState`、`stop_requested_`、`finish_reason_`、`PipelineRunState`、`epoch`。
 
-将来 UI 接入后如果命令来自不同线程，应由 Player 层的控制执行器先串行化，再调用 Pipeline。
+来自 UI 和媒体工作线程的命令/事件先进入 Player 控制线程，再由该线程串行调用 Pipeline。
 
 ### 6.3 为什么没有 PipelineState::kPaused
 
@@ -297,7 +356,7 @@ Pipeline
 - 反复 Pause/Resume/Pause 不需要重建 Node 或 Link
 - Stop 是一次性生命周期终点，完成后不能重新 Start
 
-`d9.pause_resume_pause` 用例覆盖反复暂停恢复。
+`all.pause_resume_pause` 用例覆盖反复暂停恢复。
 
 ### 6.4 组图
 
@@ -333,7 +392,7 @@ for (auto it = nodes_.rbegin(); it != nodes_.rend(); ++it) {
 
 任一 Node 启动失败立即调完整 `Stop()` 回滚已启动的线程。
 
-**当前 Pipeline 不分析 Link 连接关系，也不做拓扑排序。** 登记顺序错了框架不会自动发现。`d9.consumer_starts_first` 用例验证实际启动顺序是 Sink 先于 Source。
+**当前 Pipeline 不分析 Link 连接关系，也不做拓扑排序。** 登记顺序错了框架不会自动发现。`all.consumer_starts_first` 用例验证实际启动顺序是 Sink 先于 Source。
 
 ### 6.6 Stop 的五个阶段
 
@@ -363,7 +422,7 @@ for (auto it = nodes_.rbegin(); it != nodes_.rend(); ++it) {
 
 重复调用：已经 `kStopped` 时返回首次的 `stop_succeeded_`；`stop_in_progress_` 为 true 时返回 false。`stop_in_progress_` 只防止停止钩子同步重入，不是通用并发锁 —— 当前 Stop 不承诺与 Start / Pause / Resume 并发调用。
 
-`d9.stop_while_receiving`、`d9.stop_while_sending`、`d9.stop_while_paused`、`d9.interrupt_blocking_io`、`d9.repeated_stop` 覆盖这些路径。
+`all.stop_while_receiving`、`all.stop_while_sending`、`all.stop_while_paused`、`all.interrupt_blocking_io`、`all.repeated_stop` 覆盖这些路径。
 
 ### 6.7 析构
 
@@ -455,23 +514,21 @@ RAII 封装 `AVPacket*`：构造时 `av_packet_alloc()`（只分配结构体，�
 
 `MediaDataFlag` 定义在公共头 `include/mediacore/av_types/media_data_flag.h`，用 `enum class` + `constexpr` 位运算重载。
 
-**已知不一致：** `VideoFrame`（`video_frame.h`）目前有自己的一套 `FrameFlag`（只有 `kNone` / `kFlush` / `kEOF`），与 `Packet` 使用的 `MediaDataFlag` 并存。两套标志的统一是后续 Frame 协议里程碑的工作，当前未收口。
-
-`Packet` 目前**没有任何生产者或消费者** —— Demuxer 和 Decoder 尚未实现。它是独立完成的 DTO，不代表解封装能力已经存在。
+`Packet` 由 `FfmpegDemuxerNode` 从选中流的压缩包创建，并通过对应的有界 Link 传给视频或音频解码器。`StreamReset` 和 `EndOfStream` 作为 `StreamItem` 控制项与压缩包保持顺序。
 
 ---
 
-## 10. 测试覆盖
+## 10. Tests
 
-`tests/dag/d9_dag_lifecycle_test.cpp`，11 个用例，每个在 CMake 中注册为独立 CTest（`d9.<name>`），单个用例 `TIMEOUT 10` 秒。
+测试包含独立的 DAG 生命周期套件，以及配置、媒体错误、播放器控制、播放时间轴和 Demuxer Node 用例。各测试目标和 CTest 名称以 `tests/*/CMakeLists.txt` 为准；测试不等同于环境相关的端到端音视频、真实设备或 VA-API/EGL 验收。
 
-测试只实例化 Queue / Link / INode / Pipeline，不创建 FFmpeg 或 Qt 对象，因此可以在关掉 `BUILD_MEDIACORE` 和 `BUILD_APP` 的环境下单独构建。
+`tests/dag/` 只实例化 Queue / Link / INode / Pipeline，不创建 FFmpeg 或 Qt 对象，因此可以在关闭 `BUILD_MEDIACORE` 和 `BUILD_APP` 时单独构建 DAG 测试。其他测试按需链接 mediacore、FFmpeg 或 Qt。
 
 **不用固定时长 sleep 判断线程是否已运行。** 测试用 `TestEvent`（mutex + CV + 序号）等待确定事件，`Probe` 中的可观察状态全是 atomic。`GateNode` 让测试方通过 `ReleaseTick()` 精确控制 `Tick()` 何时返回，从而能先提交 Pause、再让 `Tick()` 到达工作循环边界，确定性地验证暂停等待而不是碰运气验证一个时间窗口。
 
 | 用例 | 验证内容 |
 |---|---|
-| `eof_close_and_drain` | Source → Transform → Sink 的正常 EOF、`CloseOutputs()` 和下游排空 |
+| `eos_propagation_and_drain` | Source → Transform → Sink 的正常 EOS、`CloseOutputs()` 和下游排空 |
 | `stop_while_receiving` | 阻塞在空 Link `Receive()` 的 Node 被 `Abort()` 解除 |
 | `stop_while_sending` | 阻塞在满 Link `Send()` 的 Node 被 `Abort()` 解除 |
 | `stop_while_paused` | 暂停等待中的 Node 被 Stop 唤醒并 Join |
@@ -483,19 +540,8 @@ RAII 封装 `AVPacket*`：构造时 `av_packet_alloc()`（只分配结构体，�
 | `join_before_destruction` | Pipeline 释放 Node 前先完成 Join |
 | `consumer_starts_first` | 按 Source → Sink 登记时，Sink 先于 Source 启动 |
 
-验证环境和 Sanitizer 运行方式见 [tests/dag/README.md](./tests/dag/README.md)，通过状态见 [DEVELOPMENT_PLAN.md](./DEVELOPMENT_PLAN.md)。
+DAG 测试设计和运行方式见 [tests/dag/README.md](./tests/dag/README.md)。`tests/decode/` 覆盖压缩音视频输入、重排帧、Drain/Flush、Seek 代际和 EOS；`tests/app/` 覆盖延迟 GL 资源队列语义。测试目标通过不代表在目标机器完成可见画面、真实 ALSA 输出、VA-API 或 DMA-BUF/EGL 设备验证。
 
----
+实际播放器只通过 FFmpeg 打开输入并解复用选中的音视频流。可用容器和编码格式受当前 FFmpeg 构建及输入数据约束。OpenGL shader 当前处理 SDR YUV 矩阵/范围与 NV12/P010 采样，不构成完整 HDR 色彩管理。
 
-## 11. 尚未实现
-
-以下机制**没有代码**，本文不描述它们的实现协议。设计意图见 README 的目标架构，落地时间见开发计划：
-
-- `PlayerFacade`、FSM、`PlaybackState` 的实际驱动（当前 `CreatePlayer()` 返回 `StubPlayer`）
-- `Pipeline::Open` / `Build` / `Seek`
-- Seek 流程：epoch 递增的调用方、带内 Flush、解码器与音频设备刷新
-- 全部真实媒体 Node：Demuxer、Decoder、Sync、Sink、Tee、Encoder、Muxer
-- 录制的 Drain 协议
-- 硬件解码、DMA-BUF / EGLImage、色彩管理
-- HTTP、RTP、Jitter Buffer 及相关 QoS 指标
-- 结构化错误上报通道
+`VideoDecoderStats` 在解码节点中每约五秒输出一次：输入包数按 FFmpeg 成功接受的压缩包计，解码帧数按 `avcodec_receive_frame()` 产出及转换成功分别记录，并按软件帧、VA-API 下载帧和 VA-API DMA-BUF 帧分别累计。首帧解码模式和输入格式取自转换前的原始 `AVFrame`，避免硬件下载替换该帧后误报为软件解码。普通包 send、Drain 的空包 send、receive API、完整帧处理墙钟、已有 `vaSyncSurface()`、decoder 侧 `av_hwframe_transfer_data()` 分开列出。完整帧处理墙钟包含 receive、同步及下载等子项，不能与子项相加；`vaSyncSurface()` 指标只统计 DMA-BUF 导出前的显式同步，硬件下载调用也可能包含驱动隐式等待。`decoder_timed_thread_cpu_pct` 按这些解码调用中的线程 CPU 时间除以统计墙钟区间计算。解码器和 sink 帧率字段均是墙钟区间比率，时间窗包含打开后等待、队列背压及暂停；它们不等于活跃播放帧率或解码器最大吞吐量。渲染器的硬件帧下载另由 `RendererDownloadStats` 记录。`VideoSinkStats` 是音画同步后交付 sink 的帧数/墙钟帧率，不代表 QOpenGLWidget 已实际呈现在显示器上的唯一帧数。

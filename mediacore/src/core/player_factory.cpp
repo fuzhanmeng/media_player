@@ -11,6 +11,7 @@
 
 #include <exception>
 #include <memory>
+#include <utility>
 
 #include "core/player.h"
 #include "mediacore/iplayer.h"
@@ -23,9 +24,13 @@ namespace mediacore {
  * @return 成功返回由 std::unique_ptr 托管的 IPlayer 抽象接口，失败返回 nullptr
  */
 std::unique_ptr<IPlayer> CreatePlayer() {
+    return CreatePlayer(PlayerConfig::Default());
+}
+
+std::unique_ptr<IPlayer> CreatePlayer(PlayerConfig config) {
     LOG_INFO("Creating player instance");
     try {
-        auto player = std::make_unique<Player>();
+        auto player = std::make_unique<Player>(std::move(config));
         LOG_INFO("Player instance created successfully: {}", static_cast<const void*>(player.get()));
         return player;
     } catch (const std::exception& error) {

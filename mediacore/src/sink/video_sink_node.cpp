@@ -22,7 +22,6 @@
 namespace mediacore {
 
 /**
-/**
  * @brief 初始化视频输出节点。
  * @param sync_context Pipeline 同步上下文
  * @param callbacks Pipeline 事件回调
@@ -41,6 +40,15 @@ VideoSinkNode::VideoSinkNode(std::shared_ptr<SyncContext> sync_ctx,
         LOG_ERROR("VideoSinkNode requires a non-null VideoSinkDispatcher and PlaybackTimeline");
         throw std::invalid_argument("VideoSinkNode requires a non-null VideoSinkDispatcher and PlaybackTimeline");
     }
+
+    sink_statistics_started_at_ = std::chrono::steady_clock::now();
+    sink_interval_started_at_ = sink_statistics_started_at_;
+}
+
+VideoSinkNode::~VideoSinkNode() {
+    if (!sink_summary_logged_) {
+        LogFrameStatistics("destroyed", true);
+    }
 }
 
 /**
@@ -51,7 +59,38 @@ VideoSinkNode::VideoSinkNode(std::shared_ptr<SyncContext> sync_ctx,
  */
 void VideoSinkNode::DeliverFrame(VideoFrame frame) {
     if (IsCurrentEpoch(frame.epoch_) && timeline_->Get().epoch_ == frame.epoch_) {
+        ++sink_frames_total_;
+        ++sink_frames_interval_;
+        sink_summary_logged_ = false;
         video_dispatcher_->DeliverFrame(std::make_shared<VideoFrame>(std::move(frame)));
+        LogFrameStatistics("interval", false);
+    }
+}
+
+void VideoSinkNode::LogFrameStatistics(const char* reason, bool summary) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsed = summary ? now - sink_statistics_started_at_ : now - sink_interval_started_at_;
+    const double elapsed_seconds = std::chrono::duration<double>(elapsed).count();
+    if (!summary && elapsed_seconds < 5.0) {
+        return;
+    }
+
+    const std::uint64_t frames = summary ? sink_frames_total_ : sink_frames_interval_;
+    const double fps = elapsed_seconds > 0.0 ? static_cast<double>(frames) / elapsed_seconds : 0.0;
+    LOG_INFO("VideoSinkStats reason={} scope={} rate_basis=wall_clock sink_frames={} sink_wall_fps={:.3f} cumulative_sink_frames={} "
+             "displayed_frames=not_observable interval_s={:.3f}",
+             reason,
+             summary ? "total" : "interval",
+             frames,
+             fps,
+             sink_frames_total_,
+             elapsed_seconds);
+
+    if (summary) {
+        sink_summary_logged_ = true;
+    } else {
+        sink_frames_interval_ = 0;
+        sink_interval_started_at_ = now;
     }
 }
 
@@ -192,6 +231,8 @@ TickResult VideoSinkNode::Tick() {
 
             ReportReady(actual_position_us, true);
         }
+
+        LogFrameStatistics("eos", true);
 
         // 报告视频轨道结束，所有活动轨道结束后通知媒体结束
         if (timeline_->MarkEnded(PlaybackTrack::kVideo, current_epoch_)) {
