@@ -611,7 +611,10 @@ void ResetFlushesDecodersAndRejectsOldEpochPackets(const std::filesystem::path& 
     auto video_decoder = OpenVideoDecoder(std::move(opened.video_parameters), info.video_stream_->time_base_);
     auto audio_decoder = OpenAudioDecoder(std::move(opened.audio_parameters), info.audio_stream_->time_base_);
 
-    PacketBatch prefix = ReadPacketPrefix(*opened.demuxer, 8);
+    // Frame-threaded decoders can buffer more than eight packets before the
+    // first output. Feed enough of this 30-frame fixture to warm those workers
+    // while retaining a partial stream for the subsequent Flush/Epoch check.
+    PacketBatch prefix = ReadPacketPrefix(*opened.demuxer, 24);
     Require(opened.demuxer->Seek(500000).IsSucceeded(), "demuxer seek for epoch test failed");
     PacketBatch tail = ReadAllPackets(*opened.demuxer);
     Require(!tail.video.empty() && !tail.audio.empty(), "seek did not produce both compressed tracks");

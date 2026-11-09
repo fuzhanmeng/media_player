@@ -689,6 +689,11 @@ void FfmpegVideoDecoder::LogStatistics(const char* reason, bool summary) {
              stats.export_pipeline_attempts_, stats.export_pipeline_failures_, stats.vaapi_export_frames_,
              stats.vaapi_download_frames_, stats.software_frames_, stats.fallback_frames_[0], stats.fallback_frames_[1],
              stats.fallback_frames_[2], stats.fallback_frames_[3]);
+    LOG_INFO("[VideoPerf][{}] component=frame_processing epoch={} window_start_ns={} window_end_ns={} "
+             "frames={} processing_total_ms={:.6f} processing_max_ms={:.6f} "
+             "scope=receive_and_convert_excludes_frame_unref", summary ? "Summary" : "Interval",
+             statistics_epoch_, start_ns, end_ns, stats.decoded_frames_, stats.frame_processing_ms_,
+             stats.max_frame_processing_ms_);
     if (summary) {
         for (const auto& entry : export_failure_reasons_) {
             if (entry.count != 0) {
@@ -963,6 +968,10 @@ FfmpegVideoDecoderOpenResult FfmpegVideoDecoder::Open(VideoCodecParameters param
         return result;
     }
 
+    // FFmpeg defaults to one software decode thread. Let it select frame/slice
+    // workers for the host CPU; the separate VA-API context is unchanged.
+    software_codec_context_owner->thread_count = 0;
+
     const int open_decoder_result = avcodec_open2(software_codec_context_owner.get(), codec, nullptr);
     if (open_decoder_result < 0) {
         LOG_ERROR("avcodec_open2 failed for decoder '{}': {}",
@@ -972,8 +981,10 @@ FfmpegVideoDecoderOpenResult FfmpegVideoDecoder::Open(VideoCodecParameters param
         return result;
     }
 
-    LOG_INFO("[VideoDecoder][Decision] api=avcodec_open2 result=0 codec={} requested={} selected=software",
-             codec_name, HardwareAccelName(hardware_acceleration));
+    LOG_INFO("[VideoDecoder][Decision] api=avcodec_open2 result=0 codec={} requested={} selected=software "
+             "thread_count={} thread_type={} active_thread_type={}",
+             codec_name, HardwareAccelName(hardware_acceleration), software_codec_context_owner->thread_count,
+             software_codec_context_owner->thread_type, software_codec_context_owner->active_thread_type);
 
     // 软解路径没有设备，也没有格式协商状态
     (void)create_video_decoder(software_codec_context_owner, nullptr);
@@ -1259,8 +1270,7 @@ std::unique_ptr<HardwareFrame> FfmpegVideoDecoder::ExportHardwareFrame(std::uint
 
         // ---------- 第 2 步：vaSyncSurface，等 GPU 真正写完 ----------
 
-        // VA-API 解码是异步提交的：avcodec_receive_frame() 返回只代表「这一帧已被调度到 GPU」，不代表 GPU
-        // 已经写完像素不等待就导出，后续在 GPU 上采样时会读到写了一半的内容
+        // VA-API 解码是异步提交的：avcodec_receive_frame() 返回只代表「这一帧已被调度到 GPU，不代表 GPU已经写完像素不等待就导出，后续在 GPU 上采样时会读到写了一半的内容
 
         const auto sync_started_at = std::chrono::steady_clock::now();
         const VAStatus sync_status = vaSyncSurface(vaapi_device_context->display, surface_id);
@@ -1436,9 +1446,9 @@ std::unique_ptr<HardwareFrame> FfmpegVideoDecoder::ExportHardwareFrame(std::uint
         }
 
         // ---------- 第 5 步：持有 AVFrame 引用，锁住 VA surface ----------
-        // ★ 这是零拷贝里第二关键的步骤（第一关键是 vaSyncSurface）。
+        // ★ 这是零拷贝里第二关键的步骤（第一关键是 vaSyncSurface）
         //
-        //   VA Surface 由 FFmpeg 的硬件帧缓冲池管理。
+        //   VA Surface 由 FFmpeg 的硬件帧缓冲池管理
         //   当前 AVFrame 持有的资源引用没有全部释放前，Surface 不能被缓冲池重新分配。
         //
         //   不持有引用的话：
