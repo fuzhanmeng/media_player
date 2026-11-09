@@ -70,6 +70,36 @@ if(MEDIA_PLAYER_BUILD_APP)
         NO_DEFAULT_PATH
     )
     ai_media_player_assert_conan_package(Qt6)
+
+    # Check the headers and libraries selected by the imported target, not just
+    # conanfile.py's requested options. Recheck after generators are updated.
+    function(ai_media_player_check_qt_egl)
+        include(CheckCXXSourceCompiles)
+        # Conan's imported includes/libraries are configuration-specific.
+        set(CMAKE_TRY_COMPILE_CONFIGURATION "${CMAKE_BUILD_TYPE}")
+        set(CMAKE_REQUIRED_LIBRARIES Qt6::Gui)
+        unset(MEDIA_PLAYER_QT_HAS_EGL CACHE)
+        check_cxx_source_compiles([=[
+        #include <QOpenGLContext>
+        #include <QtGui/qopenglcontext_platform.h>
+        #if !QT_CONFIG(egl)
+        #error MediaCore requires Qt EGL
+        #endif
+        int main() {
+            QOpenGLContext context;
+            auto *native = context.nativeInterface<QNativeInterface::QEGLContext>();
+            return native ? 0 : 1;
+        }
+        ]=] MEDIA_PLAYER_QT_HAS_EGL)
+    endfunction()
+    ai_media_player_check_qt_egl()
+    if(NOT MEDIA_PLAYER_QT_HAS_EGL)
+        message(FATAL_ERROR
+            "Selected Qt headers/libraries lack EGL or QEGLContext. "
+            "Regenerate Conan dependencies with qt/*:with_egl=True using conan.lock, "
+            "then configure again with the generated Conan preset. "
+            "See CMakeFiles/CMakeConfigureLog.yaml (or CMakeError.log) for details.")
+    endif()
 endif()
 
 if(MEDIA_PLAYER_BUILD_MEDIACORE)

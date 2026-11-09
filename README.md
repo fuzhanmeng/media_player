@@ -72,6 +72,8 @@ cmake --preset conan-relwithdebinfo
 
 首次配置可能需要 Conan 下载或构建依赖。使用 `--build=missing` 时，若本机没有匹配的二进制包，Conan 会从源码构建。
 
+播放器要求 Qt 的 `with_egl=True` 和 XCB EGL integration。修改依赖选项后，须重新运行上述 Conan 安装和 CMake 配置；只执行 `cmake --build` 不会重新解析 Conan 依赖。CMake 会编译并链接检查所选 Qt 的 EGL 特性及 `QEGLContext`，不满足时停止配置。不要手工指定 Conan 缓存包路径或混用不同包的 Qt 头文件、库和插件。
+
 ### 编译与运行
 
 ```bash
@@ -82,7 +84,16 @@ source build/RelWithDebInfo/generators/conanrun.sh
 
 不传媒体文件时可在界面中打开文件；传入文件路径时程序启动后自动打开。解码模式默认为 `auto`：优先尝试 VA-API，在初始化或格式协商阶段不可用时回退软件解码。`software` 强制软件解码；`vaapi` 强制 VA-API，初始化失败时打开失败。
 
-`build.sh` 可执行 Conan 安装、CMake 配置和编译，但脚本开头会删除整个 `build/` 目录。已有构建产物需要保留时，请使用上面的分步命令，不要运行该脚本。
+`build.sh` 可执行 Conan 安装、CMake 配置和增量编译，并保留现有 `build/` 和用户预设。
+
+在没有 Qt Wayland 插件的桌面上，可仅为播放器进程选择 XWayland 和 EGL：
+
+```bash
+QT_QPA_PLATFORM=xcb QT_XCB_GL_INTEGRATION=xcb_egl \
+  ./build/RelWithDebInfo/app/media_player
+```
+
+启动日志会记录实际 QPA 平台、EGL/GLX Context 和 DMA-BUF 格式查询结果。选择环境变量不等于 EGL 初始化成功，应以运行日志为准；不传媒体文件即可检查 Context，不执行视频帧导入。
 
 运行日志默认写入 `logs/media_player.log`。测试可使用 CTest：
 

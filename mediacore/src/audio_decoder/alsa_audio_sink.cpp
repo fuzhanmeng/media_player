@@ -573,10 +573,11 @@ private:
         snd_pcm_sw_params_alloca(&sw);
         Check(snd_pcm_sw_params_current(pcm_, sw), "snd_pcm_sw_params_current");
 
-        // 达到 start_threshold 后 ALSA 自动起播，取三者最小值，避免必须填满整个 buffer
-        //  1) 实际 buffer 容量；2) 两个实际 period；3) 用户最初请求的 buffer 帧数。
+        // 起播前积累配置要求的缓冲量，且不超过设备实际容量。
+        // 两个 period（默认仅 10 ms）不足以覆盖 Seek/恢复后上游补给的短暂空档，
+        // 会让少量预滚 PCM 提前启动设备并立即欠载。短于阈值的尾音由 Drain 显式 start。
         const snd_pcm_uframes_t start_threshold =
-            std::min({actual_buffer_frames, actual_period_frames * 2, requested_buffer_frames});
+            std::min(actual_buffer_frames, requested_buffer_frames);
         Check(snd_pcm_sw_params_set_start_threshold(pcm_, sw, start_threshold), "snd_pcm_sw_params_set_start_threshold");
 
         // avail_min 表示可用/空闲帧达到多少时，等待机制可以通知应用，它不是起播时阈值，当前类不使用
@@ -605,9 +606,9 @@ private:
             actual_period_ms,
             hardware_pause_supported_);
         LOG_INFO("[ALSA][Init] device={} pcm_type={} state={} rate={} channels={} "
-                 "buffer_frames={} period_frames={} nonblocking=true",
+                 "buffer_frames={} period_frames={} start_threshold_frames={} nonblocking=true",
                  device_, snd_pcm_type_name(snd_pcm_type(pcm_)), snd_pcm_state_name(snd_pcm_state(pcm_)),
-                 negotiated_rate, PcmFrame::kChannels, actual_buffer_frames, actual_period_frames);
+                 negotiated_rate, PcmFrame::kChannels, actual_buffer_frames, actual_period_frames, start_threshold);
 
         // 某些构建配置会将日志宏编译为空；显式标记这两个派生值已被有意计算。
         (void)actual_buffer_ms;

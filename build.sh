@@ -1,9 +1,6 @@
 #!/bin/bash
 
-# 每次运行必定强制清理 build 目录
-echo "强制清理历史构建目录..."
-rm -rf build
-echo "清理完成！"
+# 保留现有构建产物；Conan 更新 generators 后由 CMake 增量配置和编译。
 
 # 默认构建类型,如果没有传参,就默认使用 RelWithDebInfo
 BUILD_TYPE=${1:-RelWithDebInfo}
@@ -22,9 +19,7 @@ if [ ! -f "conan.lock" ]; then
     exit 1
 fi
 
-# CMakeUserPresets.json 是 Conan 生成的本地文件。清除旧 include，避免曾用过
-# 其他输出目录时把同名 conan preset 重复载入。
-rm -f CMakeUserPresets.json
+# CMakeUserPresets.json 由 Conan 更新，保留其中已有的用户预设。
 
 # freedesktop.org 对非浏览器下载返回 HTTP 418。这里从可信镜像预取同一份
 # fontconfig 归档，并由 Conan recipe 中相同的 SHA-256 继续校验和使用。
