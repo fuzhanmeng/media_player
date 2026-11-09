@@ -689,6 +689,11 @@ void FfmpegVideoDecoder::LogStatistics(const char* reason, bool summary) {
              stats.export_pipeline_attempts_, stats.export_pipeline_failures_, stats.vaapi_export_frames_,
              stats.vaapi_download_frames_, stats.software_frames_, stats.fallback_frames_[0], stats.fallback_frames_[1],
              stats.fallback_frames_[2], stats.fallback_frames_[3]);
+    LOG_INFO("[VideoPerf][{}] component=frame_processing epoch={} window_start_ns={} window_end_ns={} "
+             "frames={} processing_total_ms={:.6f} processing_max_ms={:.6f} "
+             "scope=receive_and_convert_excludes_frame_unref", summary ? "Summary" : "Interval",
+             statistics_epoch_, start_ns, end_ns, stats.decoded_frames_, stats.frame_processing_ms_,
+             stats.max_frame_processing_ms_);
     if (summary) {
         for (const auto& entry : export_failure_reasons_) {
             if (entry.count != 0) {
@@ -963,6 +968,10 @@ FfmpegVideoDecoderOpenResult FfmpegVideoDecoder::Open(VideoCodecParameters param
         return result;
     }
 
+    // FFmpeg defaults to one software decode thread. Let it select frame/slice
+    // workers for the host CPU; the separate VA-API context is unchanged.
+    software_codec_context_owner->thread_count = 0;
+
     const int open_decoder_result = avcodec_open2(software_codec_context_owner.get(), codec, nullptr);
     if (open_decoder_result < 0) {
         LOG_ERROR("avcodec_open2 failed for decoder '{}': {}",
@@ -972,8 +981,10 @@ FfmpegVideoDecoderOpenResult FfmpegVideoDecoder::Open(VideoCodecParameters param
         return result;
     }
 
-    LOG_INFO("[VideoDecoder][Decision] api=avcodec_open2 result=0 codec={} requested={} selected=software",
-             codec_name, HardwareAccelName(hardware_acceleration));
+    LOG_INFO("[VideoDecoder][Decision] api=avcodec_open2 result=0 codec={} requested={} selected=software "
+             "thread_count={} thread_type={} active_thread_type={}",
+             codec_name, HardwareAccelName(hardware_acceleration), software_codec_context_owner->thread_count,
+             software_codec_context_owner->thread_type, software_codec_context_owner->active_thread_type);
 
     // 软解路径没有设备，也没有格式协商状态
     (void)create_video_decoder(software_codec_context_owner, nullptr);

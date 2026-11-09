@@ -200,6 +200,8 @@ def main():
     parser.add_argument("--phase", choices=["foreground", "unfocused", "occluded"], required=True)
     parser.add_argument("--sample-seconds", type=float, default=30.0)
     parser.add_argument("--geometry", default="100,100,1280,720", help="x,y,width,height in X11 root coordinates")
+    parser.add_argument("--output-root", type=Path, help="directory for retained run artifacts")
+    parser.add_argument("--run-label", default="", help="optional stable label added to the run directory")
     args = parser.parse_args()
     media = args.media.resolve(strict=True)
     try:
@@ -207,7 +209,10 @@ def main():
     except ValueError as exc:
         raise SystemExit("--geometry must be x,y,width,height") from exc
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-    run = ROOT / "logs/gui-render-diagnosis" / f"{stamp}-{media.stem}-{args.mode}-{args.phase}"
+    output_root = (args.output_root.resolve() if args.output_root else ROOT / "logs/gui-render-diagnosis")
+    output_root.mkdir(parents=True, exist_ok=True)
+    label = f"-{args.run_label}" if args.run_label else ""
+    run = output_root / f"{stamp}{label}-{media.stem}-{args.mode}-{args.phase}"
     run.mkdir(parents=True, exist_ok=False)
     (run / "media.json").write_text(subprocess.check_output(["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(media)], text=True))
     env = os.environ.copy()
@@ -229,6 +234,8 @@ def main():
             manifest["pid"] = proc.pid
             (run / "manifest.json").write_text(json.dumps(manifest, indent=2))
             started = time.monotonic()
+            manifest["started_monotonic_ns"] = int(started * 1e9)
+            (run / "manifest.json").write_text(json.dumps(manifest, indent=2))
             window = None
             previous = None
             screenshot_done = False
